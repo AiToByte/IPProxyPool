@@ -1,0 +1,69 @@
+[package]
+name = "pingora-proxy-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Enterprise high-availability smart IP proxy pool gateway (GW-R1)"
+license = "MIT"
+
+[[bin]]
+name = "pingora-proxy-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Cloudflare Pingora core suite (GW-1 gateway)
+# NOTE: manual says 0.4 but 0.4 breaks on rustc 1.93 (sfv 0.15 / tokio-rustls id mismatch); use 0.6 (API-compatible, builds green)
+pingora = { version = "0.6", features = ["proxy", "lb", "rustls"] }
+pingora-core = "0.6"
+pingora-proxy = "0.6"
+pingora-load-balancing = "0.6"
+
+# Async runtime & utils
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Lock-free structures
+arc-swap = "1.7"
+dashmap = "6.0"
+parking_lot = "0.12"
+
+# Serialization & web
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.6"
+http = "1.1"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+base64 = "0.22"
+# Pin process-default rustls provider (both ring+aws-lc-rs are compiled in via
+# pingora/reqwest features, so rustls can't auto-pick; install ring explicitly).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+# GW-2 telemetry / probing
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "streams", "aio"] }
+crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# GW-3 bandit / fingerprint
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+atomic_float = "1.1"
+sha2 = "0.10"
+
+# GW-4 analytics / tenant
+# lz4 is a default feature of clickhouse 0.13 (verified in registry source);
+# `chrono` is opt-in and required for DateTime64(3) <-> DateTime<Utc>.
+clickhouse = { version = "0.13", features = ["chrono"] }
+chrono = "0.4"
+governor = "0.6"
+nonzero_ext = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,1 @@
+XADD stream:proxy:telemetry * payload {"client_ip":"t","target_domain":"quarantine-test.example","out_ip":"127.0.0.1","provider":"mock-a","tier":"residential","country":"US","status_code":403,"latency_ms":5,"transferred_bytes":0,"retry_count":0,"tenant_id":null,"error_type":null,"timestamp":1} domain quarantine-test.example status 403

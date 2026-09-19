@@ -1,0 +1,62 @@
+{
+  "title": "IPProxyPool GW-R1 Gateway",
+  "uid": "ipproxypool-gw-r1",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "全网请求成功率 SLA (%)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(proxy_requests_total{status=\"2xx\"}[1m])) / sum(rate(proxy_requests_total[1m])) * 100",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "网关附加 P99 时延 (ms)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(gateway_processing_duration_ms_bucket[5m])) by (le))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "各供应商 403 封禁比 (%)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(proxy_requests_forbidden_total[5m])) / sum(rate(proxy_requests_total[5m])) * 100",
+          "refId": "A",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 }
+    },
+    {
+      "id": 4,
+      "title": "实时下行带宽 (Gbps)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_transferred_bytes_total[1m])) * 8 / 1000000000",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 }
+    }
+  ]
+}

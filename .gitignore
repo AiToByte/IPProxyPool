@@ -1,0 +1,46 @@
+# ===== IPProxyPool .gitignore =====
+# 说明：banyan-skills/ 为独立方法底座工作区（另行归属），与本仓双轨独立，不随本仓库提交。
+# 注意：Cargo.lock 刻意提交（二进制 crate，保证构建可复现）；真供应商 Key 永不进仓库（见 docs/OPERATION.md §3）。
+
+# --- 独立轨道（另行管理） ---
+/banyan-skills/
+
+# --- Rust 构建产物（gateway/target 含 debug/release 二进制，体积大且可重建） ---
+/gateway/target/
+**/*.rs.bk
+
+# --- 运行输出（log/ 下 .py 脚本是正式工具需提交；进程 .out/.err/.log 不提交） ---
+log/*.out
+log/*.err
+log/*.log
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# --- 本地凭据与密钥 ---
+.env
+*.pem
+*.key
+*.p12
+*secret*.json
+secrets/
+
+# --- 操作系统 ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- 编辑器 / IDE ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- Docker 本地数据目录（防未来误加；当前均为具名卷，无宿主挂载） ---
+data/

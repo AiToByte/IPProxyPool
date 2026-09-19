@@ -1,0 +1,66 @@
+name: ipproxypool-gw-r1
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ipproxy-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: ipproxy-clickhouse
+    ports:
+      - "8123:8123"
+      - "127.0.0.1:9010:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./deploy/clickhouse:/docker-entrypoint-initdb.d:ro
+    environment:
+      CLICKHOUSE_USER: proxy
+      CLICKHOUSE_PASSWORD: "123456"
+      CLICKHOUSE_DB: proxy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: ipproxy-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: ipproxy-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  # OPT-2 环境门示例（网关为宿主二进制直跑，不在 compose 内；如容器化网关，
+  # 在 gateway 服务加 `environment: REQUIRE_API_KEY: "1"` 即开启无头 403）。
+  # gateway:
+  #   build: ./gateway
+  #   environment:
+  #     REQUIRE_API_KEY: "1"
+
+volumes:
+  redis-data:
+  clickhouse-data:
+  grafana-data:
