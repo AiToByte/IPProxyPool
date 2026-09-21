@@ -5,11 +5,11 @@
 //! upstream_request_filter (inject egress auth) → fail_to_connect (retry) →
 //! logging (bandit reward update + telemetry emit, GW-2 bus).
 
-use crate::bandit::{compute_reward, BanditArm, LinUCBEngine};
+use crate::bandit::{compute_reward, BanditArm, LinUCBEngine, VectorD};
 use crate::fingerprint::FingerprintHardener;
 use crate::metrics::MetricsRegistry;
 use crate::model::{ProxyContext, ProxyNode, RoutingSpec};
-use crate::router::RouterEngine;
+use crate::router::{normalize_domain, RouterEngine};
 use crate::telemetry::{TelemetryEvent, TelemetryPublisher};
 use crate::tenant::TenantManager;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ pub struct SmartProxyGateway {
     pub telemetry: Option<Arc<TelemetryPublisher>>,
     /// GW-3 LinUCB dispatch engine (alpha 0.4 at boot).
     pub bandit_engine: Arc<LinUCBEngine>,
-    /// GW-3 arm states keyed by `node.addr()` (`ip:port`, not bare IP).
+    /// GW-3 arm states keyed by `node.addr` (`ip:port`, not bare IP).
     pub bandit_arms: Arc<DashMap<String, Arc<BanditArm>>>,
     /// GW-4 tenant auth/throttle/metering.
     pub tenant_mgr: Arc<TenantManager>,
@@ -56,7 +56,7 @@ pub const DEFAULT_API_KEY: &str = "default_key";
 
 /// 取节点对应的 LinUCB 臂，没有则新建（首写竞态无害：新臂状态等价）。
 pub fn arm_for(arms: &DashMap<String, Arc<BanditArm>>, node: &ProxyNode) -> Arc<BanditArm> {
-    let key = node.addr();
+    let key = node.addr.clone();
     if let Some(existing) = arms.get(&key) {
         return existing.value().clone();
     }
@@ -65,6 +65,58 @@ pub fn arm_for(arms: &DashMap<String, Arc<BanditArm>>, node: &ProxyNode) -> Arc<
     arm
 }
 
+/// R2-3 鉴权错误 → HTTP 状态映射（纯函数，可单测）。
+///
+/// - 速率/并发超限 → 429（可重试）；
+/// - 欠费 → 402（充值后恢复，与 403 身份问题区分，计费对账可观测）；
+/// - 其余（坏 Key / 停用）→ 403。
+pub fn status_for_auth_error(msg: &str) -> u16 {
+    if msg.contains("Rate limit") || msg.contains("concurrency") {
+        429
+    } else if msg.contains("balance") {
+        402
+    } else {
+        403
+    }
+}
+/// R2-6：取本请求的 bandit 上下文——`upstream_peer` 已算好则复用（选学一致，
+/// 省一次 `extract_context` 含时钟 syscall），否则现算（粘滞路径/直调兼容）。
+pub fn resolve_bandit_context(ctx: &ProxyContext, engine: &LinUCBEngine, domain: &str) -> VectorD {
+    ctx.bandit_context
+        .unwrap_or_else(|| engine.extract_context(domain))
+}
+
+/// R2-2 会话租户隔离：把裸 `session_id` 命名为 `{tenant}:{session}`。
+///
+/// - 网关在鉴权成功后调用，路由器只见命名后的不透明 key（零改动）；
+/// - `tenant=None`（理论走不到，鉴权后必有）时沿用裸 key，保证单测/直调兼容；
+/// - 已命名（含 `:`）的不重复包一层（幂等，重入安全）。
+pub fn apply_tenant_namespace(spec: &mut RoutingSpec, tenant_id: Option<&str>) {
+    let session = match spec.session_id.clone() {
+        Some(s) => s,
+        None => return,
+    };
+    let tenant = match tenant_id {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+    if session.starts_with(&format!("{tenant}:")) {
+        return;
+    }
+    spec.session_id = Some(format!("{tenant}:{session}"));
+}
+
+/// R2-2 重试记账：把当前失败节点的 `addr` 记入 `failed_addrs`（去重、上限 16 防爆）。
+///
+/// 与 OPT-3 的 `reset_retry_accounting`（清字节）正交：一个管“换谁”，一个管“计多少”。
+pub fn record_failed_addr(ctx: &mut ProxyContext) {
+    if let Some(ref node) = ctx.current_node {
+        let addr = node.addr.clone();
+        if !ctx.failed_addrs.iter().any(|e| e == &addr) && ctx.failed_addrs.len() < 16 {
+            ctx.failed_addrs.push(addr);
+        }
+    }
+}
 /// OPT-3 重试计量口径：新 attempt 从零累计，已失败 attempt 的字节不进账单。
 ///
 /// - 语义冻结：只计 **最后一次 attempt** 的出站字节（`response_body_filter`
@@ -82,18 +134,34 @@ pub fn reset_retry_accounting(ctx: &mut ProxyContext) {
 ///   （被隔离节点的臂是“暂时不用”，不是“已下线”，误删会丢学习成果）；
 /// - 返回删除个数，供后台 ticker 打日志。
 pub fn prune_stale_arms(arms: &DashMap<String, Arc<BanditArm>>, router: &RouterEngine) -> usize {
-    let alive: std::collections::HashSet<String> =
-        router.snapshot_all().iter().map(|n| n.addr()).collect();
+    let alive: std::collections::HashSet<String> = router
+        .snapshot_all()
+        .iter()
+        .map(|n| n.addr.clone())
+        .collect();
     let before = arms.len();
     arms.retain(|key, _| alive.contains(key));
     before - arms.len()
 }
 
 impl SmartProxyGateway {
-    /// 无状态请求的 LinUCB 选路。
-    fn select_bandit_node(&self, spec: &RoutingSpec) -> Option<ProxyNode> {
+    /// 无状态请求的 LinUCB 选路（无排除兼容入口；网关重试路径走 excluding 版）。
+    #[allow(dead_code)]
+    fn select_bandit_node(&self, spec: &RoutingSpec) -> Option<Arc<ProxyNode>> {
         let context = self.bandit_engine.extract_context(&spec.target_domain);
-        let candidates = self.router.get_healthy_candidates(spec);
+        self.select_bandit_node_excluding(spec, &[], &context)
+    }
+
+    /// R2-2：带失败排除的 LinUCB 选路（重试路径用；`excluded` 为 `ip:port` 集合）。
+    /// R2-6：`context` 由调用方（`upstream_peer`）算好传入，本函数只选不算；
+    /// 候选/命中均为池内 `Arc` 句柄（零 `String` 克隆）。
+    fn select_bandit_node_excluding(
+        &self,
+        spec: &RoutingSpec,
+        excluded: &[String],
+        context: &VectorD,
+    ) -> Option<Arc<ProxyNode>> {
+        let candidates = self.router.get_healthy_candidates_excluding(spec, excluded);
         if candidates.is_empty() {
             return None;
         }
@@ -101,8 +169,8 @@ impl SmartProxyGateway {
             .iter()
             .map(|n| arm_for(&self.bandit_arms, n))
             .collect();
-        let best = self.bandit_engine.select_best_arm(&arms, &context)?;
-        candidates.iter().find(|n| n.addr() == best.key).cloned()
+        let best = self.bandit_engine.select_best_arm(&arms, context)?;
+        candidates.iter().find(|n| n.addr == best.key).cloned()
     }
 
     /// 修剪本网关的游离臂（单测与外部调用方使用）。
@@ -127,6 +195,19 @@ impl ProxyHttp for SmartProxyGateway {
             ctx.client_ip = addr.to_string();
         }
 
+        // R2-2：缺 Host 直接 400（畸形请求，不占租户配额；HTTP/2 authority 透传场景
+        // 由 Pingora 底层归一到 Host，此处只认标准 Host 头）。
+        if session
+            .req_header()
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|h| h.trim().is_empty())
+        {
+            session.respond_error(400).await?;
+            return Ok(true);
+        }
+
         // OPT-2 环境门：开启时，无头请求直接 403（不查租户表，
         // `tenant_account` 保持 None，logging 侧不释放配额——与坏 Key 语义一致）。
         let api_key_header = session
@@ -148,17 +229,17 @@ impl ProxyHttp for SmartProxyGateway {
                 ctx.tenant_account = Some(account);
             }
             Err(msg) => {
-                let status = if msg.contains("Rate limit") || msg.contains("concurrency") {
-                    429
-                } else {
-                    403
-                };
+                // R2-3：429/402/403 映射收敛到 `status_for_auth_error`（单测锁定）。
+                let status = status_for_auth_error(msg);
                 session.respond_error(status).await?;
                 return Ok(true);
             }
         }
 
         ctx.routing_spec = parse_routing_spec(session.req_header_mut());
+
+        // R2-2 会话租户隔离：`{tenant}:{session}`，跨租户同名会话不串绑定。
+        apply_tenant_namespace(&mut ctx.routing_spec, ctx.tenant_id.as_deref());
 
         // GW-3: Chrome 124+ header alignment before scrubbing.
         FingerprintHardener::align_http2_headers(session.req_header_mut());
@@ -180,10 +261,18 @@ impl ProxyHttp for SmartProxyGateway {
     ) -> Result<Box<HttpPeer>> {
         // Sticky-session fast path (GW-1 semantics: pinned node or fresh
         // random bind, quarantine-aware). Stateless traffic takes LinUCB.
+        // R2-2：两条路径都带 `failed_addrs` 排除（Pingora 重试会重调本函数，
+        // 失败节点不再被选中，避免原地打死节点重试）。
+        // R2-6：无状态路径的 bandit 上下文只算一次，存 ctx 供 `logging` 复用。
         let node = if ctx.routing_spec.session_id.is_some() {
-            self.router.select_node(&ctx.routing_spec)
+            self.router
+                .select_node_excluding(&ctx.routing_spec, &ctx.failed_addrs)
         } else {
-            self.select_bandit_node(&ctx.routing_spec)
+            let context = self
+                .bandit_engine
+                .extract_context(&ctx.routing_spec.target_domain);
+            ctx.bandit_context = Some(context);
+            self.select_bandit_node_excluding(&ctx.routing_spec, &ctx.failed_addrs, &context)
         }
         .ok_or_else(|| {
             Error::explain(
@@ -191,7 +280,9 @@ impl ProxyHttp for SmartProxyGateway {
                 "No active proxy node available",
             )
         })?;
-        ctx.current_node = Some(node.clone());
+        // R2-6：`peer_addr` 在 move 进 ctx 前克隆（`Arc` 句柄本身零成本 move）。
+        let peer_addr = node.addr.clone();
+        ctx.current_node = Some(node);
 
         let target_host = session
             .req_header()
@@ -201,7 +292,6 @@ impl ProxyHttp for SmartProxyGateway {
             .unwrap_or("default.target")
             .to_string();
 
-        let peer_addr = node.addr();
         // GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays
         // out of scope (frozen: no uTLS/Boring this round).
         let is_tls = false;
@@ -238,6 +328,8 @@ impl ProxyHttp for SmartProxyGateway {
     ) -> Box<Error> {
         // OPT-3：失败 attempt 的字节作废，新 attempt 从零累计（只计最后一次）。
         reset_retry_accounting(ctx);
+        // R2-2：记下失败节点，重试选路时排除（只换节点，不换重试次数语义）。
+        record_failed_addr(ctx);
         if ctx.retry_count < ctx.max_retries {
             ctx.retry_count += 1;
             log::warn!(
@@ -277,10 +369,11 @@ impl ProxyHttp for SmartProxyGateway {
         let node = ctx.current_node.clone();
         let node_ip = node.as_ref().map(|n| n.ip.as_str()).unwrap_or("none");
         // GW-3: online bandit feedback (reward → Sherman-Morrison update).
+        // R2-6：复用 `upstream_peer` 已算好的上下文（选学一致 + 省一次时钟
+        // syscall）；粘滞路径 ctx 为空时回落现算（与 R2-6 前行为一致）。
         if let Some(ref n) = node {
-            let context = self
-                .bandit_engine
-                .extract_context(&ctx.routing_spec.target_domain);
+            let context =
+                resolve_bandit_context(ctx, &self.bandit_engine, &ctx.routing_spec.target_domain);
             arm_for(&self.bandit_arms, n).update(&context, compute_reward(status, duration));
         }
         // GW-4: release the tenant slot + meter actual egress bytes/tier,
@@ -307,6 +400,8 @@ impl ProxyHttp for SmartProxyGateway {
                 None => ("none".to_string(), "none".to_string(), "none".to_string()),
             };
             publisher.emit(TelemetryEvent {
+                // R2-4：id 留空由 emit 配号（`{ms}-{pid}-{seq}`，XADD 幂等）。
+                event_id: String::new(),
                 client_ip: ctx.client_ip.clone(),
                 target_domain: ctx.routing_spec.target_domain.clone(),
                 out_ip: node_ip.to_string(),
@@ -322,14 +417,27 @@ impl ProxyHttp for SmartProxyGateway {
                 timestamp: TelemetryEvent::now_unix_ms(),
             });
         }
-        log::info!(
-            "[Telemetry] client={} target={} out={} status={} cost={:?}",
-            ctx.client_ip,
-            ctx.routing_spec.target_domain,
-            node_ip,
-            status,
-            duration
-        );
+        // R2-8 数据面日志采样：5xx 全量 info，其余 1/1000 全量（首条即全量），
+        // 采样掉的走 debug（明文 IP 只在全量行出现，采样数进 metrics 可观测）。
+        if self.metrics.sample_full_log(status) {
+            log::info!(
+                "[Telemetry] client={} target={} out={} status={} cost={:?}",
+                ctx.client_ip,
+                ctx.routing_spec.target_domain,
+                node_ip,
+                status,
+                duration
+            );
+        } else {
+            log::debug!(
+                "[Telemetry] client={} target={} out={} status={} cost={:?}",
+                ctx.client_ip,
+                ctx.routing_spec.target_domain,
+                node_ip,
+                status,
+                duration
+            );
+        }
     }
 }
 
@@ -345,7 +453,8 @@ pub fn parse_routing_spec(header: &RequestHeader) -> RoutingSpec {
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
     {
-        spec.target_domain = host.to_string();
+        // R2-2：Host 归一化（小写 + 剥端口 + 去尾点），与隔离 key 同口径。
+        spec.target_domain = normalize_domain(host);
     }
     if let Some(c) = header
         .headers
@@ -404,16 +513,16 @@ mod tests {
     use crate::tenant::TenantManager;
 
     fn test_node(ip: &str, port: u16) -> ProxyNode {
-        ProxyNode {
-            ip: ip.to_string(),
+        ProxyNode::new(
+            ip.to_string(),
             port,
-            username: None,
-            password: None,
-            country: "US".to_string(),
-            tier: "residential".to_string(),
-            provider: "mock-a".to_string(),
-            weight: 100,
-        }
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        )
     }
 
     fn test_gateway(nodes: Vec<ProxyNode>) -> SmartProxyGateway {
@@ -453,6 +562,16 @@ mod tests {
         // 关门 → 行为不变，一律放行到租户缺省 Key 路径。
         assert!(!should_reject_missing_api_key(false, false));
         assert!(!should_reject_missing_api_key(false, true));
+    }
+
+    #[test]
+    fn auth_error_status_mapping() {
+        // R2-3：429 可重试 / 402 欠费 / 403 身份问题，三类可区分。
+        assert_eq!(status_for_auth_error("Rate limit exceeded (QPS)"), 429);
+        assert_eq!(status_for_auth_error("Max concurrency limit reached"), 429);
+        assert_eq!(status_for_auth_error("Insufficient balance"), 402);
+        assert_eq!(status_for_auth_error("Invalid API Key"), 403);
+        assert_eq!(status_for_auth_error("Tenant is disabled"), 403);
     }
 
     #[test]
@@ -516,5 +635,78 @@ mod tests {
         let s = parse_routing_spec(&h);
         assert_eq!(s.target_domain, "h.example");
         assert!(s.country.is_none());
+    }
+
+    #[test]
+    fn parses_host_normalized() {
+        // R2-2：Host 大小写/端口/尾点归一，与隔离 key 同口径。
+        let h = header_with(&[("Host", "API.Target.COM:8443")]);
+        assert_eq!(parse_routing_spec(&h).target_domain, "api.target.com");
+        let h2 = header_with(&[("Host", "Example.COM.")]);
+        assert_eq!(parse_routing_spec(&h2).target_domain, "example.com");
+    }
+
+    #[test]
+    fn tenant_namespace_is_idempotent_and_tenant_scoped() {
+        // R2-2：同名会话跨租户不串；已命名幂等；无会话/无租户不动。
+        let mut spec = RoutingSpec {
+            session_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        apply_tenant_namespace(&mut spec, Some("t-1"));
+        assert_eq!(spec.session_id.as_deref(), Some("t-1:task-1"));
+        apply_tenant_namespace(&mut spec, Some("t-1"));
+        assert_eq!(spec.session_id.as_deref(), Some("t-1:task-1"));
+        let mut other = RoutingSpec {
+            session_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        apply_tenant_namespace(&mut other, Some("t-2"));
+        assert_ne!(spec.session_id, other.session_id);
+        let mut bare = RoutingSpec::default();
+        apply_tenant_namespace(&mut bare, Some("t-1"));
+        assert!(bare.session_id.is_none());
+        let mut no_tenant = RoutingSpec {
+            session_id: Some("s".to_string()),
+            ..Default::default()
+        };
+        apply_tenant_namespace(&mut no_tenant, None);
+        assert_eq!(no_tenant.session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn bandit_context_reuses_preset_without_recompute() {
+        // R2-6：ctx 预置则原样复用（哨兵值不可能是现算结果：bias 恒 1.0/prior 恒 0.2）；
+        // 为空则现算且形态正确（选学一致 + 省 syscall 的接线锁定）。
+        let engine = LinUCBEngine::new(0.4);
+        let sentinel = VectorD::new(7.0, 7.0, 7.0, 7.0);
+        let preset = ProxyContext {
+            bandit_context: Some(sentinel),
+            ..ProxyContext::default()
+        };
+        assert_eq!(
+            resolve_bandit_context(&preset, &engine, "plain.example"),
+            sentinel
+        );
+        let fresh = ProxyContext::default();
+        let computed = resolve_bandit_context(&fresh, &engine, "plain.example");
+        assert_eq!(computed[1], 1.0);
+        assert_eq!(computed[3], 0.2);
+        assert!((0.0..=1.0).contains(&computed[2]));
+    }
+
+    #[test]
+    fn failed_addr_record_dedupes() {
+        // R2-2：失败 addr 去重记录；无节点时不记。
+        let mut ctx = ProxyContext {
+            current_node: Some(Arc::new(test_node("10.0.0.9", 8080))),
+            ..ProxyContext::default()
+        };
+        record_failed_addr(&mut ctx);
+        record_failed_addr(&mut ctx);
+        assert_eq!(ctx.failed_addrs, vec!["10.0.0.9:8080".to_string()]);
+        let mut empty = ProxyContext::default();
+        record_failed_addr(&mut empty);
+        assert!(empty.failed_addrs.is_empty());
     }
 }

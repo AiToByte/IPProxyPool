@@ -55,10 +55,12 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 | 403 比 | panel 3 | 突增=被目标站反爬，确认 quarantine key 生效 |
 | 带宽/余额 | panel 4 / tenant balance | 余额不足先 `set_active(key,false)` 停服再充值 |
 | 熔断 key | `quarantine:{domain}:{ip}` | TTL 到自愈；内存 TTL 独立，DEL 键不清内存 |
-| Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长=CB 消费组 lag，查 `XINFO GROUPS` |
+| Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长=CB 消费组 lag，查 `XINFO GROUPS`；R2-5 起 XADD 带 MAXLEN ~10 万（消费组全挂时老数据先丢，XLEN 封顶）；sink 启动清幽灵消费者，毒丸/重复即时 ack 不进仓 |
+| 后台并发 | 网关日志 `[Prober]/[Prewarmer]/[Sweep]/[Arbitrage]` | R2-7 起三 60s ticker 启动错峰（`staggered start` 行对齐验证）；prober 20 并发 + Client 闲置 10min 淘汰；prewarmer 真 TCP 探测 100 并发封顶，`tickets`==探测节点数（票据环已删） |
+| 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；后台 CB/sink/arbitrage 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
 
-租户管理：`register_tenant(id,key,qps,max_c)` 注册；`set_active` 启停；
-计费 DC $0.2 / Res $3 / Mobile $15 每 GB。
+租户管理：`register_tenant(id,key,qps,max_c,burst)` 注册（R2-3 起 burst 必传，常规取 `qps/10`）；`set_active` 启停；
+计费 DC $0.2 / Res $3 / Mobile $15 每 GB。R2-3 起余额≤0 鉴权直接 402（欠费），与 403（坏 Key/停用）区分；当次流量可扣成负数，下次请求拦截。
 OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节，失败 attempt
 的字节在重试前清零，不进账单；`logging` 侧不做补偿。
 
@@ -78,6 +80,8 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 ## 6. 故障速查
 
 - 网关 503 全域：池被 quarantine 摘空（查 CB 日志 + Redis key）或 mocks 挂了；
+- 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；
+- 后台工人停转：CB/sink/arbitrage 由 supervisor 托管，`supervisor_restarts_total{worker}` 涨即正在自愈（指数 backoff 1s 起 60s 封顶）；
 - 403 全拦截：X-API-Key 未注册（默认 `default_key` 已在 main 注册）；
 - /metrics 无数据：确认走 :8080 有流量（intercept 的 403 也计数）；
 - CH 查不到数：流式泵已上线（`ch_sink_group` 常驻，batch 5000/1s），查

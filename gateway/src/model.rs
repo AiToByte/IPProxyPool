@@ -6,13 +6,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::bandit::VectorD;
 use crate::tenant::TenantAccount;
 
 /// Upstream egress proxy node metadata.
+///
+/// R2-6：`addr`（`ip:port`）构造时预存，选路/排除/臂表 key 比较走 `&str`
+/// 零分配；统一经 [`ProxyNode::new`] 构造，保证与 `ip:port` 一致。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyNode {
     pub ip: String,
     pub port: u16,
+    /// 预存 `format!("{ip}:{port}")`（R2-6：构造时一次分配，读路径复用）。
+    pub addr: String,
     pub username: Option<String>,
     pub password: Option<String>,
     pub country: String,
@@ -23,8 +29,31 @@ pub struct ProxyNode {
 }
 
 impl ProxyNode {
-    pub fn addr(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+    /// 全字段构造（`addr` 按 `ip:port` 自动预存，保证一致）。
+    /// 8 参数与字段 1:1 对应（builder 属过度设计，参考 `reload_nodes` 惯例放行）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ip: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<String>,
+        country: String,
+        tier: String,
+        provider: String,
+        weight: u32,
+    ) -> Self {
+        let addr = format!("{ip}:{port}");
+        Self {
+            ip,
+            port,
+            addr,
+            username,
+            password,
+            country,
+            tier,
+            provider,
+            weight,
+        }
     }
 }
 
@@ -41,7 +70,8 @@ pub struct RoutingSpec {
 pub struct ProxyContext {
     pub start_time: Instant,
     pub routing_spec: RoutingSpec,
-    pub current_node: Option<ProxyNode>,
+    /// R2-6：当前节点以 `Arc` 持有（选路返回即引用，落 ctx 不再克隆整节点）。
+    pub current_node: Option<Arc<ProxyNode>>,
     pub retry_count: usize,
     pub max_retries: usize,
     pub client_ip: String,
@@ -51,6 +81,13 @@ pub struct ProxyContext {
     pub tenant_account: Option<Arc<TenantAccount>>,
     /// GW-4 reservation: streaming byte counter (filled by response_body_filter).
     pub transferred_bytes: u64,
+    /// R2-2：本请求已失败的 `ip:port` 集合（`fail_to_connect` 记录，
+    /// `upstream_peer` 重选时排除，避免原地打死节点重试）。
+    pub failed_addrs: Vec<String>,
+    /// R2-6：本请求已算好的 bandit 上下文（`upstream_peer` 无状态路径计算一次，
+    /// `logging` 复用同一向量做 reward 更新：省一次 `extract_context`
+    ///（含时钟 syscall），且选学一致；粘滞路径为 None（logging 回落现算）。
+    pub bandit_context: Option<VectorD>,
 }
 
 impl Default for ProxyContext {
@@ -65,6 +102,8 @@ impl Default for ProxyContext {
             tenant_id: None,
             tenant_account: None,
             transferred_bytes: 0,
+            failed_addrs: Vec::new(),
+            bandit_context: None,
         }
     }
 }

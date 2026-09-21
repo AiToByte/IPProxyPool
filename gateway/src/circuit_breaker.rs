@@ -192,16 +192,16 @@ mod tests {
 
     #[test]
     fn memory_isolation_applies_within_50ms() {
-        let node = ProxyNode {
-            ip: "10.0.0.9".to_string(),
-            port: 8080,
-            username: None,
-            password: None,
-            country: "US".to_string(),
-            tier: "residential".to_string(),
-            provider: "mock-a".to_string(),
-            weight: 100,
-        };
+        let node = ProxyNode::new(
+            "10.0.0.9".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
         let router = RouterEngine::new(vec![node]);
         let spec = |d: &str| RoutingSpec {
             country: None,
@@ -260,16 +260,16 @@ mod tests {
             return;
         }
         let mut stream = pubsub.on_message();
-        let node = ProxyNode {
-            ip: out_ip.to_string(),
-            port: 8080,
-            username: None,
-            password: None,
-            country: "US".to_string(),
-            tier: "residential".to_string(),
-            provider: "mock-a".to_string(),
-            weight: 100,
-        };
+        let node = ProxyNode::new(
+            out_ip.to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
         let router = Arc::new(RouterEngine::new(vec![node]));
         let cb = PassiveCircuitBreaker::new(
             manager.clone(),

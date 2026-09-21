@@ -6,7 +6,7 @@
 //! counters, and total transferred bytes.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,12 @@ use std::time::Duration;
 pub const DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500];
 /// Metrics HTTP endpoint (matches the Prometheus scrape target).
 pub const METRICS_ADDR: &str = "127.0.0.1:9091";
+/// R2-8 `/metrics` 并发上限（零新依赖：超限即关连接；Prom 抓取低频，64 绰绰有余）。
+pub const METRICS_MAX_CONCURRENT: usize = 64;
+/// R2-8 `/metrics` 读超时（慢连接不占 worker）。
+pub const METRICS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// R2-8 数据面日志采样分母（非 5xx 每 1000 条全量一条，其余降 `debug!`）。
+pub const LOG_SAMPLE_EVERY: u64 = 1000;
 
 pub struct MetricsRegistry {
     req_2xx: AtomicU64,
@@ -27,17 +33,31 @@ pub struct MetricsRegistry {
     duration_sum_ms: AtomicU64,
     /// OPT-4 遥测落库丢弃计数：与 `TelemetryWorker` 共享同一个 `Arc`
     ///（worker 重试一次仍失败时整批累加），此处只读渲染，不参与 `observe`。
+    /// R2-4 口径冻结：只计落库失败（通道满另计 `channel_dropped`）。
     telemetry_dropped: Arc<AtomicU64>,
+    /// R2-4 通道丢弃计数：与 `TelemetryPublisher` 共享同一个 `Arc`
+    ///（emit 满队列/已关闭时累加），此处只读渲染，不参与 `observe`。
+    channel_dropped: Arc<AtomicU64>,
+    /// R2-8 后台重启计数（supervisor 直写，`supervisor_restarts_total{worker}` 渲染）。
+    supervisor_restarts: DashMap<String, AtomicU64>,
+    /// R2-8 日志采样序号（`sample_full_log` 发号，单调递增；5xx 不经过此处）。
+    log_sample_seq: AtomicU64,
+    /// R2-8 被采样掉的非 5xx 日志数（`gateway_logs_sampled_total` 渲染，可观测）。
+    logs_sampled: AtomicU64,
 }
 
 impl MetricsRegistry {
     pub fn new() -> Self {
-        Self::new_with_dropped(Arc::new(AtomicU64::new(0)))
+        Self::new_with_dropped(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
     }
 
     /// OPT-4 装配入口：与落库 worker 共享同一个丢弃计数器。
     /// `new()` 等价于传入全新计数器（存量单测行为不变）；线上 `main` 传入共享实例。
-    pub fn new_with_dropped(telemetry_dropped: Arc<AtomicU64>) -> Self {
+    /// R2-4：第二个参数为通道丢弃计数器（与 publisher 共享）。
+    pub fn new_with_dropped(
+        telemetry_dropped: Arc<AtomicU64>,
+        channel_dropped: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             req_2xx: AtomicU64::new(0),
             req_4xx: AtomicU64::new(0),
@@ -51,19 +71,59 @@ impl MetricsRegistry {
             duration_count: AtomicU64::new(0),
             duration_sum_ms: AtomicU64::new(0),
             telemetry_dropped,
+            channel_dropped,
+            supervisor_restarts: DashMap::new(),
+            log_sample_seq: AtomicU64::new(0),
+            logs_sampled: AtomicU64::new(0),
         }
     }
 
-    /// 当前已丢弃的遥测事件总数（单测断言用；线上看 `/metrics` 渲染行）。
+    /// 当前落库丢弃总数（单测断言用；线上看 `/metrics` 渲染行）。
     #[cfg(test)]
     pub fn dropped_count(&self) -> u64 {
         self.telemetry_dropped.load(Ordering::Relaxed)
     }
 
+    /// 当前通道丢弃总数（单测断言用；线上看 `/metrics` 渲染行）。
+    #[cfg(test)]
+    pub fn channel_dropped_count(&self) -> u64 {
+        self.channel_dropped.load(Ordering::Relaxed)
+    }
+
+    /// R2-8：记录一次后台 worker 重启（supervisor 在 panic/意外返回后调用）。
+    pub fn note_supervisor_restart(&self, worker: &str) {
+        self.supervisor_restarts
+            .entry(worker.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R2-8 数据面日志采样：`status>=500` 全量；其余每 `LOG_SAMPLE_EVERY`
+    /// 条全量一条（序号 0 起首条全量），被采样掉的计 `logs_sampled`。
+    /// 决定性（计数器取模，无随机），单测锁定形态。
+    pub fn sample_full_log(&self, status: u16) -> bool {
+        if status >= 500 {
+            return true;
+        }
+        if self
+            .log_sample_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(LOG_SAMPLE_EVERY)
+        {
+            true
+        } else {
+            self.logs_sampled.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
     /// Record one finished proxied response (called from `logging`).
     ///
-    /// Buckets follow Prometheus convention: every bucket with `le >= value`
-    /// is incremented, so stored counts are already cumulative.
+    /// R2-6 写侧单原子：只给首个 `le >= value` 的桶 +1（每次 `observe` 恰一次
+    /// 原子写，而非 10 次），`render` 侧前缀累加成 Prometheus 累计桶。
+    /// 根治旧累计存储的撕裂：旧写法按桶序逐个 +1，`render` 若在两次 +1 之间
+    /// 读到相邻两桶，会渲染出 `le 小 > le 大` 的非单调行；单原子写下渲染值
+    /// 恒为非负前缀和，天然单调。
     pub fn observe(&self, status: u16, provider: Option<&str>, bytes: u64, duration: Duration) {
         match status {
             200..=299 => self.req_2xx.fetch_add(1, Ordering::Relaxed),
@@ -81,10 +141,10 @@ impl MetricsRegistry {
         }
         self.bytes_total.fetch_add(bytes, Ordering::Relaxed);
         let ms = duration.as_millis().min(u64::MAX as u128) as u64;
-        for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
-            if ms <= *bound {
-                self.duration_buckets[i].fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(i) = DURATION_BUCKETS_MS.iter().position(|bound| ms <= *bound) {
+            self.duration_buckets[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // 超最大桶：只进 `_count`/`_sum`（`+Inf` 行），各 `le` 桶不动。
         }
         self.duration_count.fetch_add(1, Ordering::Relaxed);
         self.duration_sum_ms.fetch_add(ms, Ordering::Relaxed);
@@ -132,11 +192,12 @@ impl MetricsRegistry {
         ));
         out.push_str("# HELP gateway_processing_duration_ms Gateway overhead histogram.\n");
         out.push_str("# TYPE gateway_processing_duration_ms histogram\n");
-        // Buckets are stored cumulative (see `observe`); render raw.
+        // R2-6：写侧只存单桶原始值，此处前缀累加成 Prometheus 累计桶。
+        let mut cumulative = 0u64;
         for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
-            let n = self.duration_buckets[i].load(Ordering::Relaxed);
+            cumulative += self.duration_buckets[i].load(Ordering::Relaxed);
             out.push_str(&format!(
-                "gateway_processing_duration_ms_bucket{{le=\"{bound}\"}} {n}\n"
+                "gateway_processing_duration_ms_bucket{{le=\"{bound}\"}} {cumulative}\n"
             ));
         }
         let count = self.duration_count.load(Ordering::Relaxed);
@@ -155,6 +216,34 @@ impl MetricsRegistry {
             "telemetry_dropped_total {}\n",
             self.telemetry_dropped.load(Ordering::Relaxed)
         ));
+        // R2-4：通道满/关闭丢弃总数（常驻 0 行；与落库口径分离，归因不混）。
+        out.push_str("# HELP telemetry_channel_dropped_total Telemetry events dropped on a full/closed channel.\n");
+        out.push_str("# TYPE telemetry_channel_dropped_total counter\n");
+        out.push_str(&format!(
+            "telemetry_channel_dropped_total {}\n",
+            self.channel_dropped.load(Ordering::Relaxed)
+        ));
+        // R2-8：后台 worker 重启数（supervisor 计数；无重启时无线，保持 exposition 干净）。
+        out.push_str("# HELP supervisor_restarts_total Background worker restarts by worker.\n");
+        out.push_str("# TYPE supervisor_restarts_total counter\n");
+        let mut workers: Vec<(String, u64)> = self
+            .supervisor_restarts
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        workers.sort();
+        for (w, n) in workers {
+            out.push_str(&format!(
+                "supervisor_restarts_total{{worker=\"{w}\"}} {n}\n"
+            ));
+        }
+        // R2-8：被采样掉的非 5xx 数据面日志数（常驻行，采样本身可观测）。
+        out.push_str("# HELP gateway_logs_sampled_total Data-plane log lines sampled to debug.\n");
+        out.push_str("# TYPE gateway_logs_sampled_total counter\n");
+        out.push_str(&format!(
+            "gateway_logs_sampled_total {}\n",
+            self.logs_sampled.load(Ordering::Relaxed)
+        ));
         out
     }
 }
@@ -166,6 +255,9 @@ impl Default for MetricsRegistry {
 }
 
 /// Serve `GET /metrics` until process exit (minimal HTTP, no new deps).
+///
+/// R2-8 加固：读超时 5s（慢连接不占 worker）+ 在途连接超 64 即关（零新依赖
+/// 的并发上限；Prom 抓取低频）+ 单连接 body 上限沿用 1024。
 pub async fn serve_metrics(registry: Arc<MetricsRegistry>, addr: &str) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -175,6 +267,7 @@ pub async fn serve_metrics(registry: Arc<MetricsRegistry>, addr: &str) {
         }
     };
     log::info!("[Metrics] exposition on http://{addr}/metrics");
+    let inflight = Arc::new(AtomicUsize::new(0));
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -183,11 +276,23 @@ pub async fn serve_metrics(registry: Arc<MetricsRegistry>, addr: &str) {
                 continue;
             }
         };
+        if inflight.fetch_add(1, Ordering::SeqCst) >= METRICS_MAX_CONCURRENT {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            log::debug!("[Metrics] over connection cap, closing");
+            continue;
+        }
         let registry = registry.clone();
+        let inflight = inflight.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let n = match tokio::time::timeout(METRICS_READ_TIMEOUT, stream.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                _ => {
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+            };
             let head = String::from_utf8_lossy(&buf[..n]);
             let (code, reason, body) = if head.starts_with("GET /metrics") {
                 ("200", "OK", registry.render())
@@ -203,6 +308,7 @@ pub async fn serve_metrics(registry: Arc<MetricsRegistry>, addr: &str) {
                     .as_bytes(),
                 )
                 .await;
+            inflight.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -236,15 +342,76 @@ mod tests {
     }
 
     #[test]
+    fn histogram_buckets_render_monotonic() {
+        // R2-6：混合延迟 + 超界值下渲染桶恒单调（单原子写 + 前缀累加的直接收益）；
+        // 超最大桶只进 +Inf/count，不污染各 le 行。
+        let m = MetricsRegistry::new();
+        for ms in [0, 1, 3, 30, 1200, 2500, 9999, 30, 3] {
+            m.observe(200, None, 0, Duration::from_millis(ms));
+        }
+        let text = m.render();
+        let mut last = 0u64;
+        let mut seen = 0usize;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("gateway_processing_duration_ms_bucket{le=\"") {
+                let value: u64 = rest.rsplit(' ').next().unwrap().parse().unwrap();
+                assert!(
+                    value >= last,
+                    "buckets must be monotonic: {value} after {last} ({line})"
+                );
+                last = value;
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, DURATION_BUCKETS_MS.len() + 1, "10 le + Inf");
+        assert!(text.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 9"));
+        assert!(text.contains("gateway_processing_duration_ms_count 9"));
+    }
+
+    #[test]
     fn dropped_counter_shared_and_rendered() {
         // OPT-4：worker 与注册表共享同一个 Arc；worker 侧累加后 render 可见。
         let shared = Arc::new(AtomicU64::new(0));
-        let m = MetricsRegistry::new_with_dropped(shared.clone());
+        // R2-4：双计数器各自共享、各自渲染、互不干扰。
+        let channel = Arc::new(AtomicU64::new(0));
+        let m = MetricsRegistry::new_with_dropped(shared.clone(), channel.clone());
         // 零值也必须渲染（PromQL 告警依赖该行常驻）。
         assert!(m.render().contains("telemetry_dropped_total 0"));
+        assert!(m.render().contains("telemetry_channel_dropped_total 0"));
         shared.fetch_add(7, Ordering::Relaxed);
+        channel.fetch_add(3, Ordering::Relaxed);
         assert_eq!(m.dropped_count(), 7);
+        assert_eq!(m.channel_dropped_count(), 3);
         assert!(m.render().contains("telemetry_dropped_total 7"));
+        assert!(m.render().contains("telemetry_channel_dropped_total 3"));
+    }
+
+    #[test]
+    fn supervisor_restarts_counted_and_rendered() {
+        // R2-8：各 worker 重启数分别计数、排序渲染；无重启时无线。
+        let m = MetricsRegistry::new();
+        assert!(!m.render().contains("supervisor_restarts_total{"));
+        m.note_supervisor_restart("sink");
+        m.note_supervisor_restart("sink");
+        m.note_supervisor_restart("circuit_breaker");
+        let text = m.render();
+        assert!(text.contains("supervisor_restarts_total{worker=\"circuit_breaker\"} 1"));
+        assert!(text.contains("supervisor_restarts_total{worker=\"sink\"} 2"));
+    }
+
+    #[test]
+    fn log_sampling_shape() {
+        // R2-8：5xx 全量；非 5xx 首条全量、随后 999 条采样、千条一循环；
+        // 采样数可观测（`gateway_logs_sampled_total` 常驻行）。
+        let m = MetricsRegistry::new();
+        assert!(m.sample_full_log(500));
+        assert!(m.sample_full_log(503));
+        assert!(m.sample_full_log(200), "seq 0 must be full");
+        for _ in 0..999 {
+            assert!(!m.sample_full_log(200));
+        }
+        assert!(m.sample_full_log(200), "seq 1000 must be full again");
+        assert!(m.render().contains("gateway_logs_sampled_total 999"));
     }
 
     #[tokio::test]

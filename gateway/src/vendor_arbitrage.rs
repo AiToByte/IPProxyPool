@@ -51,6 +51,12 @@ impl VendorArbitrageWorker {
         }
     }
 
+    /// 注入审计间隔的 builder（R2-8 env 覆盖用；默认 60s）。
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
     /// One audit pass over every vendor×country pair. CH errors are logged
     /// and skipped (degraded mode: weights simply hold).
     pub async fn audit_once(&self) {
@@ -107,26 +113,26 @@ mod tests {
     fn derate_removes_vendor_country_nodes() {
         use crate::model::ProxyNode;
         let nodes = vec![
-            ProxyNode {
-                ip: "10.0.0.1".to_string(),
-                port: 8080,
-                username: None,
-                password: None,
-                country: "US".to_string(),
-                tier: "residential".to_string(),
-                provider: "mock-a".to_string(),
-                weight: 100,
-            },
-            ProxyNode {
-                ip: "10.0.0.2".to_string(),
-                port: 8080,
-                username: None,
-                password: None,
-                country: "US".to_string(),
-                tier: "datacenter".to_string(),
-                provider: "mock-b".to_string(),
-                weight: 80,
-            },
+            ProxyNode::new(
+                "10.0.0.1".to_string(),
+                8080,
+                None,
+                None,
+                "US".to_string(),
+                "residential".to_string(),
+                "mock-a".to_string(),
+                100,
+            ),
+            ProxyNode::new(
+                "10.0.0.2".to_string(),
+                8080,
+                None,
+                None,
+                "US".to_string(),
+                "datacenter".to_string(),
+                "mock-b".to_string(),
+                80,
+            ),
         ];
         let router = RouterEngine::new(nodes);
         // Simulate a <80% audit verdict for mock-a/US.

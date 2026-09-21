@@ -21,6 +21,11 @@ pub const DEFAULT_ALPHA: f64 = 0.4;
 pub const COST_DC: f64 = 0.1;
 pub const COST_RESIDENTIAL: f64 = 1.0;
 pub const COST_MOBILE: f64 = 3.0;
+/// R2-6 遗忘节拍：每 N 次 `update` 做一次轻 reset（向先验回 blended 10%），
+/// 重开探索空间。N=10k 按当前 QPS 约数小时一次，开销可忽略（一次 O(d²) blending）。
+pub const FORGET_EVERY_N_UPDATES: u64 = 10_000;
+/// 轻 reset 保留比例（学到方向的 90% + 先验的 10%）。
+pub const FORGET_KEEP: f64 = 0.9;
 
 pub type VectorD = SVector<f64, CONTEXT_DIM>;
 pub type MatrixD = SMatrix<f64, CONTEXT_DIM, CONTEXT_DIM>;
@@ -62,6 +67,8 @@ pub struct ArmState {
     pub a_inv: MatrixD,
     /// Bias reward vector `b` (d×1), starts at zero.
     pub b: VectorD,
+    /// R2-6：累计 `update` 次数（`FORGET_EVERY_N_UPDATES` 触发轻 reset 的节拍器）。
+    pub updates: u64,
 }
 
 impl BanditArm {
@@ -73,6 +80,7 @@ impl BanditArm {
             state: RwLock::new(ArmState {
                 a_inv: MatrixD::identity(),
                 b: VectorD::zeros(),
+                updates: 0,
             }),
             cost_weight,
         }
@@ -95,6 +103,11 @@ impl BanditArm {
     }
 
     /// Online update after passive feedback (Sherman-Morrison, O(d²)).
+    ///
+    /// R2-6 遗忘：每 `FORGET_EVERY_N_UPDATES` 次触发一次轻 reset（见
+    /// [`apply_forgetting`]）。方案原议的 `A_inv *= 0.999 / b *= 0.999` 未采用：
+    /// 逆矩阵参数化下均匀收缩只会加速 `A_inv → 0`（探索更快归零，且抹掉已学
+    /// 方向）；向先验的 blend 才是打开不确定性的正确方向（单测锁定数学形态）。
     pub fn update(&self, context: &VectorD, reward: f64) {
         let mut state = self.state.write();
         state.b += reward * context;
@@ -102,7 +115,18 @@ impl BanditArm {
         let denominator = 1.0 + context.dot(&a_inv_x);
         let numerator = a_inv_x * a_inv_x.transpose();
         state.a_inv -= numerator / denominator;
+        state.updates += 1;
+        if state.updates.is_multiple_of(FORGET_EVERY_N_UPDATES) {
+            apply_forgetting(&mut state);
+        }
     }
+}
+
+/// R2-6 轻 reset：保留 90% 已学方向，10% 拉回先验（`A_inv → I` 重开不确定性，
+/// `b` 同比收缩；计数器本身不清零，节拍恒定）。
+fn apply_forgetting(state: &mut ArmState) {
+    state.a_inv = state.a_inv * FORGET_KEEP + MatrixD::identity() * (1.0 - FORGET_KEEP);
+    state.b *= FORGET_KEEP;
 }
 
 /// LinUCB dispatch engine (stateless; arm state lives in `BanditArm`s).
@@ -144,15 +168,27 @@ impl LinUCBEngine {
 }
 
 /// WAF-grade domain risk prior.
+///
+/// R2-6：查配置表（线性扫描，7 条内分支可预测；新增厂商只加行，不动逻辑）。
+/// 同档 WAF 同分：Cloudflare/Turnstile 0.9；Akamai/DataDome/PerimeterX/Kasada/Imperva 0.85；其余 0.3。
+const DOMAIN_RISK_TABLE: &[(&str, f64)] = &[
+    ("cloudflare", 0.9),
+    ("turnstile", 0.9),
+    ("akamai", 0.85),
+    ("datadome", 0.85),
+    ("perimeterx", 0.85),
+    ("kasada", 0.85),
+    ("imperva", 0.85),
+];
+const DOMAIN_RISK_DEFAULT: f64 = 0.3;
+
 fn domain_risk(target_domain: &str) -> f64 {
     let d = target_domain.to_ascii_lowercase();
-    if d.contains("cloudflare") || d.contains("turnstile") {
-        0.9
-    } else if d.contains("akamai") || d.contains("datadome") {
-        0.85
-    } else {
-        0.3
-    }
+    DOMAIN_RISK_TABLE
+        .iter()
+        .find(|(needle, _)| d.contains(needle))
+        .map(|(_, risk)| *risk)
+        .unwrap_or(DOMAIN_RISK_DEFAULT)
 }
 
 /// Time-of-day prior: cosine of the UTC day fraction, normalized to [0,1].
@@ -188,6 +224,10 @@ mod tests {
         assert_eq!(e.extract_context("x.cloudflare.com")[0], 0.9);
         assert_eq!(e.extract_context("cdn.akamai.net")[0], 0.85);
         assert_eq!(e.extract_context("plain.example")[0], 0.3);
+        // R2-6：新增三家 bot-mitigation 厂商与 DataDome 同档（0.85）。
+        assert_eq!(e.extract_context("px.perimeterx.com")[0], 0.85);
+        assert_eq!(e.extract_context("edge.kasada.io")[0], 0.85);
+        assert_eq!(e.extract_context("cdn.imperva.com")[0], 0.85);
         assert_eq!(e.extract_context("plain.example")[1], 1.0);
         assert_eq!(e.extract_context("plain.example")[3], 0.2);
         let cos = e.extract_context("plain.example")[2];
@@ -246,6 +286,44 @@ mod tests {
         // Empty pool → None (gateway maps this to 503).
         let empty: Vec<Arc<BanditArm>> = vec![];
         assert!(e.select_best_arm(&empty, &x).is_none());
+    }
+
+    #[test]
+    fn forgetting_blend_math_is_exact() {
+        // R2-6：轻 reset 数学形态锁定（90% 已学 + 10% 先验；计数器不动）。
+        let mut state = ArmState {
+            a_inv: MatrixD::identity() * 0.5,
+            b: VectorD::new(1.0, 2.0, 3.0, 4.0),
+            updates: 41,
+        };
+        apply_forgetting(&mut state);
+        let expect_a =
+            MatrixD::identity() * 0.5 * FORGET_KEEP + MatrixD::identity() * (1.0 - FORGET_KEEP);
+        assert!((state.a_inv - expect_a).norm() < 1e-12);
+        assert!((state.b - VectorD::new(0.9, 1.8, 2.7, 3.6)).norm() < 1e-12);
+        assert_eq!(state.updates, 41);
+    }
+
+    #[test]
+    fn forgetting_fires_every_10k_updates_and_keeps_learning() {
+        // R2-6：1 万次 update 后节拍恰好触发一次（计数器可观测），分数有限、
+        // 仍显著优于 fresh 臂（学习成果保留，不是清零）。
+        // 10k × O(d²) 约毫秒级，单测可全量跑（不 mock 节拍，防常量漂移）。
+        let arm = BanditArm::new("10.0.0.1:8080".to_string(), "residential".to_string());
+        let x = fixed_context();
+        for _ in 0..FORGET_EVERY_N_UPDATES {
+            arm.update(&x, 1.0);
+        }
+        let state = arm.state.read();
+        assert_eq!(state.updates, FORGET_EVERY_N_UPDATES);
+        drop(state);
+        let score = arm.compute_ucb_score(&x, DEFAULT_ALPHA);
+        assert!(score.is_finite(), "score must stay finite, got={score}");
+        let fresh = BanditArm::new("10.0.0.2:8080".to_string(), "residential".to_string());
+        assert!(
+            score > fresh.compute_ucb_score(&x, DEFAULT_ALPHA),
+            "trained arm must still beat fresh (score={score})"
+        );
     }
 
     #[test]

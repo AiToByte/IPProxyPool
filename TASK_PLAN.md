@@ -1,9 +1,9 @@
 # 任务总体执行规划: GW-R1 企业级IP代理池网关落地
 
 > 创建/更新时间: 2026-09-19 12:00
-> 当前状态: 步骤 8 OPT-R1 方案已冻结待执行（P0×3+P1 4/5/6）；GW-R2剩余待真 Key / Linux 节点
-> 跟踪表: `plan/2026年9月19日-GW-R1实施计划.md`（动态更新，状态以该文件为准）
-> 优化表: `plan/2026年9月19日-OPT-R1优化方案.md`
+> 当前状态: 步骤 9 OPT-R2 已收官（R2-1~R2-9 全✅，82 单测+4 真 live+四门绿+curl 全回归，见 EXEC_LOG R2-9 条）；FreePool v2 迭代计划已冻结待执行；GW-R2剩余待真 Key / Linux 节点
+> 跟踪表: `plan/2026年9月19日-GW-R1实施计划.md`（动态更新，状态以该文件为准）+ `plan/2026年9月21日-FreePool实施计划-v2.md`（FreePool 第二线，supersede v1）
+> 优化表: `plan/2026年9月19日-OPT-R1优化方案.md`（已收官） + `plan/2026年9月21日-OPT-R2优化方案.md`（本轮）
 
 ## 执行进度清单
 - [x] **步骤 1**: GW-0 基线脚手架 workspace+Docker+DDL+门禁基线（可验证标准：cargo check过+Redis PONG+CH建表成功+四门基线绿）
@@ -14,6 +14,8 @@
 - [x] **步骤 6**: GW-5 全链路门禁+hardening交付（可验证标准：四门全绿报告+OPERATION/sysctl落盘） ✅ 已完成（P99 65.6ms/QPS 986+sysctl/OPERATION+最终四门绿，证据见EXEC_LOG GW-5条+log/gw5.out/err+load_probe）
 - [x] **步骤 7**: GW-R2(1) CH 流式泵 Stream→数仓常驻（可验证标准：curl 10 → CH +10行+四门绿） ✅ 已完成（39单测过+4 live真过+端到端+10行+SLA100+四门绿，证据见EXEC_LOG GW-R2泵线条+log/gw6.out/err）
 - [x] **步骤 8**: OPT-R1 优化（P0×3+P1 4/5/6：sweep/API Key门/重试口径/落库重试/共享Client/真预热）✅ 已完成（49单测过+4 live过+curl六用例+四门绿，证据见EXEC_LOG OPT-R1条+log/gw7.out/err）方案见`plan/2026年9月19日-OPT-R1优化方案.md`
+- [x] **步骤 9**: OPT-R2 优化（R2-1~R2-9：选路可恢复+真加权/重试换节点/租户计费门/遥测幂等/_sink背压/数据面性能/后台并发/运维安全收尾/最终回归）方案见`plan/2026年9月21日-OPT-R2优化方案.md` ✅ 已完成（82单测+4真live+四门绿+curl全回归，附 R2-4 XADD 非法 ID 的 P0 修复与 R2-5~R2-8 live 口径更正，证据见EXEC_LOG R2-9条+log/gw9.out/err）
+- [ ] **步骤 10**: FreePool 第二供应线（v2 迭代版，supersede v1：FullCheck匿名度三级+canary/EWMA健康分动态权重/指数backoff/SourceGuard熔断/ETag/容量淘汰/全env接线）方案见`plan/2026年9月21日-FreePool实施计划-v2.md`（Task 1~13，目标 103±1单测+4 live+ELITE两档回归；未开始）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring

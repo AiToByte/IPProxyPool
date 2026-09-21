@@ -13,7 +13,7 @@ use crate::analytics::{AnalyticsEngine, TelemetryRow};
 use crate::circuit_breaker::field_text;
 use crate::telemetry::TelemetryEvent;
 use redis::{aio::ConnectionManager, AsyncCommands};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,12 +23,58 @@ pub const SINK_GROUP: &str = "ch_sink_group";
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(60);
 /// Backoff when ClickHouse insert fails (weights/acks hold, loop continues).
 pub const INSERT_BACKOFF: Duration = Duration::from_secs(1);
+/// R2-5 已见 event_id 窗口：命中即重复（ack+skip，不进仓）。
+/// 10k × ~40B ≈ 400KB 常驻，insert→ack 间崩溃的重放对消于此。
+pub const SEEN_IDS_CAP: usize = 10_000;
 
 /// Parse one stream entry into a warehouse row (`None` = poison, ack+skip).
-pub fn parse_entry(fields: &HashMap<String, redis::Value>) -> Option<TelemetryRow> {
+/// R2-5：返回 `(row, event_id)`，空 id 表示滚动升级中的老事件（永不去重）。
+pub fn parse_entry(fields: &HashMap<String, redis::Value>) -> Option<(TelemetryRow, String)> {
     let payload = field_text(fields, "payload")?;
     let event: TelemetryEvent = serde_json::from_str(&payload).ok()?;
-    Some(TelemetryRow::from(&event))
+    let id = event.event_id.clone();
+    Some((TelemetryRow::from(&event), id))
+}
+
+/// R2-5 已见 ID 环形窗（`check_and_insert` 复合操作，调用方无需二次查找）。
+pub struct SeenIds {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl SeenIds {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(cap.min(1024)),
+            order: VecDeque::with_capacity(cap.min(1024)),
+            cap: cap.max(1),
+        }
+    }
+
+    /// 没见过 → 记录并返回 false；见过 → true（重复）。
+    /// 空串永不记录、永不命中（老事件全放行）。
+    pub fn check_and_insert(&mut self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        if self.set.contains(id) {
+            return true;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        false
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
 }
 
 pub struct ChSinkWorker {
@@ -39,6 +85,8 @@ pub struct ChSinkWorker {
     consumer: String,
     batch_size: usize,
     flush_interval: Duration,
+    /// R2-5 去重窗：insert→ack 间崩溃的重放对消于此，不进仓。
+    seen: SeenIds,
 }
 
 impl ChSinkWorker {
@@ -57,13 +105,53 @@ impl ChSinkWorker {
             consumer: format!("sink_{}", std::process::id()),
             batch_size,
             flush_interval,
+            seen: SeenIds::new(SEEN_IDS_CAP),
+        }
+    }
+
+    /// R2-5 单条目分类（纯内存操作，无网络 I/O，可单测）：
+    /// - 毒丸（坏 JSON）→ `skip_ids`（即时 ack，永不卡组）；
+    /// - 重复 event_id → `skip_ids`（debug，不进仓）；
+    /// - 有效 → `rows` + `valid_ids`（超 `rows_cap` 则两边都不进，
+    ///   不 ack 不丢，留待下轮，内存有界）；
+    /// - 空 id 老事件 → 按有效处理（永不去重）。
+    ///   自由函数（不借 `self`）：单测无需构造 worker（免 Redis/CH）。
+    fn classify_entry(
+        seen: &mut SeenIds,
+        id: String,
+        fields: &HashMap<String, redis::Value>,
+        rows: &mut Vec<TelemetryRow>,
+        valid_ids: &mut Vec<String>,
+        skip_ids: &mut Vec<String>,
+        rows_cap: usize,
+    ) {
+        match parse_entry(fields) {
+            Some((row, event_id)) => {
+                if !event_id.is_empty() && seen.check_and_insert(&event_id) {
+                    log::debug!("[ChSink] duplicate {event_id} ({id}) acked+skipped");
+                    skip_ids.push(id);
+                } else if rows.len() < rows_cap {
+                    rows.push(row);
+                    valid_ids.push(id);
+                } else {
+                    log::warn!("[ChSink] rows cap {rows_cap} hit, holding {id} for next cycle");
+                }
+            }
+            None => {
+                log::warn!("[ChSink] poison entry {id} acked+skipped");
+                skip_ids.push(id);
+            }
         }
     }
 
     /// One reclaim + read + land cycle. Returns rows landed (0 on idle/error).
-    pub async fn pump_once(&self) -> usize {
-        let mut ids: Vec<String> = Vec::new();
+    pub async fn pump_once(&mut self) -> usize {
+        let mut valid_ids: Vec<String> = Vec::new();
+        let mut skip_ids: Vec<String> = Vec::new();
         let mut rows: Vec<TelemetryRow> = Vec::new();
+        // R2-5 背压上限：单轮 reclaim(batch) + fresh(batch) 至多 2×batch，
+        // 显式 cap 截断护内存（CH 宕机时不积压）。
+        let rows_cap = self.batch_size.saturating_mul(2).max(1);
 
         // 1. Reclaim stale pending from crashed consumers.
         let mut conn = self.redis_conn.clone();
@@ -81,16 +169,15 @@ impl ChSinkWorker {
         {
             let reply: redis::streams::StreamAutoClaimReply = reply;
             for entry in reply.claimed {
-                match parse_entry(&entry.map) {
-                    Some(row) => {
-                        rows.push(row);
-                        ids.push(entry.id);
-                    }
-                    None => {
-                        log::warn!("[ChSink] poison entry {} acked+skipped", entry.id);
-                        ids.push(entry.id);
-                    }
-                }
+                Self::classify_entry(
+                    &mut self.seen,
+                    entry.id,
+                    &entry.map,
+                    &mut rows,
+                    &mut valid_ids,
+                    &mut skip_ids,
+                    rows_cap,
+                );
             }
         }
 
@@ -107,16 +194,15 @@ impl ChSinkWorker {
                 let reply: redis::streams::StreamReadReply = reply;
                 for key in reply.keys {
                     for entry in key.ids {
-                        match parse_entry(&entry.map) {
-                            Some(row) => {
-                                rows.push(row);
-                                ids.push(entry.id);
-                            }
-                            None => {
-                                log::warn!("[ChSink] poison entry {} acked+skipped", entry.id);
-                                ids.push(entry.id);
-                            }
-                        }
+                        Self::classify_entry(
+                            &mut self.seen,
+                            entry.id,
+                            &entry.map,
+                            &mut rows,
+                            &mut valid_ids,
+                            &mut skip_ids,
+                            rows_cap,
+                        );
                     }
                 }
             }
@@ -125,14 +211,15 @@ impl ChSinkWorker {
             }
         }
 
+        // 3. R2-5：毒丸/重复即时 ack（不随 insert 成败），有效按 insert 成败 ack。
+        // 失败只 hold 有效（毒丸不再重放 warn，下轮只剩有效 + 新货）。
+        if !skip_ids.is_empty() {
+            let _: () = conn
+                .xack(&self.stream_key, &self.group, &skip_ids)
+                .await
+                .unwrap_or(());
+        }
         if rows.is_empty() {
-            // Idle cycle: still ack pure-poison batches so the group advances.
-            if !ids.is_empty() {
-                let _: () = conn
-                    .xack(&self.stream_key, &self.group, &ids)
-                    .await
-                    .unwrap_or(());
-            }
             return 0;
         }
 
@@ -140,7 +227,7 @@ impl ChSinkWorker {
             Ok(()) => {
                 let landed = rows.len();
                 let _: () = conn
-                    .xack(&self.stream_key, &self.group, &ids)
+                    .xack(&self.stream_key, &self.group, &valid_ids)
                     .await
                     .unwrap_or(());
                 log::info!("[ChSink] landed {landed} rows to ClickHouse");
@@ -154,8 +241,37 @@ impl ChSinkWorker {
         }
     }
 
+    /// R2-5 启动时清一次幽灵消费者（idle 超过 reclaim horizon 且非本实例）。
+    /// 被删者的未 ack 条目由 autoclaim 接管重放（去重窗对消重复），故删除安全。
+    async fn cleanup_stale_consumers(&self) {
+        let mut conn = self.redis_conn.clone();
+        let reply: redis::RedisResult<redis::streams::StreamInfoConsumersReply> =
+            conn.xinfo_consumers(&self.stream_key, &self.group).await;
+        match reply {
+            Ok(info) => {
+                for c in info.consumers {
+                    if c.name != self.consumer && c.idle as u64 > RECLAIM_IDLE.as_millis() as u64 {
+                        let _: () = conn
+                            .xgroup_delconsumer(&self.stream_key, &self.group, &c.name)
+                            .await
+                            .unwrap_or(());
+                        log::info!(
+                            "[ChSink] delconsumer {} (idle {}ms, pending {})",
+                            c.name,
+                            c.idle,
+                            c.pending
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("[ChSink] xinfo consumers failed: {e:?}");
+            }
+        }
+    }
+
     /// Background loop until process exit.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         let mut conn = self.redis_conn.clone();
         let _: redis::RedisResult<()> = conn
             .xgroup_create_mkstream(&self.stream_key, &self.group, "$")
@@ -165,6 +281,7 @@ impl ChSinkWorker {
             self.group,
             self.batch_size
         );
+        self.cleanup_stale_consumers().await;
         loop {
             self.pump_once().await;
         }
@@ -194,6 +311,7 @@ mod tests {
 
     fn valid_payload() -> String {
         serde_json::to_string(&TelemetryEvent {
+            event_id: "sink-1".to_string(),
             client_ip: "c".to_string(),
             target_domain: "d.example".to_string(),
             out_ip: "o".to_string(),
@@ -213,9 +331,10 @@ mod tests {
 
     #[test]
     fn valid_entry_converts() {
-        let row = parse_entry(&fields(&valid_payload())).expect("row");
+        let (row, id) = parse_entry(&fields(&valid_payload())).expect("row");
         assert_eq!(row.provider, "sinktest");
         assert_eq!(row.status_code, 200);
+        assert_eq!(id, "sink-1");
     }
 
     #[test]
@@ -225,6 +344,109 @@ mod tests {
         assert!(parse_entry(&HashMap::new()).is_none());
         // Valid JSON but wrong shape.
         assert!(parse_entry(&fields(r#"{"a":1}"#)).is_none());
+    }
+
+    #[test]
+    fn seen_ids_dedupes_and_ignores_empty() {
+        // R2-5：二次命中为重复；空 id 永不命中；窗口有界。
+        let mut seen = SeenIds::new(3);
+        assert!(!seen.check_and_insert("a"));
+        assert!(seen.check_and_insert("a"));
+        assert!(!seen.check_and_insert(""));
+        assert!(!seen.check_and_insert(""));
+        assert_eq!(seen.len(), 1);
+        assert!(!seen.check_and_insert("b"));
+        assert!(!seen.check_and_insert("c"));
+        assert_eq!(seen.len(), 3);
+        // 驱逐最老（a），a 重新变为“没见过”，窗口长度恒定。
+        assert!(!seen.check_and_insert("d"));
+        assert_eq!(seen.len(), 3);
+        assert!(!seen.check_and_insert("a"));
+    }
+
+    #[test]
+    fn classify_splits_valid_poison_dup_and_caps() {
+        // R2-5：有效/毒丸/重复三分流；超 cap 的有效不 ack 不丢。
+        let mut seen = SeenIds::new(SEEN_IDS_CAP);
+        let (mut rows, mut valid, mut skip) = (Vec::new(), Vec::new(), Vec::new());
+        let f = fields(&valid_payload());
+        // 有效 → rows。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "1-0".into(),
+            &f,
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(valid, vec!["1-0".to_string()]);
+        assert!(skip.is_empty());
+        // 同 event_id 重放 → skip（重复）。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "1-1".into(),
+            &f,
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(skip, vec!["1-1".to_string()]);
+        // 毒丸 → skip。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "bad-0".into(),
+            &fields("{poison"),
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+        );
+        assert_eq!(skip.len(), 2);
+        // cap=1 且已有 1 行 → 新有效（新 id，非重复）两边都不进（留待下轮）。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "held-0".into(),
+            &fields(&payload_with_id("fresh-cap-1")),
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            1,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(!valid.contains(&"held-0".to_string()));
+        assert!(!skip.contains(&"held-0".to_string()));
+    }
+
+    /// 同一有效载荷换新 event_id（cap/去重单测用，不碰线上 valid_payload）。
+    fn payload_with_id(id: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&valid_payload()).unwrap();
+        v["event_id"] = serde_json::Value::String(id.to_string());
+        serde_json::to_string(&v).unwrap()
+    }
+
+    #[test]
+    fn pure_poison_batch_advances_without_rows() {
+        // R2-5：纯毒丸批 → 无行、有 skip（pump 侧即时 ack，组永不卡住）。
+        let mut seen = SeenIds::new(SEEN_IDS_CAP);
+        let (mut rows, mut valid, mut skip) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..3 {
+            ChSinkWorker::classify_entry(
+                &mut seen,
+                format!("poison-{i}"),
+                &fields("{poison"),
+                &mut rows,
+                &mut valid,
+                &mut skip,
+                10,
+            );
+        }
+        assert!(rows.is_empty());
+        assert!(valid.is_empty());
+        assert_eq!(skip.len(), 3);
     }
 
     /// Live pump: XADD 2 events (1 valid + 1 poison), `pump_once` lands 1 row
@@ -297,6 +519,8 @@ mod tests {
             STREAM_KEY_TEST.to_string(),
         );
         // Poll a few cycles: block-read needs the entries to arrive.
+        // R2-5：pump 需 &mut（去重窗写入）。
+        let mut worker = worker;
         let mut landed = 0;
         for _ in 0..5 {
             landed += worker.pump_once().await;

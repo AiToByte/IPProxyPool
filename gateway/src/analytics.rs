@@ -229,6 +229,7 @@ mod tests {
     #[test]
     fn row_from_event_maps_all_fields() {
         let e = crate::telemetry::TelemetryEvent {
+            event_id: "evt-1".to_string(),
             client_ip: "c".to_string(),
             target_domain: "d.example".to_string(),
             out_ip: "o".to_string(),

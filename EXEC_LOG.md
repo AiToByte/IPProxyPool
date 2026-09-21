@@ -182,3 +182,101 @@
   （收益<5%），2026文献证L7入核需整轮工程量（触发：profiling指认）。io_uring：tokio未稳定且与Pingora
   执行器不兼容。MASQUE：标准/服务端就绪但供应商无对端，Mesh续用WG。BGP：组织级事项。
 - **下一步建议**：SPIKE-R2 冻结；网关PID:27200在线。待用户：真Key / Linux节点 / 完工总结。
+
+### [2026-09-21] 步骤 9 立项: OPT-R2 优化方案冻结（先落库）
+- 计划操作：基于 20 点复核新建`plan/2026年9月21日-OPT-R2优化方案.md`（R2-1~R2-8 + R2-9 门禁）；`TASK_PLAN.md` 步骤 9 置待开始；本文件 append-only 记立项。
+- 预期验证方式：R2-9 四门绿（fmt/clippy/test 65+/bench 编译 + live）+ curl 全回归。
+- 范围：P0 先行（R2-1 选路可恢复+真加权首执行），P1/P2 随后；密钥哈希、uTLS/eBPF 落地、真 Key 灰度、Linux 50k 验收 explicitly out（见方案§不做）。
+
+### [2026-09-21] R2-1 已完成: 选路可恢复 + 真加权
+- **实际操作**：`router.rs`（matches 加 weight==0 过滤 + `pick_weighted` 累积权重 roll + `adjust_vendor_weight` 只改数不删 + 粘滞命中复核现池权重后迁移）+ 4 新单测（derate→hold→restore 全周期 / 零权过滤但快照保留 / 1:99 种子偏斜 / 粘滞 derate 迁移）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警（修 `useless_vec` 1 处）。
+  - [门3-测试] ✅ `cargo test` 53 通过/0 失败/4 ignored（基线 49，+4）；存量 arbitrage/pool/gateway 单测全绿。
+  - 综合判定：✅ R2-1 绿。计划表 `plan/2026年9月21日-OPT-R2优化方案.md` R2-1 置✅。
+- **下一步建议**：按序进入 R2-2（重试换节点 + 会话租户隔离 + Host 归一）。
+
+### [2026-09-21] R2-2 已完成: 重试换节点 + 会话隔离 + Host 归一
+- **实际操作**：`router.rs`（`normalize_domain` 纯函数 + `set/is_quarantine` key 归一 + `select_node_excluding/get_healthy_candidates_excluding`，旧入口留兼容 wrapper 按 `reload_nodes` 惯例加 allow）+ `model.rs`（`ProxyContext.failed_addrs`）+ `gateway.rs`（缺 Host 400 前置 + 鉴权后 `{tenant}:{session}` 命名 + `record_failed_addr` 去重上限 16 + 双选路带排除 + `parse_routing_spec` Host 归一）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean（fmt 修 4 处换行）。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警（兼容入口 2 处 allow，与存量惯例一致）。
+  - [门3-测试] ✅ `cargo test` 60 通过/0 失败/4 ignored（R2-1 基线 53，+7）；存量 53 全绿无回归。
+  - [门4-性能] ✅ `cargo bench --no-run` 编译过（2m00s）。
+  - 综合判定：✅ R2-2 绿。已知限制：Pingora 重试重调 `upstream_peer` 以代码走查为准（`fail_to_connect→set_retry(true)` 后重选，排除集经 `ctx` 传递），端到端强制失败重试待 curl 复验。
+- **下一步建议**：按序进入 R2-3（租户计费门：余额门禁 + burst 可配）。
+
+### [2026-09-21] R2-3 已完成: 租户计费门
+- **实际操作**：`tenant.rs`（`authenticate` 加余额门 `<=0 → "Insufficient balance"` 置 QPS/并发之前 + `register_tenant` 加 `burst` 参数 + `default_burst_for_qps=qps/10≥1` + `release` 允许扣负备注）+ `gateway.rs`（`status_for_auth_error` 纯函数收敛 429/402/403 + `request_filter` 调用）+ `main.rs`（默认租户 burst 走单源口径）+ `docs/OPERATION.md`（签名行 + 402 语义一行）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警（`default_burst_for_qps` 只在 test 用报 dead→main 改调单源口径解决，不加 allow）。
+  - [门3-测试] ✅ `cargo test` 64 通过/0 失败/4 ignored（R2-2 基线 60，+4）；存量 QPS/并发/计量单测全绿（默认 burst 下行为冻结）。
+  - 综合判定：✅ R2-3 绿。语义变化：欠费租户新得 402（原无限透支），curl 回归时坏 Key 仍 403、超限仍 429。
+- **下一步建议**：按序进入 R2-4（遥测幂等 + 双丢弃计数 + 降级零构造）。
+
+### [2026-09-21] R2-4 已完成: 遥测幂等 + 双计数 + 降级零构造
+- **实际操作**：`telemetry.rs`（Event 加 `event_id #[serde(default)]` + publisher 发号 `{ms}-{pid}-{seq}` + 满/关计数 `channel_dropped` + worker `flush_dropped` 改名 + XADD 显式 ID + `run` 改 interval 节拍 + 空 id 回填）+ `metrics.rs`（`new_with_dropped` 双参 + `telemetry_channel_dropped_total` 常驻行）+ `main.rs`（双计数器装配 + 降级不建 publisher + 收发两端释放）+ `gateway.rs`（emit 字面 `event_id` 留空配号）+ `ch_sink/analytics` 单测字面同步。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（`Instant` 导入随 ticker 删除）。
+  - [门3-测试] ✅ 66 通过/0 失败/4 ignored（R2-3 基线 64，+2 新 / 1 增强：老 JSON 兼容、配号唯一与预置保留、满队列计数=2；metrics 双行双计数断言）。
+  - [门4-性能] ✅ bench 编译过（1m21s）。
+  - 综合判定：✅ R2-4 绿。已知取舍：首轮全成功但回包丢失的极端下重试全错、计数虚高（文档注释写明，重复行污染更严重故取幂等）；sink 去重窗按计划留 R2-5。
+- **下一步建议**：按序进入 R2-5（Sink 背压 + 毒丸单 ack + 幽灵清理 + MAXLEN）。
+
+### [2026-09-21] R2-5 已完成: CH Sink 背压 + 毒丸单 ack + 幽灵清理 + MAXLEN
+- **实际操作**：`ch_sink.rs`（`SeenIds` 环形去重窗 10k + `classify_entry` 有效/毒丸/重复三分流纯函数 + 单轮 rows 上限 2×batch 超限 hold 下轮 + 毒丸/重复即时 ack、有效按 insert 成败 ack + 启动 `cleanup_stale_consumers` 清 60s+ 幽灵消费者）+ `telemetry.rs`（XADD `MAXLEN ~100k` `STREAM_MAXLEN`）+ 1 新单测（纯毒丸批推进：3 毒丸 → 0 行/0 有效/3 skip）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警。
+  - [门3-测试] ✅ `cargo test` 69 通过/0 失败/4 ignored（R2-4 基线 66，+3：去重窗/混合三分流/纯毒丸批）；`-- --ignored` 4 通过（Redis+CH 双在线，泵 live：1 有效落库 + 毒丸跳过）。
+  - [门4-性能] ✅ `cargo bench --no-run` 编译过。
+  - 综合判定：✅ R2-5 绿。计划表 R2-5 置✅（表先行、日志本条补齐）。
+- **下一步建议**：按序进入 R2-6（数据面性能：Arc 池快照 + 直方图单原子 + Bandit context 复用 + 遗忘机制）。
+
+### [2026-09-21] R2-6 已完成: 数据面性能（Arc 池快照 + 直方图单原子 + context 复用 + 遗忘）
+- **实际操作**：`model.rs`（`ProxyNode::new` 全字段构造 + `addr` 预存 + `current_node: Option<Arc>` + `bandit_context: Option<VectorD>`）+ `router.rs`（池/会话 `Arc` 化 + `pick_weighted` Arc 版 + `adjust_vendor_weight` 写时复制 + `ptr_eq` 单测）+ `gateway.rs`（`select_bandit_node_excluding` 接外部 context + `upstream_peer` 算一次存 ctx + `logging` 经 `resolve_bandit_context` 复用 + `peer_addr` 先克隆后 move + 复用哨兵单测）+ `metrics.rs`（`observe` 首桶单原子 + `render` 前缀累加 + 单调性单测）+ `bandit.rs`（`DOMAIN_RISK_TABLE` 7 条 + `apply_forgetting` 90/10 blend + `updates` 节拍 + 数学形态/10k 节拍双单测）+ 全仓字面构造点切 `::new`（main/pool/prober/circuit_breaker/vendor_arbitrage/gateway/router）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean（fmt 修 5 处换行）。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警（修 `manual_is_multiple_of` + `ProxyNode::new` 8 参 allow 注释放行；另修 `choose/cloned` 单层引用形态 + E0382 move 顺序）。
+  - [门3-测试] ✅ `cargo test` 74 通过/0 失败/4 ignored（R2-5 基线 69，+5）；存量 bandit 7 全绿；`-- --ignored` 4 live 全过（Redis+CH 双在线）。
+  - [门4-性能] ✅ `cargo test --release bandit` 全过，8 臂 avg **126ns**（预算 200ns；GW-3 基线 98ns，select 路径未动，差值判机器噪声）；`cargo bench --no-run` 编译过。
+  - 综合判定：✅ R2-6 绿。偏离说明：遗忘未用方案原议 `A_inv *= 0.999 / b *= 0.999`（逆矩阵参数化下均匀收缩加速 `A_inv→0`，探索更快归零且抹已学方向），改每 10k 次 90/10 向先验 blend（重开不确定性、保留已学方向），以本条为准。
+- **下一步建议**：按序进入 R2-7（后台并发控制：Prober 并发+淘汰 + Prewarmer 限流 + Sweep jitter）。
+
+### [2026-09-21] R2-7 已完成: 后台并发控制（Prober 并发+淘汰 + Prewarmer 限流 + jitter）
+- **实际操作**：`prober.rs`（`TRACE_URL_BACKUP` 双源降级 + `CachedClient{last_used}` + `evict_idle_clients[_older_than]`（`CLIENT_IDLE_TTL` 10min）+ `encode_userinfo` RFC3986 + `probe_node` 双源循环定级）+ `pool.rs`（删票据环/`HttpPeer` 构造 + 建链 `Semaphore` 100 许可建链期持有 + `tickets=nodes` 冻结 + `with_max_concurrent`）+ `main.rs`（prober 改 `Arc` + `JoinSet` + 信号量 20 + 逐轮淘汰 + `startup_jitter`（0..5s）三 60s ticker 错峰 + prewarmer 新签名 + `rand/Semaphore/JoinSet` 导入）+ `docs/OPERATION.md`（§4 加后台并发行）+ 单测 +4（闲置淘汰/账密编码+`Proxy::all` 可接受/150 节点有界完成/同把信号量封顶≤2）。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（`?`-in-bool 修一次：许可拿不到按失败计）。
+  - [门3-测试] ✅ `cargo test` 78 通过/0 失败/4 ignored（R2-6 基线 74，+4，另票据口径单测更名）；`-- --ignored` 4 live 全过。
+  - [门4-性能] ✅ bench 编译过（1m35s）。
+  - 综合判定：✅ R2-7 绿。已知取舍：备源 `generate_204` 无 `ip=` 行时 `exit_ip` 回落节点 IP（注释写明）；jitter 只错启动相位、稳态节拍不变（`staggered start` 日志行验证，待 R2-9 回归时看）。
+- **下一步建议**：按序进入 R2-8（运维安全收尾：配置 env 化 + Supervisor + Metrics 加固 + 日志采样）。
+
+### [2026-09-21] R2-8 已完成: 运维安全收尾（env 化 + Supervisor + Metrics 加固 + 采样）
+- **实际操作**：`metrics.rs`（`supervisor_restarts` DashMap + `note_supervisor_restart` + `sample_full_log`（5xx 直通/其余序号取模）+ `logs_sampled` + render 三组行 + `serve_metrics` 读超时 5s/在途 64 封顶超限即关）+ `gateway.rs`（logging 按采样分 `info!/debug!`）+ `pool.rs`/`vendor_arbitrage.rs`（`with_interval` builder）+ `main.rs`（`env_str/env_secs` + REDIS/CH×4/GATEWAY/METRICS/PROBE/SWEEP/ARBITRAGE/PREWARM env 接线 + `supervise` 包 CB/sink/arbitrage + main 单测模块 2 用例）+ `docker-compose.yml`（网关 env 示例 12 项）+ `docs/OPERATION.md`（§4 配置覆盖行 + §6 缺 Host 400/工人自愈两行）+ 单测 +4。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（修 `is_multiple_of` 1 处）。
+  - [门3-测试] ✅ `cargo test` 82 通过/0 失败/4 ignored（R2-7 基线 78，+4：supervisor 计数渲染/采样形态/env×2）；`-- --ignored` 4 live 全过。
+  - [门4-性能] ✅ bench 编译过（1m24s）。
+  - 综合判定：✅ R2-8 绿。走查项：supervisor 覆盖 panic（JoinHandle）与意外返回双路径、backoff 1s→60s 封顶；`METRICS_MAX_CONCURRENT` 计数器超限即关无新依赖；模块内间隔（arbitrage/prewarm 默认值）仍为 code 常量、env 只在 main 装配层覆盖（以本条为准）。
+- **下一步建议**：进入 R2-9（最终四门 + curl 全回归 + Stream/CH 行数涨）。
+
+### [2026-09-21] R2-9 已完成: 最终四门 + curl 全回归（附 P0 修复 + live 口径更正）
+- **更正（重要）**：R2-5~R2-8 条目中“`-- --ignored` 4 live 全过（Redis+CH 双在线）”失实——Docker daemon 宕机，4 live 实为自跳过（skip 亦报 ok）。EXEC_LOG append-only 不改历史，以本条更正为准；单测数（69/74/78/82）不受影响（纯内存断言真过）。
+- **P0 回归与修复**：R2-9 回归抓获 R2-4 显式 XADD ID（`{ms}-{pid}-{seq}` 三段式）非法——Redis Stream ID 只允许数字型 `<ms>-<seq>`，网关日志 `Invalid stream ID … retry failed, dropped N`，XLEN 零增长。修复（`telemetry.rs`）：XADD 回自动 `*`，幂等走 payload `event_id` + sink `SeenIds` 窗（R2-5 建设施正是为此）；`event_id` 生成/回填保留（payload 键）。注释同步三处。
+- **实际操作**：起 Docker + `compose up -d`（Redis PONG/CH Ok）→ 重启网关（降级启动过一次，杀掉重拉 PID:37832 + mocks 17976/10448/26720，日志 `log/gw9.out/err`）→ curl 六用例 + 缺 Host + /metrics → 10 流量 + 10s → XLEN/CH 查数 → 最终四门。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警。[门3-测试] ✅ 82 通过/0 失败/4 ignored（R2-8 基线持平，仅注释级改动）；`-- --ignored --nocapture` 4 真过（无 SKIP 行；修复前 `live_flush_writes_stream` 复现失败，断言实锤）。
+  - [门4-性能] ✅ bench 编译过（1m44s，修复后重跑）。
+  - [curl 回归] ✅ 普通→mock-b-jp 200；US 粘性 gw9-task1 两次→mock-a-us 200；Proxy-Auth（header 形态）→mock-b-jp 200；坏 Key→403；GB→mock-c-gb 200；缺 Host→400；/metrics→200。注：`-x` 代理形态（absolute-URI）被 Pingora 以 400 拒（`invalid uri`，网关 filter 之前），存量行为（header/直连形态）不受影响。
+  - [链路] ✅ XLEN 9656→9667（+11）、CH 3228→3239（+11）；`[ChSink] landed 1/10 rows`；flush 失败行消失；`staggered start`（Prober/Sweep）对齐验证；`/metrics` 直方图单调、`logs_sampled_total 10`、`telemetry_dropped_total 0`；Prewarmer `nodes=3 connected=3`（R2-7 信号量路径线上 OK）；Prober 对 Mock 报 Dead 系预期（plain-HTTP 不可代理 https trace，GW-2 既有结论，双 URL 路径已走到备源）。
+  - 综合判定：✅ OPT-R2 全绿收官（R2-1~R2-9，82 单测 + 4 真 live + 四门绿 + curl 全回归）。
+ - **下一步建议**：OPT-R2 冻结；GW-R2 剩余仍待用户输入：三家真 Key（staging 1% 灰度）+ Linux 性能节点（50k/<1ms 验收）。教训：live 门禁必须先验依赖在线（PONG/ping），再跑 `-- --ignored` 并检查 SKIP 行；silent-skip 的 ok ≠ 真过。
+
+### [2026-09-21] 步骤 10 立项: FreePool v2 迭代计划冻结（supersede v1，先落库再执行）
+- 计划操作：基于 v1 缺口复核（G1~G12：匿名度缺失/EWMA缺失/backoff缺失/熔断缺失/ETag未落地/悬空env/SOCKS未过滤/可观测单薄/串行fetch/无防篡改/600-900歧义/tier隔离未验证）+ 2026-09-21 前沿检索 8 组回填，新建`plan/2026年9月21日-FreePool实施计划-v2.md`（Task 1~13，TDD checkbox 可直接执行）；`TASK_PLAN.md` 步骤 10 置待开始；本文件 append-only 记立项。
+- 前沿锚点：arXiv:2403.02445（64万免费代理30月纵向：仅34.5%活跃/16,923篡改内容→零信任+canary+禁敏感流量）；Thordata/openproxyhub/VPSLab流水线（多源→验证→GeoIP→延迟分档→匿名度→streak→top-trusted；15min级复检→本计划fetch 600s/TTL 1800s/streak≥3 trusted）；MiyaIP 7头+直连基线（Task 8分级法）；proxyhive EWMA α=0.3+指数backoff+自动恢复+httpbin复检（Task 9/10）；JA4/FoxIO+Cloudflare 2026文档+httpcloak（免费≈全数据中心IP→高JA4风控面→ZZ+ tier门收敛+Phase 3上浮DomainRisk）；dLinUCB/DiscountedUCB/LARL非平稳三法（R2-6 coarse-restart够付费线，免费churn由注册表层EWMA+backoff+prune吸收，per-tier forgetting记Phase 3）；IPinfo 2026（住宅IP平均可见4.56天/60%一次性→TTL短持有+声誉不跨TTL）；ProxyStats/Proxyway 2026（成功率主项×延迟惩罚可解释双因子，付费80/95阈值不动、free独立连续权重1..20）。
+- 预期验证方式：Task 13 四门（fmt/clippy/test 103±1/bench编译+4 live真过，先验依赖+无SKIP检查）+ FREE_REQUIRE_ELITE 0/1 两档curl回归 + tier隔离验证。
+- 范围：零新依赖（futures/reqwest-json复用已有）；SOCKS egress→Phase 2；本地GeoIP/per-tier forgetting/free独立套利/composite健康→Phase 3；真Key灰度/Linux 50k验收仍待用户输入（explicitly out，见v2 §4）。

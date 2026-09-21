@@ -55,10 +55,22 @@ services:
 
   # OPT-2 环境门示例（网关为宿主二进制直跑，不在 compose 内；如容器化网关，
   # 在 gateway 服务加 `environment: REQUIRE_API_KEY: "1"` 即开启无头 403）。
+  # R2-8 配置 env 化示例（缺省沿用 main.rs code 常量，只覆盖需改项）：
   # gateway:
   #   build: ./gateway
   #   environment:
   #     REQUIRE_API_KEY: "1"
+  #     REDIS_URL: "redis://redis:6379/"
+  #     CLICKHOUSE_URL: "http://clickhouse:8123"
+  #     CLICKHOUSE_USER: "proxy"
+  #     CLICKHOUSE_PASSWORD: "123456"
+  #     CLICKHOUSE_DB: "proxy"
+  #     GATEWAY_ADDR: "0.0.0.0:8080"
+  #     METRICS_ADDR: "127.0.0.1:9091"
+  #     PROBE_INTERVAL_SECS: "60"
+  #     SWEEP_INTERVAL_SECS: "60"
+  #     ARBITRAGE_INTERVAL_SECS: "60"
+  #     PREWARM_INTERVAL_SECS: "30"
 
 volumes:
   redis-data:
