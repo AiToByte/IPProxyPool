@@ -22,6 +22,7 @@
 - [x] **步骤 14**: Phase 4 执法与运维（mismatch执法开关/GeoLite2更新脚本）方案见`plan/2026年9月22日-Phase4-执法与运维实施计划.md`（P4-1~P4-3） ✅ 已完成（143 单测+4 真 live+四门绿+存量零变化+E2E重跑+enforce对照，证据见 EXEC_LOG 步骤 14 条+log/gw14-socks.out/err+gw14-enforce.out/err）
 - [x] **步骤 15**: Phase 5 韧性验证（Redis/CH/Mock断电演练）方案见`plan/2026年9月22日-Phase5-韧性验证实施计划.md`（P5-1~P5-4） ✅ 已完成（144 单测+4 真 live+四门绿+三演练全自愈+抓获P0真bug已修，证据见 EXEC_LOG 步骤 15 条+log/gw15*.out/err）
 - [x] **步骤 16**: DOC-R1 文档一致性修复（dashboard零漂移/OPERATION 1中2小）方案见`plan/2026年9月22日-DOC-R1文档一致性修复实施计划.md` ✅ 已完成（dashboard逐名验证零漂移+OPERATION三处修复，证据见 EXEC_LOG 步骤 16 条）
+- [x] **步骤 17**: 剩余事项执行计划（真Key灰度/ Linux验收/JA4复核/完工冻结）方案见`plan/2026年9月22日-剩余事项执行计划.md` ✅ 已完成（REM-1/REM-2 冻结等输入＋REM-3 JA4复核仍OUT＋REM-4 完工盘点；证据见 EXEC_LOG 步骤 17 条）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring
