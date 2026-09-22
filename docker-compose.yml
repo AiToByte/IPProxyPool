@@ -92,6 +92,11 @@ services:
   #     SOCKS_MAX_BODY_BYTES: "10485760"
   #     # P3 GeoIP 画像（GeoLite2-City.mmdb 路径；不配即 Disabled 降级，只观察不执法）。
   #     GEOIP_MMDB_PATH: "/data/GeoLite2-City.mmdb"
+  #     # P4 mismatch 执法（默认 0 只观察；库 Live＋观察无误报后再开 1）。
+  #     GEOIP_ENFORCE_MISMATCH: "0"
+  #     # P4 库更新产物挂载（deploy/geoip_update.py --out-dir ./data 写入宿主 ./data，网关只读挂载）：
+  #     # volumes:
+  #     #   - ./data:/data:ro
 
 volumes:
   redis-data:

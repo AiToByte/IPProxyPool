@@ -1069,6 +1069,8 @@ pub struct FreePoolConfig {
     pub require_elite: bool,
     pub max_zero_cycles: u32,
     pub suspend_retry_every: u64,
+    /// P4-1 mismatch 执法开关（`GEOIP_ENFORCE_MISMATCH=1`；默认 false＝只观察）。
+    pub geo_enforce: bool,
 }
 
 /// Source 默认 URL（全 env 可覆盖；单源挂了只 hold 旧集，不清空池）。
@@ -1093,6 +1095,24 @@ fn spawn_full_check(
         let res = checker.check(&raw, &baseline).await;
         (raw, res)
     });
+}
+
+/// P4-1 执法映射（worker 与单测共用）：Mismatch 且开关开→按复检失败计
+/// （backoff＋`geo_fail` 指标，TTL 内保留＋自动恢复，沿 `note_verify_failed` 语义）；
+/// 其余一律放过（默认关＝Phase 3 逐行等价；miss/disabled 永不执法）。
+fn apply_geo_verdict(
+    registry: &mut Registry,
+    metrics: &crate::metrics::MetricsRegistry,
+    addr: &str,
+    verdict: crate::geo::GeoVerdict,
+    enforce: bool,
+) {
+    use crate::geo::GeoVerdict;
+    if verdict == GeoVerdict::Mismatch && enforce {
+        registry.note_verify_failed(addr, Instant::now());
+        metrics.note_free_verify("geo_fail");
+        log::warn!("[GeoIP] enforced mismatch on {addr} (backoff, auto-recover via reverify)");
+    }
 }
 
 pub struct FreePoolWorker {
@@ -1139,25 +1159,26 @@ impl FreePoolWorker {
         self
     }
 
-    /// P3 geo 观察（只观察不执法）：FullCheck 成功且有 exit_ip 时比对声明国家。
-    /// mismatch 只记指标＋debug（DB 陈旧时执法会误杀好节点；执法留 Phase 4）。
+    /// P3 geo 观察（P4 起返回判定供执法映射）：FullCheck 成功且有 exit_ip 时比对声明国家。
+    /// mismatch 记指标＋debug；执法与否由调用方按 `config.geo_enforce` 决定（默认只观察）。
     /// 注：Disabled 时不注记（main 启动行 `[GeoIP] disabled` 已覆盖可观测；
     /// 首 tick 注记在 supervisor 重启 Workers 时会重复刷计数器，R3-3 已删）。
-    fn observe_geo(&self, raw: &RawNode, exit_ip: Option<&str>) {
-        use crate::geo::exit_matches_source;
+    fn observe_geo(&self, raw: &RawNode, exit_ip: Option<&str>) -> crate::geo::GeoVerdict {
+        use crate::geo::{geo_verdict, GeoVerdict};
         let Some(geo) = self.geo.as_ref() else {
-            return;
+            return GeoVerdict::Skipped;
         };
         if !geo.enabled() {
-            return;
+            return GeoVerdict::Skipped;
         }
         let Some(exit) = exit_ip else {
-            return; // 无 exit（降级分支）不查
+            return GeoVerdict::Skipped; // 无 exit（降级分支）不查
         };
         match geo.country(exit) {
             Some(code) => {
                 self.metrics.note_geo_lookup("hit");
-                if !exit_matches_source(raw.country.as_deref(), Some(&code)) {
+                let verdict = geo_verdict(raw.country.as_deref(), Some(&code));
+                if verdict == GeoVerdict::Mismatch {
                     self.metrics.note_geo_mismatch();
                     log::debug!(
                         "[GeoIP] mismatch {}:{} declared={:?} exit={exit} looked_up={code}",
@@ -1166,9 +1187,11 @@ impl FreePoolWorker {
                         raw.country
                     );
                 }
+                verdict
             }
             None => {
                 self.metrics.note_geo_lookup("miss");
+                GeoVerdict::Skipped
             }
         }
     }
@@ -1337,8 +1360,17 @@ impl FreePoolWorker {
                         AnonLevel::Transparent => "transparent",
                         AnonLevel::Unknown => "unknown",
                     });
-                    // P3 geo 观察（只观察不执法；降级分支无 exit_ip 不查）。
-                    self.observe_geo(&raw, res.exit_ip.as_deref());
+                    // P4-1 geo 观察＋执法映射（默认只观察；开关开且实锤分歧→复检失败）。
+                    let verdict = self.observe_geo(&raw, res.exit_ip.as_deref());
+                    if self.config.geo_enforce {
+                        apply_geo_verdict(
+                            &mut self.registry,
+                            &self.metrics,
+                            &format!("{}:{}", raw.ip, raw.port),
+                            verdict,
+                            true,
+                        );
+                    }
                 }
                 Ok((raw, None)) => {
                     self.metrics.note_free_verify("full_fail");
@@ -1865,6 +1897,40 @@ mod tests {
         let snap2 = reg.snapshot(now, false);
         assert_eq!(snap2.len(), 1);
         assert_eq!(snap2[0].exit_ip.as_deref(), Some("10.9.9.10"));
+    }
+
+    #[test]
+    fn enforce_maps_mismatch_to_failure() {
+        // P4-1：enforce 开＋Mismatch→backoff（快照不可见但条目保留，沿 note_verify_failed 语义，
+        // TTL 内自动恢复）；enforce 关＋Mismatch→仍在池（只记指标，Phase 3 行为）。
+        use crate::geo::GeoVerdict;
+        use crate::metrics::MetricsRegistry;
+        let now = Instant::now();
+        let m = MetricsRegistry::new();
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        reg.upsert_full(
+            &raw("10.0.0.1", "a"),
+            50,
+            AnonLevel::Elite,
+            Some("10.9.9.9".to_string()),
+            now,
+        );
+        apply_geo_verdict(&mut reg, &m, "10.0.0.1:8080", GeoVerdict::Mismatch, true);
+        assert!(reg.snapshot(now, false).is_empty());
+        assert_eq!(reg.len(), 1);
+        assert!(m
+            .render()
+            .contains("free_pool_verify_total{result=\"geo_fail\"} 1"));
+        let mut reg2 = Registry::new(Duration::from_secs(1800));
+        reg2.upsert_full(
+            &raw("10.0.0.2", "a"),
+            50,
+            AnonLevel::Elite,
+            Some("10.9.9.9".to_string()),
+            now,
+        );
+        apply_geo_verdict(&mut reg2, &m, "10.0.0.2:8080", GeoVerdict::Mismatch, false);
+        assert_eq!(reg2.snapshot(now, false).len(), 1);
     }
 
     #[test]

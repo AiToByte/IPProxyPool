@@ -291,6 +291,7 @@ async fn main() {
             suspend_retry_every: env_str("FREE_SUSPEND_RETRY_EVERY", "3")
                 .parse::<u64>()
                 .unwrap_or(3),
+            geo_enforce: env_str("GEOIP_ENFORCE_MISMATCH", "0") == "1",
         };
         let free_router = router.clone();
         let free_metrics = metrics.clone();

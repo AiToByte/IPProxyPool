@@ -79,6 +79,31 @@ pub fn exit_matches_source(declared: Option<&str>, looked_up: Option<&str>) -> b
     }
 }
 
+/// P4-1 观察判定（`exit_matches_source` 的上层映射；本体冻结）。
+/// Match＝一致／免检通过；Mismatch＝两码皆知且实锤分歧；Skipped＝任一缺失无法验证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoVerdict {
+    Match,
+    Mismatch,
+    Skipped,
+}
+
+pub fn geo_verdict(declared: Option<&str>, looked_up: Option<&str>) -> GeoVerdict {
+    match (declared, looked_up) {
+        // ZZ 免检直判 Match；其余两码皆知走 exit_matches_source（二值→三值映射，
+        // 本体冻结，复用而非复制逻辑）。
+        (Some(d), Some(_)) if d.eq_ignore_ascii_case("zz") => GeoVerdict::Match,
+        (Some(d), Some(l)) => {
+            if exit_matches_source(Some(d), Some(l)) {
+                GeoVerdict::Match
+            } else {
+                GeoVerdict::Mismatch
+            }
+        }
+        _ => GeoVerdict::Skipped,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +134,18 @@ mod tests {
         assert!(exit_matches_source(Some("US"), None));
         assert!(exit_matches_source(None, None));
         assert!(!exit_matches_source(Some("US"), Some("DE")));
+        assert!(!exit_matches_source(Some("us"), Some("DE")));
+    }
+
+    #[test]
+    fn geo_verdict_matrix() {
+        // P4-1 纯判定：Match／实锤分歧 Mismatch／缺失一律 Skipped（fail-open 延续，
+        // 为 exit_matches_source 的上层映射，本体冻结）。
+        assert_eq!(geo_verdict(Some("US"), Some("us")), GeoVerdict::Match);
+        assert_eq!(geo_verdict(Some("ZZ"), Some("DE")), GeoVerdict::Match);
+        assert_eq!(geo_verdict(None, Some("DE")), GeoVerdict::Skipped);
+        assert_eq!(geo_verdict(Some("US"), None), GeoVerdict::Skipped);
+        assert_eq!(geo_verdict(None, None), GeoVerdict::Skipped);
+        assert_eq!(geo_verdict(Some("US"), Some("DE")), GeoVerdict::Mismatch);
     }
 }

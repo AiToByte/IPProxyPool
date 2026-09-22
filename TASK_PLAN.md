@@ -19,6 +19,7 @@
 - [x] **步骤 11**: Phase 2 SOCKS egress（EgressProto+选路隔离/握手/翻译桥/filter短路/free全收/prober+pool/main env）方案见`plan/2026年9月22日-Phase2-SOCKS实施计划.md`（P2-1~P2-8） ✅ 已完成（127 单测+4 真 live+四门绿+存量零变化+本地 E2E 五断言，证据见 EXEC_LOG 步骤 11 条+log/gw11-socks.out/err）
 - [x] **步骤 12**: Phase 3 画像与学习增强（分档遗忘+风险溢价/免费套利/composite/GeoIP降级/报表）方案见`plan/2026年9月22日-Phase3-画像与学习增强实施计划.md`（P3-1~P3-6） ✅ 已完成（136 单测+4 真 live+release bandit<200ns+四门绿+存量零变化+E2E重跑，证据见 EXEC_LOG 步骤 12 条+log/gw12.out/err）
 - [x] **步骤 13**: OPT-R3 优化（R3-1 socks选路对齐bandit/R3-2 out_ip+exit隔离/R3-3 删冗余注记/R3-4 日志移出/R3-5 源礼貌轮询/R3-6门禁）方案见`plan/2026年9月22日-OPT-R3优化方案.md` ✅ 已完成（141 单测+4 真 live+release bandit+四门绿+存量零变化+E2E重跑+CH out_ip断言，证据见 EXEC_LOG 步骤 13 条+log/gw13-socks.out/err）
+- [x] **步骤 14**: Phase 4 执法与运维（mismatch执法开关/GeoLite2更新脚本）方案见`plan/2026年9月22日-Phase4-执法与运维实施计划.md`（P4-1~P4-3） ✅ 已完成（143 单测+4 真 live+四门绿+存量零变化+E2E重跑+enforce对照，证据见 EXEC_LOG 步骤 14 条+log/gw14-socks.out/err+gw14-enforce.out/err）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring

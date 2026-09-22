@@ -89,6 +89,13 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - SOCKS 桥零信任延续：socks 节点同样禁敏感流量（与免费线同规）；握手/CONNECT 只连验证与请求目标，不做扫描；relay 只在 E2E 脚本出现，不进生产；
 - GeoLite2 配库（P3）：MaxMind 账号取 license→下 GeoLite2-City.mmdb→挂载进容器/宿主→`GEOIP_MMDB_PATH` 指向→重启网关（热加载不做）；无库默认 Disabled，免费线行为不变（`geoip_lookups{result="disabled"}` 可见）；
+- GeoLite2 自动更新（P4，每周三 03:00 UTC）：`MAXMIND_LICENSE_KEY` 环境传入（不要落盘）后跑
+  `python deploy/geoip_update.py --out-dir ./data`（干跑验证：无 key 时 exit 2＋usage）；
+  Linux cron 例：`0 3 * * 3 cd /opt/IPProxyPool && MAXMIND_LICENSE_KEY=$KEY python3 deploy/geoip_update.py`；
+  Windows schtasks 例：`schtasks /create /tn GeoIPUpdate /tr "python D:\IPProxyPool\deploy\geoip_update.py" /sc weekly /d WED /st 03:00`（key 经计划任务环境变量传入）；
+  更新后重启网关（热加载不做）；生效标志：启动行 `[GeoIP] live DB loaded`＋`geoip_lookups{result="hit"}` 上涨；
+  执法开关 `GEOIP_ENFORCE_MISMATCH=1` 仅在库 Live 且观察一段时间无误报后开（默认 0 只观察），
+  开后 mismatch 按复检失败计（backoff＋`geo_fail`，TTL 内自愈）；
 - 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；
 - 后台工人停转：CB/sink/arbitrage 由 supervisor 托管，`supervisor_restarts_total{worker}` 涨即正在自愈（指数 backoff 1s 起 60s 封顶）；
 - 403 全拦截：X-API-Key 未注册（默认 `default_key` 已在 main 注册）；

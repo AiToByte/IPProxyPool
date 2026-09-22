@@ -390,3 +390,41 @@
 - **验证结果**：fmt clean／clippy 零告警／141 过／定向 4 单测过。
 - **待用户确认**：若 RA 仍红→必为环境问题（RA 版本过旧/多工具链残留），需提供 RA 版本＋诊断码再查；
   若转绿→结案。本条随改写同提交。
+
+### [2026-09-22] 步骤 14 立项: Phase 4 执法与运维计划冻结（先落库再执行）
+- 计划操作：用户指令“准备下一阶段优化，沿 Phase 3 计划继续”——核查 Phase 3（P3-1~P3-6 全✅已提交，
+  其后 OPT-R3/硬化/RA 三轮亦收官）无剩余项，遂落 Phase 4（§4 预留项中可落地两项）。新建
+  `plan/2026年9月22日-Phase4-执法与运维实施计划.md`（P4-1~P4-3，TDD checkbox）；`TASK_PLAN.md`
+  步骤 14 置进行中；本文件 append-only 记立项。
+- JA4 复核（OUT 延续）：上游仍 plain-HTTP mocks、Pingora 仍 0.6、无 TLS 可调面、fork 冲突仍在——
+  自 SPIKE-R2 起零变化，风险溢价仍为诚实替代。dLinUCB/P2C、库热加载延续 OUT（见计划§4）。
+- 范围：零新依赖；P4-1（执法开关，默认关）＋P4-2（更新脚本干跑验证，不耗 license 配额）＋P4-3 门禁；
+  真 Key／Linux 仍待用户输入。
+
+### [2026-09-22] 步骤 14 已完成: Phase 4 执法与运维（P4-1~P4-3 全✅ + E2E 重跑）
+- **实际操作**：P4-1（`GeoVerdict`＋`apply_geo_verdict`＋`FreePoolConfig.geo_enforce`＋main env，2 单测；
+  verdict 复用冻结的 `exit_matches_source`）/P4-2（`deploy/geoip_update.py` 干跑 exit 2＋roundtrip＋
+  OPERATION cron/schtasks＋compose volume/env；文件名连字符改下划线）/P4-3 门禁回归。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（修 doc 空行＋exit 本体复用）。
+  - [门3-测试] ✅ `cargo test` 143 通过/0 失败/4 ignored（OPT-R3 基线 141，+2；计划预估 144±2，
+    实际 143——P4-2 为脚本无 Rust 单测，以实测为准）；`-- --ignored` 4 真过（先验 PONG/1，无 SKIP）。
+    [门4-性能] ✅ bench 编译过（bandit 未动，release bandit 跳过并注明理由）。
+  - [存量回归] ✅ 网关 PID:31260（默认 env，`log/gw14.out/err`）：六用例语义不变＋缺 Host 400＋/metrics 200。
+  - [E2E 重跑] ✅ 网关 PID:34624（enforce 默认关，`log/gw14-socks.out/err`）：`tick=1 pool=1`；
+    `by_proto{socks5}=1`；socks 显式→mock-a-us；默认→mock-b-jp；tier 互斥 503；
+    11 流量后 XLEN 9769→9780（+11）、CH 3341→3352（+11）；CH 新行 `free-gh0|27.18.3.145|200`
+    （out_ip 公网保持）；dashboard JSON 有效＋5 panels。
+  - [enforce 对照] ✅ 网关 PID:10680（`GEOIP_ENFORCE_MISMATCH=1`，`log/gw14-enforce.out/err`）：
+    `tick=1 pool=0`（full_fail×1，同 R3-6 首 tick 复检超时抖动——外部延迟方差，非执法所致：
+    Disabled 下 verdict 恒 Skipped，且无 `geo_fail`/`enforced` 行）→`tick=2 pool=1` 自愈；
+    socks 显式→mock-a-us（与关对照完全一致）。结论：Disabled 下开关零行为变化（预期内对照，
+    非功能验证——功能验证需生产配库，诚实声明）。
+  - 综合判定：✅ Phase 4 全绿收官（143 单测＋4 真 live＋四门绿＋E2E 重跑＋enforce 对照）。
+    在线：网关 10680＋relay/list/mocks。
+- **遇到的问题与解决**：
+  - geo.rs 尾部一次 edit 多写 `}` 致未闭合→读尾定位修复（教训重申：大段 edit 后读尾校验）。
+  - `lookup→LookupResult` 须 `.decode()` 两段式（registry 源码为准）。
+  - exit 语义 fail-open 修正（计划同步）。
+  - 脚本文件名连字符改下划线（可 import＋仓惯例）。
+- **下一步建议**：Phase 4 冻结；剩余待用户：真 Key 灰度／Linux 节点／JA4（待 TLS 面）／完工总结。
