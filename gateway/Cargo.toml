@@ -69,5 +69,7 @@ tokio = { version = "1", features = ["full"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# 复审结论：unwind（默认）而非 abort——supervise() 靠 JoinHandle 捕获 panic 重启后台任务，
+# abort 下任一 panic 直接带走整个进程，supervisor 形同虚设。strip 保留（体积）。
+panic = "unwind"
 strip = true

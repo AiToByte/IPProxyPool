@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 /// 会话粘性有效期（秒）：超时后会话绑定失效，可被清理。
 const SESSION_TTL_SECS: u64 = 600;
 
+/// 隔离 TTL 上限（秒，24h）：`set_quarantine` 与 PubSub 解析共用。
+/// 复审结论：`Instant + Duration` 会溢出 panic——u64::MAX 级输入（毒报文/非法 env）
+/// 必须钳制；上限远超业务 TTL（60/600s），钳制无行为影响。
+pub const QUARANTINE_MAX_TTL_SECS: u64 = 86400;
+
 /// R2-2 域名归一化：去空白 → 剥端口（`host:port`，端口须全数字）→ 去尾点 → 小写。
 ///
 /// - 目标是让隔离 key 与选路匹配对大小写/端口变体一致；
@@ -60,10 +65,15 @@ impl RouterEngine {
     /// 施加域级隔离（GW-2 熔断器 / PubSub 增量同步调用）。
     /// R2-2：domain 统一归一化（小写 + 剥端口 + 去尾点），`A.COM:443` 与
     /// `a.com` 落同一 key，大小写/端口变体绕不过隔离。
+    /// 复审钳制：ttl 先取上限再相加（`checked_add` 显式无 panic；上限内 checked 恒成功，
+    /// 写成 checked 形式以证 panic-free，而非依赖平台知识）。
     pub fn set_quarantine(&self, domain: &str, ip: &str, ttl_secs: u64) {
         let key = format!("{}:{ip}", normalize_domain(domain));
-        self.quarantine_map
-            .insert(key, Instant::now() + Duration::from_secs(ttl_secs));
+        let ttl = Duration::from_secs(ttl_secs.min(QUARANTINE_MAX_TTL_SECS));
+        let expiry = Instant::now()
+            .checked_add(ttl)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(QUARANTINE_MAX_TTL_SECS));
+        self.quarantine_map.insert(key, expiry);
     }
 
     /// 导出当前全量节点快照（含被隔离节点，用于臂表修剪白名单）。
@@ -342,6 +352,30 @@ fn pick_weighted(candidates: &[Arc<ProxyNode>], rng: &mut impl Rng) -> Option<Ar
 mod tests {
     use super::*;
     use crate::model::ProxyNode;
+
+    #[test]
+    fn quarantine_ttl_clamped_no_overflow() {
+        // 复审 FLAG：极端 ttl（u64::MAX，PubSub 毒报文形态）不得 panic，
+        // 按上限钳制；条目仍生效且可 sweep 清理。
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("x.example", "10.0.0.1", u64::MAX);
+        let exp = r
+            .quarantine_map
+            .get("x.example:10.0.0.1")
+            .map(|e| *e.value())
+            .expect("entry");
+        let horizon = Instant::now() + Duration::from_secs(QUARANTINE_MAX_TTL_SECS);
+        assert!(
+            exp <= horizon + Duration::from_secs(1),
+            "expiry must be clamped"
+        );
+        // 钳制语义：MAX+1 秒后 sweep 即清理（TTL 有限，非永久隔离）。
+        let (s, q) = r.sweep_expired_at(horizon + Duration::from_secs(1));
+        assert_eq!((s, q), (0, 1));
+        // 正常值不受影响。
+        r.set_quarantine("x.example", "10.0.0.2", 600);
+        assert!(r.is_quarantined("x.example", "10.0.0.2", Instant::now()));
+    }
 
     fn fixtures() -> Vec<ProxyNode> {
         vec![

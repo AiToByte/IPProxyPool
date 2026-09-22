@@ -90,6 +90,12 @@ fn env_secs(key: &str, default_secs: u64) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(default_secs))
 }
 
+/// 复审钳制：FREE_TTL 上限（`now + ttl` 在 upsert/reverify，非法大值即 panic；
+/// 后台任务 panic 在 abort 下带走进程）。30 天远超合理 TTL（默认 30min），钳制无行为影响。
+pub fn clamp_free_ttl(ttl: Duration) -> Duration {
+    ttl.min(Duration::from_secs(30 * 86400))
+}
+
 /// FreePool 逗号分隔 URL 列表读值（去空白＋去空项＋仅 http/https，file/dict/gopher
 /// 一律过滤防 SSRF；缺省走 default）。
 fn split_env_list(key: &str, default: &str) -> Vec<String> {
@@ -269,7 +275,7 @@ async fn main() {
             html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
             github_urls: split_env_list("FREE_GITHUB_URLS", DEFAULT_GITHUB_URL),
             fetch_interval: env_secs("FREE_FETCH_INTERVAL_SECS", 600),
-            ttl: env_secs("FREE_TTL_SECS", 1800),
+            ttl: clamp_free_ttl(env_secs("FREE_TTL_SECS", 1800)),
             verify_timeout: env_secs("FREE_VERIFY_TIMEOUT_SECS", 3),
             max_latency_ms: env_str("FREE_MAX_LATENCY_MS", "3000")
                 .parse::<u64>()
@@ -585,6 +591,20 @@ mod tests {
         std::env::set_var("R2T_FREE_FLAG", "1");
         assert_eq!(env_str("R2T_FREE_FLAG", "0"), "1");
         std::env::remove_var("R2T_FREE_FLAG");
+    }
+
+    #[test]
+    fn clamp_free_ttl_bounds() {
+        // 复审 FLAG：FREE_TTL 非法大值不得传导到 `now + ttl`（upsert/reverify 会 panic）。
+        // 常规值原样过；u64::MAX 级钳到 30 天（远超合理 TTL，默认 30min）。
+        assert_eq!(
+            clamp_free_ttl(Duration::from_secs(1800)),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            clamp_free_ttl(Duration::from_secs(u64::MAX)),
+            Duration::from_secs(30 * 86400)
+        );
     }
 
     #[test]

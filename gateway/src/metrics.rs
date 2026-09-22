@@ -158,7 +158,7 @@ impl MetricsRegistry {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    /// FreePool 质检结果计数（result 调用方保证∈pass/tcp_fail/full_fail/backoff_skip）。
+    /// FreePool 质检结果计数（result 调用方保证∈pass/tcp_fail/full_fail/backoff_skip/geo_fail）。
     pub fn note_free_verify(&self, result: &str) {
         self.free_verify
             .entry(result.to_string())

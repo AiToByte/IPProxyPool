@@ -32,7 +32,10 @@ pub fn quarantine_ttl_for_status(status: u16) -> Option<u64> {
 }
 
 /// Parse a `QUARANTINE|domain|ip|ttl` delta message. Strict: exactly 4 parts.
+/// 复审钳制：ttl 为 0 或超上限（24h）直接拒收（毒报文不得进隔离表；
+/// 上限内由 `set_quarantine` 二次钳制兜底，双保险）。
 pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
+    use crate::router::QUARANTINE_MAX_TTL_SECS;
     let mut parts = payload.split('|');
     match (
         parts.next(),
@@ -44,6 +47,7 @@ pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
         (Some("QUARANTINE"), Some(domain), Some(ip), Some(ttl), None) => ttl
             .parse::<u64>()
             .ok()
+            .filter(|t| *t > 0 && *t <= QUARANTINE_MAX_TTL_SECS)
             .map(|t| (domain.to_string(), ip.to_string(), t)),
         _ => None,
     }
@@ -188,6 +192,22 @@ mod tests {
         );
         assert_eq!(parse_delta_message("OTHER|a.com|10.0.0.1|600"), None);
         assert_eq!(parse_delta_message("QUARANTINE|a.com|10.0.0.1|abc"), None);
+    }
+
+    #[test]
+    fn delta_parse_rejects_absurd_ttl() {
+        // 复审 FLAG：PubSub 毒报文（超大 ttl）不得进入隔离表（set_quarantine 的
+        // `Instant + Duration` 会 panic；上限以内由 set 侧钳制兜底）。
+        assert_eq!(parse_delta_message("QUARANTINE|a.com|10.0.0.1|0"), None);
+        assert_eq!(parse_delta_message("QUARANTINE|a.com|10.0.0.1|86401"), None);
+        assert_eq!(
+            parse_delta_message("QUARANTINE|a.com|10.0.0.1|18446744073709551615"),
+            None
+        );
+        assert_eq!(
+            parse_delta_message("QUARANTINE|a.com|10.0.0.1|86400"),
+            Some(("a.com".to_string(), "10.0.0.1".to_string(), 86400))
+        );
     }
 
     #[test]

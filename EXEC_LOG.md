@@ -488,3 +488,27 @@
 - **验证结果**：JA4 复核三证据行（本条＋计划内引用行号）；完工盘点 7 维度（步骤/提交/单测/数据面/进程/文档/冻结项）。
 - **下一步建议**：项目冻结，等待外部输入（Key／节点）或新方向。教训：阻塞项的价值在于冻结入口＋步骤，
   到位即执行，无需重新勘察——本计划即此作用。
+
+### [2026-09-22] 全面复审（锁纪律＋panic＋性能，多维独立审计）
+- **触发**：用户指令“再做一次整体代码审查（潜在 bug／性能／错漏多维）”。执行方式：
+  独立 subagent 全量核查锁纪律＋panic 路径（19 模块，非测试代码逐点），作者并行核查
+  除法／指标／注释漂移。
+- **锁纪律**：0 UNSAFE——parking_lot 守卫皆临时克隆后释放（`lock().clone()` 模式），
+  DashMap 守卫无一跨 await；唯一嵌套方向恒为 session→quarantine（无反向，无死锁）；
+  ArcSwap epoch guard 非阻塞锁；SeenIds 非锁。结论：冻结规则全仓成立。
+- **panic 面**：生产代码显式 unwrap/expect 仅 main 三处启动 fail-fast＋tenant 两处
+  infallible 构造；零 unsafe/todo；索引/切片逐点有界（normalize/scanner/body/chunk/
+  handshake 皆守卫覆盖）；算术除零/asm 转换逐点安全（SQL 空窗 NaN→100  intentional）。
+- **修复 3 FLAG（皆 TDD＋复绿）**：
+  1. `panic = "abort"`（release）架空 `supervise()`（后台 panic 直接带走进程）→改 `unwind`
+     （strip 保留）；release 全量 147 过复核。
+  2. `set_quarantine` 的 `Instant + Duration` 经 PubSub 毒报文（u64::MAX）可 panic→
+     `QUARANTINE_MAX_TTL_SECS`（86400）钳制＋checked 相加＋`parse_delta_message` 拒收
+     0/超限（双保险；单测 2）。
+  3. `FREE_TTL_SECS` 非法大值经 `now + ttl` 可 panic→`clamp_free_ttl`（30 天）＋main 接线
+     （单测 1）。
+  附带：metrics `result` 白名单注释补 `geo_fail`。
+- **性能面**：release 全量 147 过（含 8 臂 <200ns 激活断言）；热点路径无变化类
+  （R3-1 新增 Copy＋同类选择）；`snapshot_all` Arc 克隆／render 串构造为既有接受态；
+  无可执行优化项，不虚构。bench 编译过。
+- **结论**：复审转 3 修全落库（本条随修复同提交）；其余皆 SAFE，有据可查。
