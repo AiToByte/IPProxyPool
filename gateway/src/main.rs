@@ -215,6 +215,7 @@ async fn main() {
     // OPT-4：落库丢弃计数由 worker 与 metrics 共享（worker 直写、metrics 只读渲染）。
     // R2-4：再加通道丢弃计数（publisher 直写）；两行各自渲染、口径分离。
     // R2-8：`METRICS_ADDR` env 化。
+    // R3-4：GeoIP 库状态启动即打（移出 FREE 块：不开 FREE 也可见，避免静默 misconfig）。
     let telemetry_dropped = Arc::new(AtomicU64::new(0));
     let channel_dropped = Arc::new(AtomicU64::new(0));
     let metrics = Arc::new(MetricsRegistry::new_with_dropped(
@@ -244,6 +245,17 @@ async fn main() {
         .with_interval(env_secs("PREWARM_INTERVAL_SECS", 30));
     tokio::spawn(prewarmer.run());
 
+    // 3c. P3 exit-IP 画像库（R3-4：装配＋状态日志移出 FREE 块，不开 FREE 也可见库状态，
+    // 避免静默 misconfig；`with_geo` 仍只在 FREE 分支内 attach，行为不变）。
+    // `GEOIP_MMDB_PATH` 空/不可读→Disabled 降级，只观察不执法。
+    let geo_db = Arc::new(geo::GeoDb::open(env_str("GEOIP_MMDB_PATH", "").as_str()));
+    if !geo_db.enabled() {
+        log::info!(
+            "[GeoIP] disabled ({}), free exit-country checks observe-skip",
+            geo_db.reason()
+        );
+    }
+
     // 4e. FreePool 第二供应线（默认关闭；FREE_ENABLED=1 开启；全 env 见计划 §2）。
     if env_str("FREE_ENABLED", "0") == "1" {
         let mut full_base = env_str("FREE_FULL_CHECK_URL", DEFAULT_FULL_CHECK_BASE);
@@ -251,14 +263,7 @@ async fn main() {
             log::warn!("[FreePool] FREE_FULL_CHECK_URL must be https, falling back to default");
             full_base = DEFAULT_FULL_CHECK_BASE.to_string();
         }
-        // P3 exit-IP 画像库（`GEOIP_MMDB_PATH` 空/不可读→Disabled 降级，只观察不执法）。
-        let geo_db = Arc::new(geo::GeoDb::open(env_str("GEOIP_MMDB_PATH", "").as_str()));
-        if !geo_db.enabled() {
-            log::info!(
-                "[GeoIP] disabled ({}), free exit-country checks observe-skip",
-                geo_db.reason()
-            );
-        }
+        let free_geo = geo_db.clone();
         let free_config = FreePoolConfig {
             api_urls: split_env_list("FREE_API_URLS", DEFAULT_API_URL),
             html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
@@ -289,7 +294,6 @@ async fn main() {
         };
         let free_router = router.clone();
         let free_metrics = metrics.clone();
-        let free_geo = geo_db.clone();
         tokio::spawn(async move {
             tokio::time::sleep(startup_jitter()).await;
             log::info!("[FreePool] staggered start (second supply line)");

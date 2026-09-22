@@ -69,14 +69,64 @@ pub trait Source: Send + Sync {
     async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String>;
 }
 
+/// 条件 GET（R3-5 礼貌轮询共享件；GitHubSource 自有实现不动，存量冻结）。
+/// 发 `If-None-Match`／`If-Modified-Since`（有缓存才带）；304→`Ok(None)`
+/// （调用方包 `not_modified`，SourceGuard 不计数）；200→更新缓存并 `Ok(Some(body))`。
+async fn conditional_get(
+    client: &reqwest::Client,
+    url: &str,
+    etag: &parking_lot::Mutex<Option<String>>,
+    last_modified: &parking_lot::Mutex<Option<String>>,
+) -> Result<Option<String>, String> {
+    let mut req = client.get(url);
+    if let Some(e) = etag.lock().clone() {
+        req = req.header("If-None-Match", e);
+    }
+    if let Some(m) = last_modified.lock().clone() {
+        req = req.header("If-Modified-Since", m);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    if let Some(v) = resp.headers().get("etag").and_then(|h| h.to_str().ok()) {
+        *etag.lock() = Some(v.to_string());
+    }
+    if let Some(v) = resp
+        .headers()
+        .get("last-modified")
+        .and_then(|h| h.to_str().ok())
+    {
+        *last_modified.lock() = Some(v.to_string());
+    }
+    resp.text()
+        .await
+        .map(Some)
+        .map_err(|e| format!("read {url} failed: {e}"))
+}
+
 /// JSON API 源（默认 Geonode；URL env 可配，见 Task 12）。
 /// port 兼容字符串/数字双形态；缺 country 视为 None（后继标 ZZ）。
+/// R3-5 礼貌轮询：ETag/Last-Modified 缓存＋304（对齐 GitHubSource）。
 pub struct ApiSource {
     pub name: &'static str,
     pub url: String,
+    etag: parking_lot::Mutex<Option<String>>,
+    last_modified: parking_lot::Mutex<Option<String>>,
 }
 
 impl ApiSource {
+    pub fn new(name: &'static str, url: String) -> Self {
+        Self {
+            name,
+            url,
+            etag: parking_lot::Mutex::new(None),
+            last_modified: parking_lot::Mutex::new(None),
+        }
+    }
     pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
         let v: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
@@ -131,15 +181,10 @@ impl Source for ApiSource {
     }
 
     async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
-        let body = client
-            .get(&self.url)
-            .send()
-            .await
-            .map_err(|e| format!("GET {} failed: {e}", self.url))?
-            .text()
-            .await
-            .map_err(|e| format!("read {} failed: {e}", self.url))?;
-        Ok(FetchOutcome::nodes(Self::parse(self.name, &body)))
+        match conditional_get(client, &self.url, &self.etag, &self.last_modified).await? {
+            Some(body) => Ok(FetchOutcome::nodes(Self::parse(self.name, &body))),
+            None => Ok(FetchOutcome::not_modified()),
+        }
     }
 }
 
@@ -147,13 +192,25 @@ impl Source for ApiSource {
 /// 无 HTML 解析依赖：字节扫描 `a.b.c.d[:port]|</td><td>port` 形态，octet≤255、
 /// 端口 1..=65535；行内含 `socks4`/`socks5`（大小写不敏感）则标对应协议
 ///（Phase 1 Verifier 跳过）。
+/// R3-5 礼貌轮询：ETag/Last-Modified 缓存＋304（对齐 GitHubSource）。
 pub struct HtmlSource {
     pub name: &'static str,
     pub url: String,
     pub default_proto: FreeProto,
+    etag: parking_lot::Mutex<Option<String>>,
+    last_modified: parking_lot::Mutex<Option<String>>,
 }
 
 impl HtmlSource {
+    pub fn new(name: &'static str, url: String, default_proto: FreeProto) -> Self {
+        Self {
+            name,
+            url,
+            default_proto,
+            etag: parking_lot::Mutex::new(None),
+            last_modified: parking_lot::Mutex::new(None),
+        }
+    }
     pub fn extract(source: &str, html: &str, default_proto: FreeProto) -> Vec<RawNode> {
         let bytes = html.as_bytes();
         let mut out = Vec::new();
@@ -278,19 +335,14 @@ impl Source for HtmlSource {
     }
 
     async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
-        let body = client
-            .get(&self.url)
-            .send()
-            .await
-            .map_err(|e| format!("GET {} failed: {e}", self.url))?
-            .text()
-            .await
-            .map_err(|e| format!("read {} failed: {e}", self.url))?;
-        Ok(FetchOutcome::nodes(Self::extract(
-            self.name,
-            &body,
-            self.default_proto,
-        )))
+        match conditional_get(client, &self.url, &self.etag, &self.last_modified).await? {
+            Some(body) => Ok(FetchOutcome::nodes(Self::extract(
+                self.name,
+                &body,
+                self.default_proto,
+            ))),
+            None => Ok(FetchOutcome::not_modified()),
+        }
     }
 }
 
@@ -803,7 +855,9 @@ impl Registry {
             e.expires_at = now + self.ttl;
             e.health.note_success(fwd_latency_ms);
             e.health.anon = anon;
-            e.health.exit_ip = exit_ip;
+            e.health.exit_ip = exit_ip.clone();
+            // R3-2：快照节点同步真 egress（exit 轮转即更新；遥测 out_ip 与隔离消费）。
+            e.node.exit_ip = exit_ip;
             e.node.weight = e.health.weight();
             log::debug!(
                 "[FreePool] upsert {addr} anon={:?} exit={:?} score={:.3} weight={}",
@@ -817,7 +871,7 @@ impl Registry {
         let mut health = Health::fresh();
         health.note_success(fwd_latency_ms);
         health.anon = anon;
-        health.exit_ip = exit_ip;
+        health.exit_ip = exit_ip.clone();
         let node = ProxyNode::new(
             raw.ip.clone(),
             raw.port,
@@ -830,7 +884,8 @@ impl Registry {
             format!("free-{}", raw.source),
             health.weight(),
         )
-        .with_proto(egress_of(raw.proto));
+        .with_proto(egress_of(raw.proto))
+        .with_exit_ip(exit_ip);
         self.entries.insert(
             addr,
             Entry {
@@ -1086,19 +1141,14 @@ impl FreePoolWorker {
 
     /// P3 geo 观察（只观察不执法）：FullCheck 成功且有 exit_ip 时比对声明国家。
     /// mismatch 只记指标＋debug（DB 陈旧时执法会误杀好节点；执法留 Phase 4）。
+    /// 注：Disabled 时不注记（main 启动行 `[GeoIP] disabled` 已覆盖可观测；
+    /// 首 tick 注记在 supervisor 重启 Workers 时会重复刷计数器，R3-3 已删）。
     fn observe_geo(&self, raw: &RawNode, exit_ip: Option<&str>) {
         use crate::geo::exit_matches_source;
         let Some(geo) = self.geo.as_ref() else {
-            // Disabled 快捷：首 tick 记一次（每轮都记会刷计数器，注释写明）。
-            if self.tick == 1 {
-                self.metrics.note_geo_lookup("disabled");
-            }
             return;
         };
         if !geo.enabled() {
-            if self.tick == 1 {
-                self.metrics.note_geo_lookup("disabled");
-            }
             return;
         }
         let Some(exit) = exit_ip else {
@@ -1143,18 +1193,15 @@ impl FreePoolWorker {
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         for (i, url) in api_urls.iter().enumerate() {
             let name = self.intern_name(format!("api{i}"));
-            sources.push(Box::new(ApiSource {
-                name,
-                url: url.clone(),
-            }));
+            sources.push(Box::new(ApiSource::new(name, url.clone())));
         }
         for (i, url) in html_urls.iter().enumerate() {
             let name = self.intern_name(format!("html{i}"));
-            sources.push(Box::new(HtmlSource {
+            sources.push(Box::new(HtmlSource::new(
                 name,
-                url: url.clone(),
-                default_proto: FreeProto::Http,
-            }));
+                url.clone(),
+                FreeProto::Http,
+            )));
         }
         for (i, url) in github_urls.iter().enumerate() {
             let name = self.intern_name(format!("gh{i}"));
@@ -1493,6 +1540,96 @@ mod tests {
         );
     }
 
+    /// 通用 ETag stub：首轮 200＋ETag＋给定 body；次轮见 If-None-Match 含 v1 即 304。
+    /// 返回（端口，收到的 If-None-Match 记录）。R3-5 供 Api/Html 礼貌轮询断言。
+    async fn spawn_etag_stub(
+        body_200: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let inm = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("if-none-match:"))
+                    .map(|l| {
+                        l.split_once(':')
+                            .map(|(_, v)| v.trim().to_string())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                seen2.lock().expect("lock").push(inm.clone());
+                if inm.contains("v1") {
+                    let _ = s
+                        .write_all(b"HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n")
+                        .await;
+                } else {
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body_200}",
+                                body_200.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn api_source_etag_not_modified() {
+        // R3-5：ApiSource 礼貌轮询（对齐 GitHub）：首轮存 ETag，次轮 304→not_modified。
+        let body =
+            r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#;
+        let (port, seen) = spawn_etag_stub(body).await;
+        let client = reqwest::Client::new();
+        let src = ApiSource::new("api", format!("http://127.0.0.1:{port}/api"));
+        let first = src.fetch(&client).await.expect("first");
+        assert_eq!(first.nodes.len(), 1);
+        assert!(!first.not_modified);
+        let second = src.fetch(&client).await.expect("second");
+        assert!(second.not_modified);
+        assert!(second.nodes.is_empty());
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].contains("v1"));
+    }
+
+    #[tokio::test]
+    async fn html_source_etag_not_modified() {
+        // R3-5：HtmlSource 礼貌轮询同理。
+        let body = "<table><tr><td>203.0.113.7</td><td>8080</td></tr></table>";
+        let (port, seen) = spawn_etag_stub(body).await;
+        let client = reqwest::Client::new();
+        let src = HtmlSource::new(
+            "html",
+            format!("http://127.0.0.1:{port}/list"),
+            FreeProto::Http,
+        );
+        let first = src.fetch(&client).await.expect("first");
+        assert_eq!(first.nodes.len(), 1);
+        assert!(!first.not_modified);
+        let second = src.fetch(&client).await.expect("second");
+        assert!(second.not_modified);
+        assert!(second.nodes.is_empty());
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].contains("v1"));
+    }
+
     #[tokio::test]
     async fn verifier_admits_fast_listener() {
         // 本地 listener 必连上（OPT-6 手法），延迟门内放行。
@@ -1700,6 +1837,32 @@ mod tests {
         assert!(reg
             .snapshot(Instant::now() + Duration::from_secs(1801), false)
             .is_empty());
+    }
+
+    #[test]
+    fn registry_stores_exit_ip() {
+        // R3-2：upsert 的 exit_ip 落到快照节点（遥测 out_ip 用）；刷新即更新（exit 轮转不保留旧值）。
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        let now = Instant::now();
+        reg.upsert_full(
+            &raw("10.0.0.1", "a"),
+            50,
+            AnonLevel::Elite,
+            Some("10.9.9.9".to_string()),
+            now,
+        );
+        let snap = reg.snapshot(now, false);
+        assert_eq!(snap[0].exit_ip.as_deref(), Some("10.9.9.9"));
+        reg.upsert_full(
+            &raw("10.0.0.1", "a"),
+            60,
+            AnonLevel::Elite,
+            Some("10.9.9.10".to_string()),
+            now,
+        );
+        let snap2 = reg.snapshot(now, false);
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(snap2[0].exit_ip.as_deref(), Some("10.9.9.10"));
     }
 
     #[test]

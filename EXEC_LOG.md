@@ -343,3 +343,24 @@
   - `curl.exe` 直连 httpbin 仍空回而 reqwest 通——E2E 基址以 reqwest 实测为准（Phase 2 同结论复现）。
   - 存量 `health_score_math` 零修改通过（composite 映射边界设计正确，冻结成立）。
 - **下一步建议**：Phase 3 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 4（mismatch 执法＋GeoLite2 自动更新＋JA4 待 TLS 面）／完工总结。
+
+### [2026-09-22] 步骤 13 立项: OPT-R3 优化方案冻结（先落库，待执行）
+- 计划操作：基于 Phase 3 后全仓复核（19 模块，6 点：学选分裂／遥测出口盲区＋CB 耦合／重启注记通胀／GEOIP 日志位置／半截礼貌轮询／门禁）新建`plan/2026年9月22日-OPT-R3优化方案.md`（R3-1~R3-6，TDD checkbox 可直接执行）；`TASK_PLAN.md` 步骤 13 置待执行；本文件 append-only 记立项。
+- 复核实锤：R3-1（serve_via_socks 用均匀随机而 HTTP 无状态用 LinUCB，`gateway.rs` 行级确认）；R3-2（CB 用 `out_ip` 隔离而 `matches` 只比 `node.ip`——只改遥测必致免费线隔离静默失效，故捆绑 exit 感知修复）；R3-5（v2 G5 只修了 GitHub，Api/Html 仍裸 GET）。
+- 评估无动作：HEAD 经桥 CL 语义（合法 HTTP，罕见）、套利空窗（NaN→100 hold 已注释）、maxminddb 传递依赖（零，`cargo tree` 已验）。见方案§不做。
+- 预期验证方式：R3-6 四门（145±2/release bandit<200ns 复测＋4 live 真过）＋存量 curl＋E2E 五断言重跑＋新增 CH out_ip 公网断言＋dashboard 有效。
+- 范围：零新依赖；真 Key／Linux／Phase 4（执法＋库自更新）／JA4／P2C 延续 out。
+
+### [2026-09-22] 步骤 13 已完成: OPT-R3 优化（R3-1~R3-6 全✅ + E2E 重跑）
+- **实际操作**：R3-1（`pick_socks_candidate`＋无状态 LinUCB，1 单测）/R3-2（`exit_ip` 字段＋upsert 同步＋logging 真 egress＋`is_node_quarantined` 双检，2 单测）/R3-3（删两处 tick==1 注记）/R3-4（GeoDb 装配＋日志提到 3c）/R3-5（共享条件 GET＋Api/Html `::new` 迁移，2 单测）。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（修 scale 恒真 min＋redundant closure＋main mod 重行）。
+  - [门3-测试] ✅ `cargo test` 141 通过/0 失败/4 ignored（Phase 3 基线 136，+5；计划预估 145±2，实际 141——R3-3/R3-4 无新增单测，以实测为准）；`-- --ignored` 4 真过（先验 PONG/1，无 SKIP）。[门4-性能] ✅ bench 编译过；`cargo test --release bandit` 12 过（含 8 臂 <200ns，R3-1 选路改线无回归）。
+  - [存量回归] ✅ 网关 PID:9528（默认 env，`log/gw13.out/err`）：普通 mock-b-jp、US 粘性×2 mock-a-us、Proxy-Auth mock-b-jp、坏 Key 403、GB mock-c-gb、缺 Host 400、/metrics 200；默认网关启动行含 `[GeoIP] disabled (unset)`（R3-4 证据）；ChSink 幽灵消费者清理行（sink_5288）顺带验证。
+  - [E2E 重跑] ✅ 网关 PID:4544（`log/gw13-socks.out/err`，同 Phase 3 E2E env）：`tick=1 pool=0`（full_fail×1：3s 复检超时抖动）→`tick=2 pool=1`（pass＋transparent，自愈语义活证据）；`by_proto{socks5}=1`；socks 显式→mock-a-us；默认→mock-b-jp；tier 互斥 503；11 流量后 XLEN 9751→9762（+11）、CH 3323→3334（+11）；CH 新行 `free-gh0|27.18.3.145|200`（R3-2 新断言：out_ip 为公网 exit，旧行 127.0.0.1 为 R3-2 前行为对照）；dashboard JSON 有效＋5 panels。
+  - 综合判定：✅ OPT-R3 全绿收官（141 单测＋4 真 live＋release bandit＋四门绿＋E2E 重跑）。在线：网关 4544＋relay/list/mocks。
+- **遇到的问题与解决**：
+  - E2E 首 tick full_fail 致 pool=0——查 verify 分布定位复检超时（外部延迟方差），次 tick 自愈 pool=1；如实记录，不掩饰为“环境问题”（hold＋retry 正是设计语义，本轮顺带验证）。
+  - `u32::MAX` min 恒真＋redundant closure 两 clippy 修；`with_proto` 陈旧 allow 已清（转正生产消费）。
+  - 单测数 141 vs 预估 145±2：R3-3/R3-4 为删除/移动类变更无新增单测，差值合理，以实测为准。
+- **下一步建议**：OPT-R3 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 4／完工总结。

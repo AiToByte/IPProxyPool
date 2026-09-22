@@ -28,6 +28,9 @@ pub struct ProxyNode {
     pub weight: u32,
     /// P2 出站协议（默认 Http；SOCKS 节点经 `with_proto` 标注，走翻译桥出站）。
     pub proto: EgressProto,
+    /// R3-2 真 egress 出口 IP（FullCheck 实测；None＝未知/经典 HTTP 节点，
+    /// 此时遥测 out_ip 回落 `ip`，行为冻结）。
+    pub exit_ip: Option<String>,
 }
 
 /// 出站协议（P2 SOCKS egress）。
@@ -57,6 +60,7 @@ impl ProxyNode {
     /// 全字段构造（`addr` 按 `ip:port` 自动预存，保证一致）。
     /// 8 参数与字段 1:1 对应（builder 属过度设计，参考 `reload_nodes` 惯例放行）。
     /// `proto` 缺省 Http（P2：存量调用点零改动；SOCKS 节点经 `with_proto` 标注）。
+    /// `exit_ip` 缺省 None（R3-2：遥测回落 `ip`，存量行为冻结）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ip: String,
@@ -80,14 +84,20 @@ impl ProxyNode {
             provider,
             weight,
             proto: EgressProto::Http,
+            exit_ip: None,
         }
     }
 
-    /// P2：标注出站协议（free_pool Registry／静态装配用；P2-5 前仅单测消费，
-    /// 按 `reload_nodes` 惯例放行 dead）。
-    #[allow(dead_code)]
+    /// P2：标注出站协议（free_pool Registry／静态装配用）。
     pub fn with_proto(mut self, proto: EgressProto) -> Self {
         self.proto = proto;
+        self
+    }
+
+    /// R3-2：标注真 egress 出口（free_pool Registry 从 FullCheck 结果同步；
+    /// 遥测 out_ip 与隔离匹配消费）。
+    pub fn with_exit_ip(mut self, exit_ip: Option<String>) -> Self {
+        self.exit_ip = exit_ip;
         self
     }
 }

@@ -223,6 +223,22 @@ impl SmartProxyGateway {
         prune_stale_arms(&self.bandit_arms, &self.router)
     }
 
+    /// R3-1：socks 候选选择（有会话走粘滞＋失败排除；无会话走 LinUCB，与 HTTP
+    /// 无状态路径对齐——P2 的学选分裂在此闭合；router 侧已按 proto 过滤）。
+    fn pick_socks_candidate(
+        &self,
+        spec: &RoutingSpec,
+        excluded: &[String],
+        context: &VectorD,
+        has_session: bool,
+    ) -> Option<Arc<ProxyNode>> {
+        if has_session {
+            self.router.select_node_excluding(spec, excluded)
+        } else {
+            self.select_bandit_node_excluding(spec, excluded, context)
+        }
+    }
+
     /// P2：经翻译桥服务显式 socks 请求（`proxy_upstream_filter` 调用）。
     ///
     /// - 选路复用 `select_node_excluding`（粘滞＋失败排除；router 已按 proto 过滤，
@@ -286,11 +302,20 @@ impl SmartProxyGateway {
             }
         };
         let attempts = ctx.max_retries + 1;
+        let has_session = ctx.routing_spec.session_id.is_some();
+        // R3-1：bandit 上下文已在上文算好存 ctx（logging 复用）；此处 clone 出来
+        // 供无状态 LinUCB 选路（`VectorD` 为 Copy，零分配）。
+        let context = ctx.bandit_context.unwrap_or_else(|| {
+            self.bandit_engine
+                .extract_context(&ctx.routing_spec.target_domain)
+        });
         for _ in 0..attempts {
-            let Some(node) = self
-                .router
-                .select_node_excluding(&ctx.routing_spec, &ctx.failed_addrs)
-            else {
+            let Some(node) = self.pick_socks_candidate(
+                &ctx.routing_spec,
+                &ctx.failed_addrs,
+                &context,
+                has_session,
+            ) else {
                 break;
             };
             if node.proto == EgressProto::Http {
@@ -564,7 +589,12 @@ impl ProxyHttp for SmartProxyGateway {
             .map(|r| r.status.as_u16())
             .unwrap_or(0);
         let node = ctx.current_node.clone();
-        let node_ip = node.as_ref().map(|n| n.ip.as_str()).unwrap_or("none");
+        // R3-2：遥测 out_ip 取真 egress（exit_ip 有即用；经典 HTTP 节点 exit 恒 None，
+        // 回落代理入口 ip，存量行为冻结）。CB 隔离消费 out_ip（见 R3-2 matches 双检）。
+        let node_ip = node
+            .as_ref()
+            .map(|n| n.exit_ip.as_deref().unwrap_or(n.ip.as_str()))
+            .unwrap_or("none");
         // GW-3: online bandit feedback (reward → Sherman-Morrison update).
         // R2-6：复用 `upstream_peer` 已算好的上下文（选学一致 + 省一次时钟
         // syscall）；粘滞路径 ctx 为空时回落现算（与 R2-6 前行为一致）。
@@ -986,5 +1016,44 @@ mod tests {
             Some("http://api.target.com/p?q=1")
         );
         assert_eq!(bridge_url_for(&origin, None), None);
+    }
+
+    #[test]
+    fn socks_stateless_prefers_trained_winner() {
+        // R3-1：socks 无状态选路走 LinUCB（与 HTTP 路径对齐；有会话仍走粘滞）。
+        // helper 可单测直调（Session 不可单元构造，全链由 E2E 覆盖）。
+        use crate::bandit::LinUCBEngine;
+        use crate::model::EgressProto;
+        let mk = |ip: &str| {
+            ProxyNode::new(
+                ip.to_string(),
+                1080,
+                None,
+                None,
+                "ZZ".to_string(),
+                "free".to_string(),
+                "free-socks".to_string(),
+                10,
+            )
+            .with_proto(EgressProto::Socks5)
+        };
+        let gw = test_gateway(vec![mk("9.9.9.9"), mk("9.9.9.10")]);
+        let x = LinUCBEngine::new(0.4).extract_context("plain.example");
+        let nodes = gw.router.snapshot_all();
+        let winner = nodes.iter().find(|n| n.ip == "9.9.9.9").expect("winner");
+        let loser = nodes.iter().find(|n| n.ip == "9.9.9.10").expect("loser");
+        for _ in 0..5 {
+            arm_for(&gw.bandit_arms, winner).update(&x, 1.0);
+            arm_for(&gw.bandit_arms, loser).update(&x, 0.0);
+        }
+        let spec = RoutingSpec {
+            proto: Some(EgressProto::Socks5),
+            target_domain: "plain.example".to_string(),
+            ..Default::default()
+        };
+        let picked = gw
+            .pick_socks_candidate(&spec, &[], &x, false)
+            .expect("candidate");
+        assert_eq!(picked.ip, "9.9.9.9");
     }
 }

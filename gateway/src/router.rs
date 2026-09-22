@@ -138,10 +138,21 @@ impl RouterEngine {
                 return false;
             }
         }
-        if self.is_quarantined(&spec.target_domain, &node.ip, now) {
+        if self.is_node_quarantined(node, &spec.target_domain, now) {
             return false;
         }
         true
+    }
+
+    /// R3-2：节点级隔离判定（代理入口 ip＋真 egress exit_ip 双检）。
+    /// CB 消费遥测 `out_ip`（R3-2 起为真 egress），隔离条目可能落在任一地址上；
+    /// 双检保证代理级/出口级隔离都不静默失效（http 节点 exit 恒 None，行为冻结）。
+    fn is_node_quarantined(&self, node: &ProxyNode, domain: &str, now: Instant) -> bool {
+        self.is_quarantined(domain, &node.ip, now)
+            || node
+                .exit_ip
+                .as_deref()
+                .is_some_and(|e| self.is_quarantined(domain, e, now))
     }
 
     /// 按条件过滤健康候选节点（GW-3 LinUCB / 预热器 / 套利审计的统一入口）。
@@ -204,7 +215,7 @@ impl RouterEngine {
                 if !excluded_hit
                     && created_at.elapsed().as_secs() < SESSION_TTL_SECS
                     && still_live
-                    && !self.is_quarantined(&spec.target_domain, &node.ip, now)
+                    && !self.is_node_quarantined(node, &spec.target_domain, now)
                 {
                     return Some(Arc::clone(node));
                 }
@@ -822,6 +833,54 @@ mod tests {
                 .find(|n| n.ip == "10.0.0.1")
                 .map(|n| n.weight),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn quarantine_matches_exit_ip() {
+        // R3-2：隔离 exit_ip 即摘除该节点（CB 用 out_ip＝真 egress 隔离，见 logging）；
+        // 隔离 proxy ip 仍摘除；两者皆无即放行（双隔离，语义不降级）。
+        use crate::model::EgressProto;
+        let node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5)
+        .with_exit_ip(Some("10.9.9.9".to_string()));
+        let spec = RoutingSpec {
+            proto: Some(EgressProto::Socks5),
+            target_domain: "x.example".to_string(),
+            ..Default::default()
+        };
+        let r = RouterEngine::new(vec![node]);
+        assert!(r.select_node(&spec).is_some());
+        r.set_quarantine("x.example", "10.9.9.9", 600);
+        assert!(
+            r.select_node(&spec).is_none(),
+            "exit-ip quarantine must exclude"
+        );
+        let r2 = RouterEngine::new(vec![ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5)
+        .with_exit_ip(Some("10.9.9.9".to_string()))]);
+        r2.set_quarantine("x.example", "9.9.9.9", 600);
+        assert!(
+            r2.select_node(&spec).is_none(),
+            "proxy-ip quarantine must still exclude"
         );
     }
 
