@@ -8,8 +8,9 @@
 use crate::bandit::{compute_reward, BanditArm, LinUCBEngine, VectorD};
 use crate::fingerprint::FingerprintHardener;
 use crate::metrics::MetricsRegistry;
-use crate::model::{ProxyContext, ProxyNode, RoutingSpec};
+use crate::model::{EgressProto, ProxyContext, ProxyNode, RoutingSpec};
 use crate::router::{normalize_domain, RouterEngine};
+use crate::socks_bridge::{BridgeRequest, BridgeResponse, SocksBridge};
 use crate::telemetry::{TelemetryEvent, TelemetryPublisher};
 use crate::tenant::TenantManager;
 use async_trait::async_trait;
@@ -40,6 +41,8 @@ pub struct SmartProxyGateway {
     /// 不进入租户查询（语义与坏 Key 一致：`tenant_account=None`，logging 不释放配额）。
     /// 默认关闭（`REQUIRE_API_KEY=1` 开启），保持 GW-1~GW-4 存量 curl 行为不变。
     pub require_api_key: bool,
+    /// P2 SOCKS 翻译桥（`None`＝未装配：socks 显式请求直接 503；main 装配 Some，见 P2-7）。
+    pub bridge: Option<Arc<SocksBridge>>,
 }
 
 /// OPT-2 纯谓词：环境门是否应拦截本次请求。
@@ -144,6 +147,45 @@ pub fn prune_stale_arms(arms: &DashMap<String, Arc<BanditArm>>, router: &RouterE
     before - arms.len()
 }
 
+/// P2：HttpPeer 装配（含 socks 守卫）。
+///
+/// 守卫正常走不到（显式 socks 请求被 `proxy_upstream_filter` 短路，默认请求被
+/// router 默认隔离），但一旦走到必须硬 503——把 socks 地址当 HTTP 上游去连，
+/// 连上也是协议错配（HTTP 正向代理握手发给 SOCKS 端口必失败，还浪费一次重试）。
+fn build_http_peer(node: &ProxyNode, target_host: &str) -> Result<Box<HttpPeer>> {
+    if node.proto != EgressProto::Http {
+        return Err(Error::explain(
+            pingora_core::ErrorType::HTTPStatus(503),
+            "SOCKS node in HTTP path",
+        ));
+    }
+    // GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays
+    // out of scope (frozen: no uTLS/Boring this round).
+    let is_tls = false;
+    let mut peer = HttpPeer::new(node.addr.clone(), is_tls, target_host.to_string());
+    peer.options.connection_timeout = Some(Duration::from_millis(1500));
+    peer.options.read_timeout = Some(Duration::from_millis(5000));
+    peer.options.write_timeout = Some(Duration::from_millis(3000));
+    FingerprintHardener::apply_chrome_profile(&mut peer);
+    Ok(Box::new(peer))
+}
+
+/// P2：桥出站目标 URL。
+///
+/// - absolute-form（含 scheme＋authority，原样透传；https 由 reqwest 在隧道内建 TLS）；
+/// - origin-form 按 Host 头拼 `http://`（本网关上游现全 plain-HTTP，TLS 指纹仍 out）；
+/// - 无 Host 即 None（调用方按失败计，不 panic）。
+fn bridge_url_for(uri: &http::Uri, host: Option<&str>) -> Option<String> {
+    if uri.scheme().is_some() && uri.authority().is_some() {
+        return Some(uri.to_string());
+    }
+    let h = host?;
+    match uri.path_and_query() {
+        Some(pq) => Some(format!("http://{h}{pq}")),
+        None => Some(format!("http://{h}/")),
+    }
+}
+
 impl SmartProxyGateway {
     /// 无状态请求的 LinUCB 选路（无排除兼容入口；网关重试路径走 excluding 版）。
     #[allow(dead_code)]
@@ -179,6 +221,154 @@ impl SmartProxyGateway {
     #[allow(dead_code)]
     pub fn prune_arms(&self) -> usize {
         prune_stale_arms(&self.bandit_arms, &self.router)
+    }
+
+    /// P2：经翻译桥服务显式 socks 请求（`proxy_upstream_filter` 调用）。
+    ///
+    /// - 选路复用 `select_node_excluding`（粘滞＋失败排除；router 已按 proto 过滤，
+    ///   命中防御性校验 proto，非 socks 即跳过换下一个）；
+    /// - bandit 上下文算一次存 ctx（`logging` 复用，沿 R2-6）；
+    /// - 最多试 `max_retries + 1` 个不同节点（与 HTTP 重试预算对齐），失败记
+    ///   `failed_addrs`＋`retry_count`（遥测口径与 HTTP 重试一致）；
+    /// - 成功：合成响应＋`transferred_bytes` 累加（计量/遥测走 `logging` 现有路径）；
+    /// - 全失败／无候选／无桥：静态文案 503（细节打 warn 日志，不进错误类型）。
+    async fn serve_via_socks(&self, session: &mut Session, ctx: &mut ProxyContext) -> Result<()> {
+        let bridge = match self.bridge {
+            Some(ref b) => Arc::clone(b),
+            None => {
+                log::warn!("[SocksBridge] bridge offline, rejecting socks request");
+                return Err(Error::explain(
+                    pingora_core::ErrorType::HTTPStatus(503),
+                    "SOCKS bridge offline",
+                ));
+            }
+        };
+        let context = self
+            .bandit_engine
+            .extract_context(&ctx.routing_spec.target_domain);
+        ctx.bandit_context = Some(context);
+        // 出站目标与请求件（filter 时机下游头已齐：request_filter 已做鉴权/脱敏/对齐）。
+        let req_header = session.req_header();
+        let url = {
+            let host = req_header
+                .headers
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok());
+            match bridge_url_for(&req_header.uri, host) {
+                Some(u) => u,
+                None => {
+                    return Err(Error::explain(
+                        pingora_core::ErrorType::HTTPStatus(400),
+                        "SOCKS request without target",
+                    ));
+                }
+            }
+        };
+        let method = req_header.method.as_str().to_string();
+        let mut headers = Vec::new();
+        for (k, v) in req_header.headers.iter() {
+            if let Ok(val) = v.to_str() {
+                headers.push((k.as_str().to_string(), val.to_string()));
+            }
+        }
+        let body = if session.is_body_empty() {
+            None
+        } else {
+            match session.read_request_body().await {
+                Ok(b) => b.filter(|x| !x.is_empty()),
+                Err(e) => {
+                    log::warn!("[SocksBridge] read downstream body failed: {e:?}");
+                    return Err(Error::explain(
+                        pingora_core::ErrorType::HTTPStatus(400),
+                        "SOCKS request body unreadable",
+                    ));
+                }
+            }
+        };
+        let attempts = ctx.max_retries + 1;
+        for _ in 0..attempts {
+            let Some(node) = self
+                .router
+                .select_node_excluding(&ctx.routing_spec, &ctx.failed_addrs)
+            else {
+                break;
+            };
+            if node.proto == EgressProto::Http {
+                continue; // 防御分支：正常走不到（router 已按 spec.proto 过滤）。
+            }
+            ctx.current_node = Some(Arc::clone(&node));
+            ctx.transferred_bytes = 0; // OPT-3：只计最后 attempt
+            let breq = BridgeRequest {
+                method: method.clone(),
+                url: url.clone(),
+                headers: headers.clone(),
+                body: body.clone(),
+            };
+            match bridge.fetch(&node, breq).await {
+                Ok(resp) => {
+                    let bytes = resp.body.len() as u64;
+                    self.write_bridge_response(session, resp).await?;
+                    ctx.transferred_bytes = bytes;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("[SocksBridge] via {} failed: {e}", node.addr);
+                    record_failed_addr(ctx);
+                    if ctx.retry_count < ctx.max_retries {
+                        ctx.retry_count += 1;
+                    }
+                }
+            }
+        }
+        Err(Error::explain(
+            pingora_core::ErrorType::HTTPStatus(503),
+            "No SOCKS node available",
+        ))
+    }
+
+    /// P2：桥响应合成回下游（status＋过滤后头＋分 chunk body；content-length 显式）。
+    async fn write_bridge_response(
+        &self,
+        session: &mut Session,
+        resp: BridgeResponse,
+    ) -> Result<()> {
+        use pingora::http::ResponseHeader;
+        let mut head = ResponseHeader::build(resp.status, Some(resp.body.len())).map_err(|e| {
+            log::warn!("[SocksBridge] build response head failed: {e:?}");
+            Error::explain(
+                pingora_core::ErrorType::HTTPStatus(502),
+                "Bad SOCKS response",
+            )
+        })?;
+        for (k, v) in &resp.headers {
+            if k.eq_ignore_ascii_case("content-length") {
+                continue; // build 已按实际 body 设置，不取上游值
+            }
+            // 头名需 owned（`IntoCaseHeaderName` 只接受 `String`／`&'static str`，不收短借用）。
+            if head.insert_header(k.clone(), v.as_str()).is_err() {
+                log::debug!("[SocksBridge] skip illegal response header {k}");
+            }
+        }
+        session
+            .as_mut()
+            .write_response_header(Box::new(head))
+            .await?;
+        // 分 32KB chunk 流写（大 body 不额外缓冲；bridge 已做上限）。
+        const CHUNK: usize = 32 * 1024;
+        let mut off = 0;
+        while off < resp.body.len() {
+            let end = (off + CHUNK).min(resp.body.len());
+            session
+                .as_mut()
+                .write_response_body(resp.body.slice(off..end), false)
+                .await?;
+            off = end;
+        }
+        session
+            .as_mut()
+            .write_response_body(Bytes::new(), true)
+            .await?;
+        Ok(())
     }
 }
 
@@ -280,10 +470,6 @@ impl ProxyHttp for SmartProxyGateway {
                 "No active proxy node available",
             )
         })?;
-        // R2-6：`peer_addr` 在 move 进 ctx 前克隆（`Arc` 句柄本身零成本 move）。
-        let peer_addr = node.addr.clone();
-        ctx.current_node = Some(node);
-
         let target_host = session
             .req_header()
             .headers
@@ -291,16 +477,27 @@ impl ProxyHttp for SmartProxyGateway {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("default.target")
             .to_string();
+        // P2：peer 装配经守卫函数（socks 节点硬失败，正常走不到——见函数注释）。
+        let peer = build_http_peer(&node, &target_host)?;
+        // R2-6：`current_node` 落 ctx（`Arc` 句柄本身零成本 move）。
+        ctx.current_node = Some(node);
+        Ok(peer)
+    }
 
-        // GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays
-        // out of scope (frozen: no uTLS/Boring this round).
-        let is_tls = false;
-        let mut peer = HttpPeer::new(peer_addr, is_tls, target_host);
-        peer.options.connection_timeout = Some(Duration::from_millis(1500));
-        peer.options.read_timeout = Some(Duration::from_millis(5000));
-        peer.options.write_timeout = Some(Duration::from_millis(3000));
-        FingerprintHardener::apply_chrome_profile(&mut peer);
-        Ok(Box::new(peer))
+    /// P2 SOCKS 短路：显式 socks 请求（`X-Proxy-Proto: socks5/socks4`）不走
+    /// `upstream_peer`/HttpPeer，经翻译桥出站后合成响应回下游，返回 `Ok(false)`。
+    /// HTTP 快路径（默认＋显式 http）直接 `Ok(true)`，零改动。
+    /// 合成后 `logging()` 照常运行（status 取自已写响应，bandit／计量／遥测全复用）。
+    async fn proxy_upstream_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        if ctx.routing_spec.proto.unwrap_or(EgressProto::Http) == EgressProto::Http {
+            return Ok(true);
+        }
+        self.serve_via_socks(session, ctx).await?;
+        Ok(false)
     }
 
     async fn upstream_request_filter(
@@ -477,6 +674,15 @@ pub fn parse_routing_spec(header: &RequestHeader) -> RoutingSpec {
     {
         spec.tier = Some(t.to_string());
     }
+    // P2：显式出站协议（header 优先；非法值忽略回落默认 http）。
+    if let Some(p) = header
+        .headers
+        .get("X-Proxy-Proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::model::EgressProto::from_token)
+    {
+        spec.proto = Some(p);
+    }
 
     if let Some(auth) = header
         .headers
@@ -494,6 +700,11 @@ pub fn parse_routing_spec(header: &RequestHeader) -> RoutingSpec {
                             spec.session_id = Some(v.to_string());
                         } else if let Some(v) = token.strip_prefix("tier-") {
                             spec.tier = Some(v.to_string());
+                        } else if let Some(v) = token.strip_prefix("proto-") {
+                            // P2：token 形态仅在 header 未指定时生效（header 优先）。
+                            if spec.proto.is_none() {
+                                spec.proto = crate::model::EgressProto::from_token(v);
+                            }
                         }
                     }
                 }
@@ -535,6 +746,8 @@ mod tests {
             metrics: Arc::new(MetricsRegistry::new()),
             // 单测默认关门：存量路由/租户行为不受环境门影响。
             require_api_key: false,
+            // 单测不装桥（socks 全链路由 E2E 承担；无桥时 socks 请求 503 属正确）。
+            bridge: None,
         }
     }
 
@@ -647,6 +860,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_routing_spec_proto_header_and_token() {
+        // P2-1：X-Proxy-Proto 头解析（大小写不敏感）；Proxy-Auth proto- token；
+        // header 优先于 token；非法值回落 None（默认 http）。
+        use crate::model::EgressProto;
+        let h = header_with(&[("Host", "x.example"), ("X-Proxy-Proto", "SOCKS5")]);
+        assert_eq!(parse_routing_spec(&h).proto, Some(EgressProto::Socks5));
+        let raw = "u_proto-socks4:x";
+        let b64 = B64.encode(raw.as_bytes());
+        let mut h2 = header_with(&[("Host", "x.example")]);
+        h2.insert_header("Proxy-Authorization", format!("Basic {b64}"))
+            .unwrap();
+        assert_eq!(parse_routing_spec(&h2).proto, Some(EgressProto::Socks4));
+        // header 优先。
+        let raw3 = "u_proto-socks4:x";
+        let b643 = B64.encode(raw3.as_bytes());
+        let mut h3 = header_with(&[("Host", "x.example"), ("X-Proxy-Proto", "socks5")]);
+        h3.insert_header("Proxy-Authorization", format!("Basic {b643}"))
+            .unwrap();
+        assert_eq!(parse_routing_spec(&h3).proto, Some(EgressProto::Socks5));
+        // 非法值与缺省 → None。
+        let h4 = header_with(&[("Host", "x.example"), ("X-Proxy-Proto", "gopher")]);
+        assert_eq!(parse_routing_spec(&h4).proto, None);
+        let h5 = header_with(&[("Host", "x.example")]);
+        assert_eq!(parse_routing_spec(&h5).proto, None);
+    }
+
+    #[test]
     fn tenant_namespace_is_idempotent_and_tenant_scoped() {
         // R2-2：同名会话跨租户不串；已命名幂等；无会话/无租户不动。
         let mut spec = RoutingSpec {
@@ -708,5 +948,43 @@ mod tests {
         let mut empty = ProxyContext::default();
         record_failed_addr(&mut empty);
         assert!(empty.failed_addrs.is_empty());
+    }
+
+    #[test]
+    fn upstream_peer_refuses_socks_node() {
+        // P2-4 双保险：socks 节点直达 peer 构造即 Err（正常走不到——filter 已短路＋router 默认隔离）。
+        use crate::model::EgressProto;
+        let socks = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        assert!(build_http_peer(&socks, "x.example").is_err());
+        let http = test_node("10.0.0.1", 8080);
+        assert!(build_http_peer(&http, "x.example").is_ok());
+    }
+
+    #[test]
+    fn socks_request_url_shape() {
+        // P2-4：absolute-form 原样透传（含 https，reqwest 在隧道内建 TLS）；
+        // origin-form 按 Host 拼 http；无 Host 即 None（调用方判 400/502，不 panic）。
+        use http::Uri;
+        let abs: Uri = "https://api.target.com:8443/p?q=1".parse().unwrap();
+        assert_eq!(
+            bridge_url_for(&abs, Some("ignored.example")).as_deref(),
+            Some("https://api.target.com:8443/p?q=1")
+        );
+        let origin: Uri = "/p?q=1".parse().unwrap();
+        assert_eq!(
+            bridge_url_for(&origin, Some("api.target.com")).as_deref(),
+            Some("http://api.target.com/p?q=1")
+        );
+        assert_eq!(bridge_url_for(&origin, None), None);
     }
 }

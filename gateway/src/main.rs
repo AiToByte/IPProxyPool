@@ -20,6 +20,8 @@ mod model;
 mod pool;
 mod prober;
 mod router;
+mod socks_bridge;
+mod socks_handshake;
 mod telemetry;
 mod tenant;
 mod vendor_arbitrage;
@@ -43,6 +45,7 @@ use prober::CanaryProber;
 use rand::Rng;
 use redis::aio::ConnectionManager;
 use router::RouterEngine;
+use socks_bridge::SocksBridge;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 use telemetry::{TelemetryEvent, TelemetryPublisher, TelemetryWorker, TELEMETRY_CHANNEL_CAP};
@@ -470,9 +473,18 @@ async fn main() {
     // 4d. OPT-1 职守清理：每 60s 清过期会话/隔离 + 修剪游离臂，防长稳内存泄漏。
     // R2-7：启动错峰（与 prober/arbitrage 三 60s ticker 打散，不再对齐惊群）。
     // R2-8：清理间隔 env 化（`SWEEP_INTERVAL_SECS`，默认 60s）。
+    // P2-7：同节拍淘汰 bridge 闲置 Client（socks 节点下线/账密 rotation 后 key 不常驻）。
     let sweep_router = router.clone();
     let sweep_arms = bandit_arms.clone();
     let sweep_interval = env_secs("SWEEP_INTERVAL_SECS", 60);
+    // P2 SOCKS 翻译桥（显式 socks 请求出站执行器；env 见计划 §2）。
+    let socks_bridge = Arc::new(SocksBridge::new(
+        env_secs("SOCKS_BRIDGE_TIMEOUT_SECS", 20),
+        env_str("SOCKS_MAX_BODY_BYTES", "10485760")
+            .parse::<u64>()
+            .unwrap_or(10 * 1024 * 1024),
+    ));
+    let sweep_bridge = socks_bridge.clone();
     tokio::spawn(async move {
         tokio::time::sleep(startup_jitter()).await;
         log::info!("[Sweep] staggered start (R2-7 jitter)");
@@ -481,9 +493,10 @@ async fn main() {
             ticker.tick().await;
             let (sessions, quarantines) = sweep_router.sweep_expired();
             let arms = gateway::prune_stale_arms(&sweep_arms, &sweep_router);
-            if sessions + quarantines + arms > 0 {
+            let bridged = sweep_bridge.evict_idle();
+            if sessions + quarantines + arms + bridged > 0 {
                 log::info!(
-                    "[Sweep] cleared sessions={sessions} quarantines={quarantines} arms={arms}"
+                    "[Sweep] cleared sessions={sessions} quarantines={quarantines} arms={arms} bridge={bridged}"
                 );
             }
         }
@@ -504,6 +517,7 @@ async fn main() {
             tenant_mgr: tenant_mgr.clone(),
             metrics: metrics.clone(),
             require_api_key,
+            bridge: Some(socks_bridge.clone()),
         },
     );
     // R2-8：网关监听地址 env 化（`GATEWAY_ADDR`，默认 0.0.0.0:8080）。

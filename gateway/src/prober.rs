@@ -116,7 +116,8 @@ impl CanaryProber {
     /// R2-7 userinfo 百分号编码：`user:pass@` 含空格/保留字符时代理 URL 非法
     ///（未编码前复现为 `invalid proxy url` Dead）。按 RFC 3986 userinfo 允许集
     /// 放行（unreserved + sub-delims + `:`），其余字节 `%XX` 大写编码；零新依赖。
-    fn encode_userinfo(s: &str) -> String {
+    /// P2-3 起由 `socks_bridge` 复用（单份实现，不复制第二份）。
+    pub(crate) fn encode_userinfo(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {
             match b {
@@ -146,16 +147,24 @@ impl CanaryProber {
     }
 
     /// 拼接某节点的代理 URL（含可选的上游认证；账密百分号编码，R2-7）。
+    /// P2-6：按 `node.proto` 切 scheme（socks5 走远端解析 `socks5h`；`client_for`
+    /// 零改动——`Proxy::all` 原生接受 socks URL，socks feature 已开）。
     fn proxy_url_for(node: &ProxyNode) -> String {
+        use crate::model::EgressProto;
+        let scheme = match node.proto {
+            EgressProto::Http => "http",
+            EgressProto::Socks5 => "socks5h",
+            EgressProto::Socks4 => "socks4",
+        };
         match (&node.username, &node.password) {
             (Some(u), Some(p)) => format!(
-                "http://{}:{}@{}:{}",
+                "{scheme}://{}:{}@{}:{}",
                 Self::encode_userinfo(u),
                 Self::encode_userinfo(p),
                 node.ip,
                 node.port
             ),
-            _ => format!("http://{}:{}", node.ip, node.port),
+            _ => format!("{scheme}://{}:{}", node.ip, node.port),
         }
     }
 
@@ -325,5 +334,43 @@ mod tests {
             ProbeResult::Dead { .. } | ProbeResult::Degraded { .. } => {}
             ProbeResult::Healthy { .. } => panic!("bad proxy must not report healthy"),
         }
+    }
+
+    #[test]
+    fn proxy_url_for_socks_shape() {
+        // P2-6：socks 节点按协议出 URL（socks5 走远端解析）；http 形态冻结不变；
+        // 编码后 `Proxy::all` 可接受（socks feature 已开）。
+        use crate::model::EgressProto;
+        let mut s5 = crate::model::ProxyNode::new(
+            "1.2.3.4".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        assert_eq!(CanaryProber::proxy_url_for(&s5), "socks5h://1.2.3.4:1080");
+        s5.username = Some("u x".to_string());
+        s5.password = Some("p@y".to_string());
+        assert_eq!(
+            CanaryProber::proxy_url_for(&s5),
+            "socks5h://u%20x:p%40y@1.2.3.4:1080"
+        );
+        assert!(reqwest::Proxy::all(CanaryProber::proxy_url_for(&s5)).is_ok());
+        let s4 = crate::model::ProxyNode::new(
+            "1.2.3.5".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks4);
+        assert_eq!(CanaryProber::proxy_url_for(&s4), "socks4://1.2.3.5:1080");
     }
 }

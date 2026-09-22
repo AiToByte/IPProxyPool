@@ -8,7 +8,7 @@
 //! instead of `Arc<parking_lot::RwLock<Vec<ProxyNode>>>`, so no blocking lock
 //! is ever held across an `.await` (frozen repo rule).
 
-use crate::model::RoutingSpec;
+use crate::model::{EgressProto, RoutingSpec};
 use crate::router::RouterEngine;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,15 +66,25 @@ impl ConnectionPrewarmer {
 
     /// OPT-6 单轮预热：真 TCP 预建链（R2-7 信号量限流）。
     ///
-    /// - 建链环：对每个候选节点 `TcpStream::connect(addr)`（1s 超时），
+    /// - 建链环：http 节点 `TcpStream::connect(addr)`；socks 节点只做
+    ///   `greet_only`（P2：证明端口说 SOCKS，不对外 CONNECT，礼貌性）。
     ///   并发 spawn（信号量封顶），统计 `connected/failed`（失败只 debug，不抛错）；
+    /// - 候选集：默认 spec（http）＋显式 socks5/socks4 spec 三路并取
+    ///   （P2：默认隔离下 socks 对 `RoutingSpec::default()` 不可见，不并取即漏探）；
     /// - 永不 panic：空池返回零统计；单节点超时/拒连只记 `failed`。
     pub async fn warm_once(&self) -> WarmStats {
-        let candidates = self.router.get_healthy_candidates(&RoutingSpec::default());
-        // 真 TCP 预建链（并发 + 信号量封顶，1s 超时）：只探“节点可达”，不发应用层字节。
-        let mut handles = Vec::with_capacity(candidates.len());
-        for node in &candidates {
-            let addr = node.addr.clone();
+        let mut candidates = self.router.get_healthy_candidates(&RoutingSpec::default());
+        for proto in [EgressProto::Socks5, EgressProto::Socks4] {
+            let spec = RoutingSpec {
+                proto: Some(proto),
+                ..Default::default()
+            };
+            candidates.extend(self.router.get_healthy_candidates(&spec));
+        }
+        // 真探测（并发 + 信号量封顶，1s 超时）：只探“节点可达/说协议”，不发应用层字节。
+        let nodes = candidates.len();
+        let mut handles = Vec::with_capacity(nodes);
+        for node in candidates {
             let sem = self.semaphore.clone();
             handles.push(tokio::spawn(async move {
                 // 许可在建链期间持有：并发建链数恒 ≤ 上限（FD 有界）。
@@ -83,9 +93,20 @@ impl ConnectionPrewarmer {
                     Ok(p) => p,
                     Err(_) => return false,
                 };
-                tokio::time::timeout(PREWARM_TCP_TIMEOUT, tokio::net::TcpStream::connect(addr))
+                match node.proto {
+                    EgressProto::Http => tokio::time::timeout(
+                        PREWARM_TCP_TIMEOUT,
+                        tokio::net::TcpStream::connect(node.addr.clone()),
+                    )
                     .await
-                    .is_ok_and(|r| r.is_ok())
+                    .is_ok_and(|r| r.is_ok()),
+                    EgressProto::Socks5 | EgressProto::Socks4 => tokio::time::timeout(
+                        PREWARM_TCP_TIMEOUT,
+                        crate::socks_handshake::greet_only(&node.ip, node.port, node.proto),
+                    )
+                    .await
+                    .is_ok_and(|r| r.is_ok()),
+                }
             }));
         }
         let mut connected = 0usize;
@@ -95,7 +116,6 @@ impl ConnectionPrewarmer {
                 connected += 1;
             }
         }
-        let nodes = candidates.len();
         let failed = nodes.saturating_sub(connected);
         let stats = WarmStats {
             tickets: nodes,
@@ -290,5 +310,69 @@ mod tests {
             max.load(Ordering::SeqCst) <= 2,
             "max concurrent exceeded permits"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_socks_greeting_only() {
+        // P2-6：socks 节点只做 greeting（不对外 CONNECT，礼貌性）；
+        // 默认 spec 本不可见 socks——warm_once 须同时取 socks 候选（实现见 warm_once）。
+        use crate::model::EgressProto;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let mut head = [0u8; 2];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; head[1] as usize];
+            if s.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            let _ = s.write_all(&[0x05, 0x00]).await;
+        });
+        let socks = crate::model::ProxyNode::new(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        let router = Arc::new(RouterEngine::new(vec![socks]));
+        let pre = ConnectionPrewarmer::new(router);
+        let s = pre.warm_once().await;
+        assert_eq!(s.nodes, 1, "socks node must be warmed (not invisible)");
+        assert_eq!(s.connected, 1);
+        assert_eq!(s.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_socks_refused_counts_failed() {
+        // 127.0.0.1:1 socks 节点→failed，不 panic。
+        use crate::model::EgressProto;
+        let socks = crate::model::ProxyNode::new(
+            "127.0.0.1".to_string(),
+            1,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        let router = Arc::new(RouterEngine::new(vec![socks]));
+        let pre = ConnectionPrewarmer::new(router);
+        let s = pre.warm_once().await;
+        assert_eq!(s.nodes, 1);
+        assert_eq!(s.connected, 0);
+        assert_eq!(s.failed, 1);
     }
 }

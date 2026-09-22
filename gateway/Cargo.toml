@@ -43,7 +43,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # GW-2 telemetry / probing
 redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "streams", "aio"] }
 crossbeam-channel = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks", "stream"] }
 
 # GW-3 bandit / fingerprint
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }

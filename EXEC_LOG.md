@@ -297,3 +297,26 @@
   - 水位 0 属正常（计划 Task 13 已预言：源站直连受限即 hold 空集）；tier 隔离由单测锁定（residential/US 约束不命中 free-ZZ，无约束按 100:10 权重混合），curl 抽查普通流量仍命中付费大权重（mock-b-jp），无稀释异常。
   - `wmic` 在本机不可用（改 `Get-CimInstance Win32_Process` 查 mock 命令行）；CH 无密码查询报 AUTHENTICATION_FAILED（改 `-u proxy:123456`）。
 - **下一步建议**：FreePool 冻结（默认关闭，线上开需 `FREE_ENABLED=1`）；GW-R2 剩余仍待用户输入：三家真 Key（staging 1% 灰度）+ Linux 性能节点（50k/<1ms 验收）。教训：实现轮必须同步记 EXEC_LOG，否则后轮需先考古再回归（本轮即如此）。
+
+### [2026-09-22] 步骤 11 立项: Phase 2 SOCKS egress 计划冻结（先落库再执行）
+- 计划操作：基于 Pingora 0.6 全仓勘察（无 SOCKS connector；`ProxyHttp` 唯一出口 `upstream_peer()->HttpPeer`；`proxy_upstream_filter Ok(false)`＋合成响应为唯一零侵入扩展点，`lib.rs:592-621` 确认 `finish→logging` 照常；`read_request_body`/`write_response_header|body` 皆 public；reqwest 0.12 `socks = []` 空 feature 零新 crate）新建`plan/2026年9月22日-Phase2-SOCKS实施计划.md`（P2-1~P2-8，TDD checkbox 可直接执行）；`TASK_PLAN.md` 步骤 11 置进行中；本文件 append-only 记立项。
+- 架构锁定：EgressProto（model 单源）→Router 默认隔离（无 proto 头永不命中 socks）→`proxy_upstream_filter` 短路（显式 socks 请求：选路→桥→合成→ctx 记账，logging/计量/遥测/bandit 全复用）＋`upstream_peer` socks 守卫双保险；`socks_handshake` 纯 tokio 手写（RFC1928/1929＋SOCKS4）；`socks_bridge` per-node Client 缓存（沿 prober OPT-5）＋body 上限＋hop 头过滤；free 全收＋prober/pool 跟进；新增 env 仅 2 个（桥超时/body 上限）。
+- 预期验证方式：P2-8 四门（fmt/clippy/test 121±2/bench 编译＋4 live 真过，先验依赖＋无 SKIP）＋存量 curl 零变化＋本地确定性 E2E（list server＋relay stub＋free 管道＋`X-Proxy-Proto: socks5` curl→mock body，全 localhost 零外网依赖）。
+- 范围：零新依赖（reqwest 加 `socks` 空 feature 名）；客户端 CONNECT 隧道/UDP/默认流量走 socks/Pingora fork/IPv6 CONNECT 目标 explicitly out（见计划 §4）。
+
+### [2026-09-22] 步骤 11 已完成: Phase 2 SOCKS egress（P2-1~P2-8 全✅ + 本地 E2E）
+- **实际操作**：P2-1（`EgressProto`＋`ProxyNode.proto` 缺省 Http／`with_proto`＋`RoutingSpec.proto`＋matches 默认隔离＋header/token 解析；17 处字面量迁移）/P2-2（`socks_handshake.rs` RFC1928/1929＋SOCKS4/4a＋greet_only，4 单测字节断言）/P2-3（`socks_bridge.rs` per-node Client 缓存＋hop 过滤＋body 上限＋relay 透传，3 单测；reqwest 加 `socks`＋`stream` feature，lock 仅增 wasm 目标 `wasm-streams`，native 零新 crate）/P2-4（`proxy_upstream_filter` 短路＋合成响应＋`build_http_peer` 守卫＋粘滞 proto 复核，3 单测）/P2-5（`poolable` 概念退役＋proto 入池＋Verifier 握手/CONNECT＋FullChecker 经 socks＋by-proto 水位，5 单测）/P2-6（`proxy_url_for` 按 proto 切 scheme＋warm 三路候选＋greeting-only，3 单测）/P2-7（bridge 装配＋sweep 同节拍 evict＋2 env＋OPERATION§4/§6＋compose）。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（修 `poolable` 退役删除＋doc-list 体裁＋合成头名 owned String＋pool 移值顺序＋main mod 重行）。
+  - [门3-测试] ✅ `cargo test` 127 通过/0 失败/4 ignored（FreePool 基线 107，+20；计划预估 121±2，实际 127——warm 新增第 2 单测＋计数，以实测为准）；`-- --ignored` 4 真过（先验 PONG/Ok，无 SKIP）。[门4-性能] ✅ bench 编译过。
+  - [存量回归] ✅ 网关 PID:13452（默认 env，`log/gw11.out/err`）：六用例语义不变＋缺 Host 400＋/metrics 200；`X-Proxy-Proto: socks5` 在无 socks 池正确 503（守卫链证据）。
+  - [本地 E2E] ✅ 全 localhost：relay stub :1099（`log/socks_relay.py`，烟囱验证握手→CONNECT→mock 体）＋list :18080＋网关 PID:21428（`log/gw11-socks.out/err`，FREE_GITHUB 指本地，api/html 指 127.0.0.1:1 快速失败）：`tick=1 pool=1`（gh0 yield→握手→经 socks FullCheck→Transparent（同机出口，诚实记录）→REQUIRE_ELITE=0 合并）；`by_proto{http 0/socks4 0/socks5 1}`；`X-Proxy-Proto: socks5`＋Host 127.0.0.1:8888→`mock-a-us`（整链透传）；默认请求→mock-b-jp（隔离）；tier=residential＋socks5→503（互斥）；11 流量后 XLEN 9717→9730（+13）、CH 3289→3302（+13）；CH 行 `free-gh0|free|200×2`（落库级证据）。
+  - 综合判定：✅ Phase 2 全绿收官（127 单测＋4 真 live＋四门绿＋E2E 五断言）。在线：网关 21428＋relay 10272＋list 4364＋mocks 11444/30636/1436。
+- **遇到的问题与解决**：
+  - `pool.rs` 尾部一次 edit 内容截断致未闭合→读尾定位后重写修复（教训：大段 newString 提交后必读尾校验）。
+  - `bytes_stream` 需 `stream` feature（futures-util 已在锁内，零 native 新 crate；wasm-streams 仅 wasm 目标）。
+  - 合成头名须 owned String（`IntoCaseHeaderName` 不收短借用）；`ResponseHeader::build` 状态 u16 直转。
+  - `warm_once` 默认 spec 天然漏探 socks（三路并取修复，单测锁定 `nodes==1`）。
+  - `curl.exe` 直连 httpbin 空回（疑走代理 env），reqwest 直连/中继皆通——E2E 基址沿 reqwest 实测为准，不以 curl 为准。
+  - 无 socks 节点时 socks 显式请求 503 属正确（无候选），非回归。
+- **下一步建议**：Phase 2 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 3（GeoIP／JA4 门／per-tier 遗忘）／完工总结。教训：新模块先 dry-run 编译再写单测断言，减少红灯噪音。

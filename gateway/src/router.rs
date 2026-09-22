@@ -111,6 +111,15 @@ impl RouterEngine {
         if node.weight == 0 {
             return false;
         }
+        // P2：按出站协议隔离。显式约束须精确命中；默认（None）只放行 Http——
+        // SOCKS 节点永不服务默认流量（翻译桥只处理显式 socks 请求，见 gateway filter）。
+        if let Some(want) = spec.proto {
+            if node.proto != want {
+                return false;
+            }
+        } else if node.proto != crate::model::EgressProto::Http {
+            return false;
+        }
         if let Some(ref c) = spec.country {
             if !node.country.eq_ignore_ascii_case(c) {
                 return false;
@@ -182,12 +191,15 @@ impl RouterEngine {
                 let (node, created_at) = entry.value();
                 // R2-1：粘滞命中后必须复核“当前池”权重，derate 到 0 的会话要迁移，
                 // 不能沿用绑定时刻克隆的老权重。
+                // P2：同时复核 proto——绑 socks 节点的会话发默认请求必须迁走
+                // （否则 socks 节点漏进 HttpPeer 必失败；反之亦然）。
+                let want_proto = spec.proto.unwrap_or(crate::model::EgressProto::Http);
                 let still_live = self
                     .pools
                     .load()
                     .iter()
                     .find(|n| n.addr == node.addr)
-                    .is_some_and(|n| n.weight > 0);
+                    .is_some_and(|n| n.weight > 0 && n.proto == want_proto);
                 let excluded_hit = excluded.iter().any(|e| e == &node.addr);
                 if !excluded_hit
                     && created_at.elapsed().as_secs() < SESSION_TTL_SECS
@@ -327,6 +339,7 @@ mod tests {
             session_id: Some("task-001".to_string()),
             tier: None,
             target_domain: "example.com".to_string(),
+            proto: None,
         };
         // Single-candidate pool to make pinning deterministic.
         r.reload_nodes(vec![fixtures()[0].clone()]);
@@ -345,6 +358,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "a.com".to_string(),
+            proto: None,
         });
         assert!(blocked.is_none());
         let other = r.select_node(&RoutingSpec {
@@ -352,6 +366,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "b.com".to_string(),
+            proto: None,
         });
         assert!(other.is_some());
     }
@@ -365,6 +380,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             tier: None,
             target_domain: "example.com".to_string(),
+            proto: None,
         };
         r.reload_nodes(vec![fixtures()[0].clone()]);
         assert!(r.select_node(&spec).is_some());
@@ -423,6 +439,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "x.example".to_string(),
+            proto: None,
         }
     }
 
@@ -491,6 +508,7 @@ mod tests {
             session_id: Some("mig-1".to_string()),
             tier: None,
             target_domain: "example.com".to_string(),
+            proto: None,
         };
         let first = r.select_node(&spec).expect("bind");
         assert_eq!(first.ip, "10.0.0.1");
@@ -545,6 +563,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "a.com".to_string(),
+            proto: None,
         });
         assert!(blocked.is_none());
         let other = r.select_node(&RoutingSpec {
@@ -552,6 +571,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "b.com".to_string(),
+            proto: None,
         });
         assert!(other.is_some());
     }
@@ -583,6 +603,7 @@ mod tests {
             session_id: Some("exc-1".to_string()),
             tier: None,
             target_domain: "example.com".to_string(),
+            proto: None,
         };
         let first = r.select_node(&spec).expect("bind");
         assert_eq!(first.ip, "10.0.0.1");
@@ -673,6 +694,7 @@ mod tests {
             session_id: None,
             tier: Some("residential".to_string()),
             target_domain: "x.example".to_string(),
+            proto: None,
         };
         for _ in 0..20 {
             let n = r.select_node(&res_spec).expect("node");
@@ -684,6 +706,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "x.example".to_string(),
+            proto: None,
         };
         for _ in 0..20 {
             let n = r.select_node(&us_spec).expect("node");
@@ -695,6 +718,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "x.example".to_string(),
+            proto: None,
         };
         let mut saw_free = false;
         for _ in 0..100 {
@@ -717,8 +741,109 @@ mod tests {
             session_id: None,
             tier: Some("free".to_string()),
             target_domain: "x.example".to_string(),
+            proto: None,
         };
         let n = r.select_node(&free_spec).expect("node");
         assert!(n.provider.starts_with("free-"));
+    }
+
+    #[test]
+    fn proto_isolation_default_http_only() {
+        // P2-1：默认 spec（proto=None）永不命中 socks 节点；显式 socks5 只命中 socks5；
+        // 显式 http 不命中 socks；socks4 与 socks5 互斥。
+        use crate::model::EgressProto;
+        let http_node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let socks_node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        let r = RouterEngine::new(vec![http_node, socks_node]);
+        let open = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: None,
+            target_domain: "x.example".to_string(),
+            proto: None,
+        };
+        for _ in 0..20 {
+            assert_eq!(r.select_node(&open).expect("node").provider, "mock-a");
+        }
+        let s5 = RoutingSpec {
+            proto: Some(EgressProto::Socks5),
+            ..Default::default()
+        };
+        let n = r.select_node(&s5).expect("socks node");
+        assert!(n.provider.starts_with("free-"));
+        assert_eq!(n.proto, EgressProto::Socks5);
+        let h = RoutingSpec {
+            proto: Some(EgressProto::Http),
+            ..Default::default()
+        };
+        assert_eq!(r.select_node(&h).expect("node").provider, "mock-a");
+        let s4 = RoutingSpec {
+            proto: Some(EgressProto::Socks4),
+            ..Default::default()
+        };
+        assert!(r.select_node(&s4).is_none());
+    }
+
+    #[test]
+    fn sticky_binding_migrates_on_proto_mismatch() {
+        // P2-4：粘滞绑定只在同 proto 下复用——绑 socks 节点的会话发默认请求必须迁走
+        // （否则 socks 节点漏进 HttpPeer 必失败）；反之亦然。
+        use crate::model::EgressProto;
+        let http_node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let socks_node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        let r = RouterEngine::new(vec![http_node, socks_node]);
+        // 先用 socks 会话绑定 socks 节点。
+        let s5sess = RoutingSpec {
+            session_id: Some("sess-1".to_string()),
+            proto: Some(EgressProto::Socks5),
+            ..Default::default()
+        };
+        let bound = r.select_node(&s5sess).expect("bind socks");
+        assert!(bound.provider.starts_with("free-"));
+        // 同名会话发默认请求 → 迁到 http 节点（不沿用绑定）。
+        let open_sess = RoutingSpec {
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        };
+        let moved = r.select_node(&open_sess).expect("migrate");
+        assert_eq!(moved.provider, "mock-a");
     }
 }

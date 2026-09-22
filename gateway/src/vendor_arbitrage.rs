@@ -144,6 +144,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: "x.example".to_string(),
+            proto: None,
         };
         let remaining = router.get_healthy_candidates(&us);
         assert_eq!(remaining.len(), 1);

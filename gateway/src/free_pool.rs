@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 use std::time::Instant;
-/// 抓取协议（Phase 1 仅 Http/Https 进池，见 `Registry::snapshot` 过滤）。
+/// 抓取协议（P2：全协议进池；出站形态见 `egress_of`，选路隔离见 `RouterEngine::matches`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreeProto {
     Http,
@@ -25,11 +25,6 @@ impl FreeProto {
             "socks5" => Some(FreeProto::Socks5),
             _ => None,
         }
-    }
-
-    /// 是否允许进池（Phase 1 仅 HTTP(S)；SOCKS 标注保留待 Phase 2）。
-    pub fn poolable(self) -> bool {
-        matches!(self, FreeProto::Http | FreeProto::Https)
     }
 }
 
@@ -385,14 +380,48 @@ impl Source for GitHubSource {
     }
 }
 
-/// 质检器：TCP 建链（超时）＋延迟门。Phase 1 只收 Http/Https，其余协议
-/// 直接跳过（None；Phase 2 加 SOCKS 握手探测）。
-/// TCP 通过只代表“端口开放”，匿名度与转发能力由 Task 8 FullChecker 判定；
-/// 返回的建链延迟供 Registry 初值，权重主信号是 FullCheck 的转发延迟。
+/// `FreeProto`（抓取形态）→`EgressProto`（出站形态）。
+/// Http/Https 皆为 HTTP 正向代理（Phase 1 语义延续）；Socks4/5 直映（P2 走翻译桥）。
+pub fn egress_of(proto: FreeProto) -> EgressProto {
+    match proto {
+        FreeProto::Http | FreeProto::Https => EgressProto::Http,
+        FreeProto::Socks5 => EgressProto::Socks5,
+        FreeProto::Socks4 => EgressProto::Socks4,
+    }
+}
+
+/// `full_check_base`（`https://host[:port]`）→ socks CONNECT 验证目标。
+/// 仅 http/https 基址合法（file/dict 等一律 None，沿 SSRF 护栏口径）；缺省端口 443/80。
+pub fn socks_target_of_base(base: &str) -> Option<(String, u16)> {
+    let rest = base
+        .strip_prefix("https://")
+        .map(|r| (r, 443u16))
+        .or_else(|| base.strip_prefix("http://").map(|r| (r, 80u16)))?;
+    let authority = rest.0.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p.parse::<u16>().ok()?;
+            if h.is_empty() || port == 0 {
+                return None;
+            }
+            Some((h.to_string(), port))
+        }
+        None => Some((authority.to_string(), rest.1)),
+    }
+}
+/// 质检器：TCP 建链（超时）＋延迟门。
+/// Http/Https 走 TCP 建链（原语义；通过只代表端口开放，匿名度由 FullChecker 判定）。
+/// Socks4/5（P2）经 `socks_handshake::establish` 向 `socks_target` 做 CONNECT 验证，
+/// 无 target 时 greeting-only 降级（prewarmer 同口径）。
+/// 返回的延迟供 Registry 初值，权重主信号是 FullCheck 的转发延迟。
 #[derive(Clone)]
 pub struct Verifier {
     timeout: Duration,
     max_latency_ms: u64,
+    socks_target: Option<(String, u16)>,
 }
 
 impl Verifier {
@@ -400,23 +429,25 @@ impl Verifier {
         Self {
             timeout,
             max_latency_ms,
+            socks_target: None,
         }
     }
 
-    /// 通过返回建链延迟 ms；失败/超门/非 HTTP(S) 返回 None。
+    /// P2：设置 socks CONNECT 验证目标（Worker 传入 `full_check_base` 解析出的 host:port）。
+    pub fn with_socks_target(mut self, host: String, port: u16) -> Self {
+        self.socks_target = Some((host, port));
+        self
+    }
+
+    /// 通过返回质检耗时 ms；失败/超门返回 None。
     pub async fn verify(&self, raw: &RawNode) -> Option<u64> {
         match raw.proto {
-            FreeProto::Http | FreeProto::Https => {}
-            _ => {
-                log::debug!(
-                    "[FreePool] skip unsupported proto {:?} {}:{}",
-                    raw.proto,
-                    raw.ip,
-                    raw.port
-                );
-                return None;
-            }
+            FreeProto::Http | FreeProto::Https => self.verify_tcp(raw).await,
+            FreeProto::Socks5 | FreeProto::Socks4 => self.verify_socks(raw).await,
         }
+    }
+
+    async fn verify_tcp(&self, raw: &RawNode) -> Option<u64> {
         let start = std::time::Instant::now();
         let ok = tokio::time::timeout(
             self.timeout,
@@ -432,6 +463,38 @@ impl Verifier {
             Some(ms)
         } else {
             log::debug!("[FreePool] slow {}:{} {ms}ms over gate", raw.ip, raw.port);
+            None
+        }
+    }
+
+    async fn verify_socks(&self, raw: &RawNode) -> Option<u64> {
+        use crate::socks_handshake::{establish, greet_only};
+        let start = std::time::Instant::now();
+        let proto = egress_of(raw.proto);
+        let done = match self.socks_target.clone() {
+            Some((host, port)) => tokio::time::timeout(
+                self.timeout,
+                establish(&raw.ip, raw.port, None, None, proto, &host, port),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok()),
+            // 降级：greeting-only（免费节点无账密字段，账密节点不在免费线出现，注释写明）。
+            None => tokio::time::timeout(self.timeout, greet_only(&raw.ip, raw.port, proto))
+                .await
+                .is_ok_and(|r| r.is_ok()),
+        };
+        if !done {
+            return None;
+        }
+        let ms = start.elapsed().as_millis() as u64;
+        if ms <= self.max_latency_ms {
+            Some(ms)
+        } else {
+            log::debug!(
+                "[FreePool] slow socks {}:{} {ms}ms over gate",
+                raw.ip,
+                raw.port
+            );
             None
         }
     }
@@ -510,11 +573,14 @@ impl FullChecker {
     }
 
     pub async fn check(&self, raw: &RawNode, baseline_ip: &str) -> Option<FullCheckResult> {
-        match raw.proto {
-            FreeProto::Http | FreeProto::Https => {}
-            _ => return None,
-        }
-        let proxy_url = format!("http://{}:{}", raw.ip, raw.port);
+        // P2：全协议复检（三端点逻辑零改动；socks 经 reqwest 原生 socks 代理，
+        // socks5 走远端解析；匿名度/canary 同权）。
+        let scheme = match raw.proto {
+            FreeProto::Http | FreeProto::Https => "http",
+            FreeProto::Socks5 => "socks5h",
+            FreeProto::Socks4 => "socks4",
+        };
+        let proxy_url = format!("{scheme}://{}:{}", raw.ip, raw.port);
         let proxy = reqwest::Proxy::all(&proxy_url).ok()?;
         let client = reqwest::Client::builder()
             .proxy(proxy)
@@ -600,6 +666,7 @@ pub const TRUSTED_MAX_LATENCY_MS: f64 = 1500.0;
 pub const BACKOFF_BASE_SECS: u64 = 60;
 pub const BACKOFF_MAX_SECS: u64 = 3600;
 
+use crate::model::EgressProto;
 use crate::model::ProxyNode;
 use crate::router::RouterEngine;
 use std::collections::HashMap;
@@ -710,7 +777,8 @@ impl Registry {
     }
 
     /// 质检通过即插入/刷新（已存在 addr：续期＋health 更新，不覆盖 source；首见获胜）。
-    /// 非 poolable 协议（SOCKS）入口即丢弃（G7；Phase 2 前不进池）。
+    /// P2：全协议进池（Http/Https 走经典转发，Socks4/5 走翻译桥；出站形态存 `node.proto`，
+    /// 选路隔离见 `RouterEngine::matches`）。
     /// v1 `upsert(raw, latency, now)` 语义由本函数替代（TCP-only 降级时 anon=Unknown/lat=tcp）。
     pub fn upsert_full(
         &mut self,
@@ -720,15 +788,6 @@ impl Registry {
         exit_ip: Option<String>,
         now: Instant,
     ) {
-        if !raw.proto.poolable() {
-            log::debug!(
-                "[FreePool] skip non-poolable proto {:?} {}:{}",
-                raw.proto,
-                raw.ip,
-                raw.port
-            );
-            return;
-        }
         let addr = format!("{}:{}", raw.ip, raw.port);
         if let Some(e) = self.entries.get_mut(&addr) {
             e.expires_at = now + self.ttl;
@@ -760,7 +819,8 @@ impl Registry {
             "free".to_string(),
             format!("free-{}", raw.source),
             health.weight(),
-        );
+        )
+        .with_proto(egress_of(raw.proto));
         self.entries.insert(
             addr,
             Entry {
@@ -1097,24 +1157,17 @@ impl FreePoolWorker {
         if baseline.is_none() {
             log::warn!("[FreePool] baseline unreachable, degrading to TCP-only this tick");
         }
-        // 4a. TCP 初筛（信号量 max_concurrent；非 poolable 在 upsert 入口丢弃，
-        // 此处直接跳过并记 backoff_skip，避免无效建链）。
-        let verifier = Verifier::new(self.config.verify_timeout, self.config.max_latency_ms);
+        // 4a. 初筛（信号量 max_concurrent）：Http/Https 走 TCP 建链，
+        // Socks4/5 走握手/CONNECT 验证（目标＝复检基址 host，见 with_socks_target）。
+        let mut verifier = Verifier::new(self.config.verify_timeout, self.config.max_latency_ms);
+        if let Some((host, port)) = socks_target_of_base(&self.config.full_check_base) {
+            verifier = verifier.with_socks_target(host, port);
+        }
         let tcp_sem = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent.max(1),
         ));
         let mut set = tokio::task::JoinSet::new();
         for raw in raws {
-            if !raw.proto.poolable() {
-                log::debug!(
-                    "[FreePool] skip non-poolable proto {:?} {}:{}",
-                    raw.proto,
-                    raw.ip,
-                    raw.port
-                );
-                self.metrics.note_free_verify("backoff_skip");
-                continue;
-            }
             let sem = tcp_sem.clone();
             let vf = verifier.clone();
             set.spawn(async move {
@@ -1202,7 +1255,7 @@ impl FreePoolWorker {
         );
     }
 
-    /// 纯合并步（可单测）：快照 → 路由 → 水位计。
+    /// 纯合并步（可单测）：快照 → 路由 → 水位计（含按协议水位）。
     pub fn merge_once(
         router: &Arc<RouterEngine>,
         metrics: &Arc<crate::metrics::MetricsRegistry>,
@@ -1212,6 +1265,18 @@ impl FreePoolWorker {
         let now = Instant::now();
         let snap = registry.snapshot(now, require_elite);
         metrics.set_free_pool_nodes(snap.len() as u64);
+        // 按出站协议聚合水位（三档恒设 0/数值，仪表盘行稳定；P2-5）。
+        let (mut http, mut s5, mut s4) = (0u64, 0u64, 0u64);
+        for n in &snap {
+            match n.proto {
+                EgressProto::Http => http += 1,
+                EgressProto::Socks5 => s5 += 1,
+                EgressProto::Socks4 => s4 += 1,
+            }
+        }
+        metrics.set_free_pool_nodes_proto("http", http);
+        metrics.set_free_pool_nodes_proto("socks5", s5);
+        metrics.set_free_pool_nodes_proto("socks4", s4);
         router.replace_vendor_nodes("free-", snap);
     }
 
@@ -1758,5 +1823,241 @@ mod tests {
         FreePoolWorker::merge_once(&router, &metrics, &reg, false);
         assert_eq!(router.snapshot_all().len(), 1);
         assert!(metrics.render().contains("free_pool_nodes_total 1"));
+    }
+
+    fn socks_raw(ip: &str, source: &str) -> RawNode {
+        RawNode {
+            ip: ip.to_string(),
+            port: 1080,
+            proto: FreeProto::Socks5,
+            country: None,
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_stores_socks_proto() {
+        // P2-5：socks 节点正常进池（poolable 门已拆），快照携带 proto＝Socks5。
+        use crate::model::EgressProto;
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        let now = Instant::now();
+        reg.upsert_full(&socks_raw("9.9.9.9", "gh"), 50, AnonLevel::Elite, None, now);
+        let snap = reg.snapshot(now, false);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].proto, EgressProto::Socks5);
+        assert_eq!(snap[0].tier, "free");
+    }
+
+    /// CONNECT 常成功 stub（greeting→CONNECT→回成功；再读带 500ms 超时以兼容 greeting-only）。
+    async fn spawn_connect_ok_stub() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut s, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut head = [0u8; 2];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; head[1] as usize];
+            if s.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            if s.write_all(&[0x05, 0x00]).await.is_err() {
+                return;
+            }
+            // CONNECT 头 4 字节（500ms 读不到＝greeting-only，正常关闭）。
+            let mut req4 = [0u8; 4];
+            let got =
+                tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut req4)).await;
+            if got.is_err() {
+                return;
+            }
+            let rest_len = match req4[3] {
+                0x01 => 4 + 2,
+                0x03 => {
+                    let mut l = [0u8; 1];
+                    if s.read_exact(&mut l).await.is_err() {
+                        return;
+                    }
+                    l[0] as usize + 2
+                }
+                _ => return,
+            };
+            let mut rest = vec![0u8; rest_len];
+            if s.read_exact(&mut rest).await.is_err() {
+                return;
+            }
+            let _ = s
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn verifier_socks_handshake_ok_and_refused() {
+        // 有 target→CONNECT 验证 Some；无 target→greeting-only 降级 Some；拒连 None。
+        let stub = spawn_connect_ok_stub().await;
+        let raw = socks_raw("127.0.0.1", "t");
+        let raw = RawNode { port: stub, ..raw };
+        let v = Verifier::new(Duration::from_secs(3), 3000)
+            .with_socks_target("127.0.0.1".to_string(), stub);
+        assert!(v.verify(&raw).await.is_some());
+        let stub2 = spawn_connect_ok_stub().await;
+        let raw2 = RawNode {
+            port: stub2,
+            ..socks_raw("127.0.0.1", "t")
+        };
+        let v2 = Verifier::new(Duration::from_secs(3), 3000);
+        assert!(v2.verify(&raw2).await.is_some());
+        let refused = RawNode {
+            port: 1,
+            ..socks_raw("127.0.0.1", "t")
+        };
+        assert!(v.verify(&refused).await.is_none());
+    }
+
+    #[test]
+    fn check_target_parses_base() {
+        // full_check_base → CONNECT 验证目标（host＋端口，缺省 443/80）。
+        assert_eq!(
+            socks_target_of_base("https://httpbin.org"),
+            Some(("httpbin.org".to_string(), 443))
+        );
+        assert_eq!(
+            socks_target_of_base("http://127.0.0.1:18080/"),
+            Some(("127.0.0.1".to_string(), 18080))
+        );
+        assert_eq!(socks_target_of_base("gopher://x/"), None);
+        assert_eq!(socks_target_of_base(""), None);
+    }
+
+    #[tokio::test]
+    async fn fullcheck_via_socks_relay_reports_elite() {
+        // 本地 echo 基址（/ip＋/headers＋/anything 三连 accept）＋relay-stub
+        // （CONNECT 到 echo 端口后双向管道）→经 socks 复检 Some＋Elite。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let echo_port = echo.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut s, _) = match echo.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let body = if path.starts_with("/ip") {
+                    r#"{"origin":"10.9.9.9"}"#.to_string()
+                } else if path.starts_with("/headers") {
+                    r#"{"headers":{}}"#.to_string()
+                } else {
+                    format!(r#"{{"url":"http://x/anything/{FULL_CHECK_MARKER}"}}"#)
+                };
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let relay_port = relay.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut s, _) = match relay.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut head = [0u8; 2];
+                if s.read_exact(&mut head).await.is_err() {
+                    continue;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                if s.read_exact(&mut methods).await.is_err() {
+                    continue;
+                }
+                if s.write_all(&[0x05, 0x00]).await.is_err() {
+                    continue;
+                }
+                let mut req4 = [0u8; 4];
+                if s.read_exact(&mut req4).await.is_err() {
+                    continue;
+                }
+                let (host, port) = match req4[3] {
+                    0x01 => {
+                        let mut b = [0u8; 6];
+                        if s.read_exact(&mut b).await.is_err() {
+                            continue;
+                        }
+                        (
+                            std::net::IpAddr::from([b[0], b[1], b[2], b[3]]).to_string(),
+                            u16::from_be_bytes([b[4], b[5]]),
+                        )
+                    }
+                    0x03 => {
+                        let mut l = [0u8; 1];
+                        if s.read_exact(&mut l).await.is_err() {
+                            continue;
+                        }
+                        let mut b = vec![0u8; l[0] as usize + 2];
+                        if s.read_exact(&mut b).await.is_err() {
+                            continue;
+                        }
+                        let n = b.len();
+                        (
+                            String::from_utf8_lossy(&b[..n - 2]).to_string(),
+                            u16::from_be_bytes([b[n - 2], b[n - 1]]),
+                        )
+                    }
+                    _ => continue,
+                };
+                let mut up = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
+            }
+        });
+        let checker = FullChecker::new(
+            format!("http://127.0.0.1:{echo_port}"),
+            Duration::from_secs(5),
+        );
+        let raw = RawNode {
+            port: relay_port,
+            ..socks_raw("127.0.0.1", "t")
+        };
+        let res = checker.check(&raw, "1.2.3.4").await.expect("pass");
+        assert_eq!(res.anon, AnonLevel::Elite);
+        assert_eq!(res.exit_ip.as_deref(), Some("10.9.9.9"));
     }
 }

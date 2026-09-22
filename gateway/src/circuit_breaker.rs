@@ -208,6 +208,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: d.to_string(),
+            proto: None,
         };
         assert!(router.select_node(&spec("a.com")).is_some());
         let start = std::time::Instant::now();
@@ -285,6 +286,7 @@ mod tests {
             session_id: None,
             tier: None,
             target_domain: d.to_string(),
+            proto: None,
         };
         assert!(router.select_node(&spec(domain)).is_none());
         assert!(router.select_node(&spec("other.example")).is_some());

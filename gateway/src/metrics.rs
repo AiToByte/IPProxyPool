@@ -56,6 +56,9 @@ pub struct MetricsRegistry {
     free_anonymity: DashMap<String, AtomicU64>,
     /// FreePool 源站熔断 gauge（`free_pool_source_suspended{source}` 0/1 渲染）。
     free_suspended: DashMap<String, AtomicU64>,
+    /// P2 FreePool 按出站协议水位（`free_pool_nodes_by_proto{proto}` gauge 渲染；
+    /// proto∈http/socks5/socks4，merge 后三档恒设，仪表盘行稳定）。
+    free_nodes_by_proto: DashMap<String, AtomicU64>,
 }
 
 impl MetricsRegistry {
@@ -92,6 +95,7 @@ impl MetricsRegistry {
             free_verify: DashMap::new(),
             free_anonymity: DashMap::new(),
             free_suspended: DashMap::new(),
+            free_nodes_by_proto: DashMap::new(),
         }
     }
 
@@ -170,6 +174,14 @@ impl MetricsRegistry {
             .entry(source.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .store(u64::from(suspended), Ordering::Relaxed);
+    }
+
+    /// P2 FreePool 按出站协议水位（worker 每次合并后按快照聚合设置三档；只写 gauge）。
+    pub fn set_free_pool_nodes_proto(&self, proto: &str, n: u64) {
+        self.free_nodes_by_proto
+            .entry(proto.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(n, Ordering::Relaxed);
     }
 
     /// Record one finished proxied response (called from `logging`).
@@ -360,6 +372,18 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "free_pool_source_suspended{{source=\"{s}\"}} {n}\n"
             ));
+        }
+        // P2 FreePool 按出站协议水位（merge 后三档恒设；proto 白名单 http/socks5/socks4）。
+        out.push_str("# HELP free_pool_nodes_by_proto FreePool merged nodes by egress proto.\n");
+        out.push_str("# TYPE free_pool_nodes_by_proto gauge\n");
+        let mut protos: Vec<(String, u64)> = self
+            .free_nodes_by_proto
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        protos.sort();
+        for (p, n) in protos {
+            out.push_str(&format!("free_pool_nodes_by_proto{{proto=\"{p}\"}} {n}\n"));
         }
         out
     }
@@ -558,6 +582,17 @@ mod tests {
         assert!(m
             .render()
             .contains("free_pool_source_suspended{source=\"gh0\"} 0"));
+    }
+
+    #[test]
+    fn metrics_nodes_by_proto_rendered() {
+        // P2-5：按出站协议水位（merge 后按快照聚合设置；need 行存在且值正确）。
+        let m = MetricsRegistry::new();
+        m.set_free_pool_nodes_proto("socks5", 2);
+        m.set_free_pool_nodes_proto("http", 5);
+        let r = m.render();
+        assert!(r.contains("free_pool_nodes_by_proto{proto=\"socks5\"} 2"));
+        assert!(r.contains("free_pool_nodes_by_proto{proto=\"http\"} 5"));
     }
 
     #[tokio::test]

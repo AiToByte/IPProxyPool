@@ -87,6 +87,9 @@ services:
   #     FREE_REQUIRE_ELITE: "0"
   #     FREE_SOURCE_MAX_ZERO_CYCLES: "3"
   #     FREE_SUSPEND_RETRY_EVERY: "3"
+  #     # P2 SOCKS 翻译桥（显式 X-Proxy-Proto: socks5/socks4 请求出站执行器）。
+  #     SOCKS_BRIDGE_TIMEOUT_SECS: "20"
+  #     SOCKS_MAX_BODY_BYTES: "10485760"
 
 volumes:
   redis-data:

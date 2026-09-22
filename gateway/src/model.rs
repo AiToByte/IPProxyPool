@@ -26,11 +26,37 @@ pub struct ProxyNode {
     pub tier: String,
     pub provider: String,
     pub weight: u32,
+    /// P2 出站协议（默认 Http；SOCKS 节点经 `with_proto` 标注，走翻译桥出站）。
+    pub proto: EgressProto,
+}
+
+/// 出站协议（P2 SOCKS egress）。
+///
+/// - `Http`：经典 HTTP 正向代理（存量全部节点＋免费 http/https 映射到此）；
+/// - `Socks5`/`Socks4`：经网关内翻译桥出站；默认选路永不命中（见 `RouterEngine::matches` 隔离）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressProto {
+    Http,
+    Socks5,
+    Socks4,
+}
+
+impl EgressProto {
+    /// 解析客户端 `X-Proxy-Proto` 头／`proto-` token（大小写不敏感；非法值 None）。
+    pub fn from_token(tok: &str) -> Option<Self> {
+        match tok.to_ascii_lowercase().as_str() {
+            "http" | "https" => Some(EgressProto::Http),
+            "socks5" | "socks5h" => Some(EgressProto::Socks5),
+            "socks4" | "socks4a" => Some(EgressProto::Socks4),
+            _ => None,
+        }
+    }
 }
 
 impl ProxyNode {
     /// 全字段构造（`addr` 按 `ip:port` 自动预存，保证一致）。
     /// 8 参数与字段 1:1 对应（builder 属过度设计，参考 `reload_nodes` 惯例放行）。
+    /// `proto` 缺省 Http（P2：存量调用点零改动；SOCKS 节点经 `with_proto` 标注）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ip: String,
@@ -53,7 +79,16 @@ impl ProxyNode {
             tier,
             provider,
             weight,
+            proto: EgressProto::Http,
         }
+    }
+
+    /// P2：标注出站协议（free_pool Registry／静态装配用；P2-5 前仅单测消费，
+    /// 按 `reload_nodes` 惯例放行 dead）。
+    #[allow(dead_code)]
+    pub fn with_proto(mut self, proto: EgressProto) -> Self {
+        self.proto = proto;
+        self
     }
 }
 
@@ -64,6 +99,9 @@ pub struct RoutingSpec {
     pub session_id: Option<String>,
     pub tier: Option<String>,
     pub target_domain: String,
+    /// P2：显式出站协议约束（`X-Proxy-Proto` 头／`proto-` token）。
+    /// `None`＝默认 http（SOCKS 节点永不命中，见 `RouterEngine::matches`）。
+    pub proto: Option<EgressProto>,
 }
 
 /// Per-request gateway lifecycle context（稳定 API：全字段均被网关消费）。
