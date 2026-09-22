@@ -378,3 +378,15 @@
 - **H-C 性能**：热点路径无变化（R3-1 新增 Copy＋同类 bandit 选择，bench 断言持绿）；
   `snapshot_all` Arc 克隆／render 串构造皆为既有接受态；无可执行优化项，不虚构。
 - **结论**：硬化零负载问题（1 处卫生修复）。本条随修复同提交。
+
+### [2026-09-22] RA 误报兼容改写（free_pool 两处 format!＋geo matches!）
+- **背景**：用户 IDE（rust-analyzer，重载后依旧）报 `free_pool.rs:1764/2216 expected String, found ()`
+  与 `geo.rs:44 expected bool, found ()`；本机 `check/clippy/test`（含 release 双 profile）全绿，
+  无法复现。判定为 RA 对两类宏展开的推断误报（内联作用域捕获套 raw 大括号；`matches!` 尾表达式），
+  非 rustc 真错误。
+- **实际操作**：两处 `format!(r#"...{FULL_CHECK_MARKER}..."#)` 改显式位置参数；
+  `enabled()` 的 `matches!` 改显式 `match`。行为零变化（canary/Elite 定向单测复绿即证）；
+  注释写明缘由，防后人改回捕获式。
+- **验证结果**：fmt clean／clippy 零告警／141 过／定向 4 单测过。
+- **待用户确认**：若 RA 仍红→必为环境问题（RA 版本过旧/多工具链残留），需提供 RA 版本＋诊断码再查；
+  若转绿→结案。本条随改写同提交。

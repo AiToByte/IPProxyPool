@@ -39,8 +39,13 @@ impl GeoDb {
         }
     }
 
+    /// 是否已装载有效库（显式 match，不用 `matches!` 宏：部分 rust-analyzer 版本
+    /// 对宏尾表达式推断误报，见硬化记录；行为等价）。
     pub fn enabled(&self) -> bool {
-        matches!(self, Self::Live(_))
+        match self {
+            Self::Live(_) => true,
+            Self::Disabled { .. } => false,
+        }
     }
 
     /// 降级原因（`unset`／`unreadable`／`disabled`；main 启动日志消费，可观测）。

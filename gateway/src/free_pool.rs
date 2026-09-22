@@ -1760,7 +1760,9 @@ mod tests {
                     if tamper {
                         r#"{"url":"tampered"}"#.to_string()
                     } else {
-                        format!(r#"{{"url":"http://x/anything/{FULL_CHECK_MARKER}"}}"#)
+                        // 显式位置参数（不用内联作用域捕获：raw 字符串大括号＋捕获式混写
+                        // 在部分 rust-analyzer 版本误报，见硬化记录）。
+                        format!(r#"{{"url":"http://x/anything/{}"}}"#, FULL_CHECK_MARKER)
                     }
                 } else {
                     r#"{}"#.to_string()
@@ -2212,7 +2214,8 @@ mod tests {
                 } else if path.starts_with("/headers") {
                     r#"{"headers":{}}"#.to_string()
                 } else {
-                    format!(r#"{{"url":"http://x/anything/{FULL_CHECK_MARKER}"}}"#)
+                    // 同上：显式位置参数。
+                    format!(r#"{{"url":"http://x/anything/{}"}}"#, FULL_CHECK_MARKER)
                 };
                 let _ = s
                     .write_all(
