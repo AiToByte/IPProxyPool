@@ -27,6 +27,21 @@ pub fn arbitrage_action(success_rate: f64) -> Option<u32> {
     }
 }
 
+/// P3 免费独立套利：池级成功率 → 缩放因子（`None` = hold）。
+/// 分档：小于 50 摘除为 0.0（TTL 到期＋复检通过即自愈，与 paid 小于 80 归 0 同族语义）；
+/// 50~80 半权 0.5（free 上限本就远低于付费，半权即显著降载）；
+/// 大于等于 80 则 hold（free 永不自动抬到付费量级；恢复走复检/health 路径，注释写明）。
+/// 付费 `arbitrage_action` 80/95 冻结不动。
+pub fn free_pool_action(success_rate: f64) -> Option<f64> {
+    if success_rate < 50.0 {
+        Some(0.0)
+    } else if success_rate < 80.0 {
+        Some(0.5)
+    } else {
+        None
+    }
+}
+
 pub struct VendorArbitrageWorker {
     analytics: Arc<AnalyticsEngine>,
     router: Arc<RouterEngine>,
@@ -82,6 +97,41 @@ impl VendorArbitrageWorker {
                 }
             }
         }
+        self.audit_free_once().await;
+    }
+
+    /// P3 免费分支：枚举池内 `free-*` provider×country 去重对 → 池级 SLA →
+    /// 分档 scale（`free_pool_action`）。与付费循环解耦；CH 错 hold（同 degraded 语义）。
+    /// 恢复走复检/health 路径（本函数永不抬权，见 `free_pool_action`）。
+    pub async fn audit_free_once(&self) {
+        use std::collections::BTreeSet;
+        let pairs: BTreeSet<(String, String)> = self
+            .router
+            .snapshot_all()
+            .iter()
+            .filter(|n| n.provider.starts_with("free-"))
+            .map(|n| (n.provider.clone(), n.country.clone()))
+            .collect();
+        for (vendor, country) in pairs {
+            match self.analytics.query_provider_sla(&vendor, &country).await {
+                Ok(rate) => {
+                    log::info!(
+                        "[Arbitrage] free vendor={vendor} country={country} success={rate:.2}%"
+                    );
+                    if let Some(factor) = free_pool_action(rate) {
+                        self.router.scale_vendor_weights(&vendor, &country, factor);
+                        log::warn!(
+                            "[Arbitrage] free vendor={vendor} country={country} scale->{factor} (rate={rate:.2}%)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "[Arbitrage] free SLA query failed vendor={vendor} country={country}: {e:?} (weights hold)"
+                    );
+                }
+            }
+        }
     }
 
     /// Background loop until process exit.
@@ -107,6 +157,18 @@ mod tests {
         assert_eq!(arbitrage_action(95.0), None);
         assert_eq!(arbitrage_action(95.1), Some(100));
         assert_eq!(arbitrage_action(100.0), Some(100));
+    }
+
+    #[test]
+    fn free_pool_action_thresholds() {
+        // P3-2：池级成功率分档→缩放因子。<50 摘除（复检自愈）；50~80 半权；
+        // ≥80 hold（free 永不自动抬权，恢复走复检/health 路径）；付费 80/95 冻结不动。
+        assert_eq!(free_pool_action(0.0), Some(0.0));
+        assert_eq!(free_pool_action(49.9), Some(0.0));
+        assert_eq!(free_pool_action(50.0), Some(0.5));
+        assert_eq!(free_pool_action(79.9), Some(0.5));
+        assert_eq!(free_pool_action(80.0), None);
+        assert_eq!(free_pool_action(100.0), None);
     }
 
     #[test]

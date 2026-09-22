@@ -59,6 +59,10 @@ pub struct MetricsRegistry {
     /// P2 FreePool 按出站协议水位（`free_pool_nodes_by_proto{proto}` gauge 渲染；
     /// proto∈http/socks5/socks4，merge 后三档恒设，仪表盘行稳定）。
     free_nodes_by_proto: DashMap<String, AtomicU64>,
+    /// P3 GeoIP 观察计数（`geoip_lookups_total{result}` 渲染；result∈hit/miss/disabled/error）。
+    geo_lookups: DashMap<String, AtomicU64>,
+    /// P3 exit-国家分歧计数（`geoip_mismatch_total` 渲染；只收实锤分歧，见 `exit_matches_source`）。
+    geo_mismatch: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -96,6 +100,8 @@ impl MetricsRegistry {
             free_anonymity: DashMap::new(),
             free_suspended: DashMap::new(),
             free_nodes_by_proto: DashMap::new(),
+            geo_lookups: DashMap::new(),
+            geo_mismatch: AtomicU64::new(0),
         }
     }
 
@@ -184,6 +190,18 @@ impl MetricsRegistry {
             .store(n, Ordering::Relaxed);
     }
 
+    /// P3 GeoIP 观察计数（result 调用方保证∈hit/miss/disabled/error）。
+    pub fn note_geo_lookup(&self, result: &str) {
+        self.geo_lookups
+            .entry(result.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// P3 exit-国家实锤分歧计数（只观察不执法；执法留 Phase 4）。
+    pub fn note_geo_mismatch(&self) {
+        self.geo_mismatch.fetch_add(1, Ordering::Relaxed);
+    }
     /// Record one finished proxied response (called from `logging`).
     ///
     /// R2-6 写侧单原子：只给首个 `le >= value` 的桶 +1（每次 `observe` 恰一次
@@ -385,6 +403,24 @@ impl MetricsRegistry {
         for (p, n) in protos {
             out.push_str(&format!("free_pool_nodes_by_proto{{proto=\"{p}\"}} {n}\n"));
         }
+        // P3 GeoIP 观察分布＋实锤分歧（无数据时只 HELP/TYPE，沿 suspend 惯例保持干净）。
+        out.push_str("# HELP geoip_lookups_total GeoIP exit-country lookups by result.\n");
+        out.push_str("# TYPE geoip_lookups_total counter\n");
+        let mut geos: Vec<(String, u64)> = self
+            .geo_lookups
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        geos.sort();
+        for (r, n) in geos {
+            out.push_str(&format!("geoip_lookups_total{{result=\"{r}\"}} {n}\n"));
+        }
+        out.push_str("# HELP geoip_mismatch_total GeoIP exit-country hard mismatches.\n");
+        out.push_str("# TYPE geoip_mismatch_total counter\n");
+        out.push_str(&format!(
+            "geoip_mismatch_total {}\n",
+            self.geo_mismatch.load(Ordering::Relaxed)
+        ));
         out
     }
 }
@@ -593,6 +629,19 @@ mod tests {
         let r = m.render();
         assert!(r.contains("free_pool_nodes_by_proto{proto=\"socks5\"} 2"));
         assert!(r.contains("free_pool_nodes_by_proto{proto=\"http\"} 5"));
+    }
+
+    #[test]
+    fn metrics_geo_rendered() {
+        // P3-4：lookup 分布＋mismatch 行存在；mismatch 常驻 0 行（counter 语义）。
+        let m = MetricsRegistry::new();
+        m.note_geo_lookup("disabled");
+        m.note_geo_lookup("hit");
+        m.note_geo_mismatch();
+        let r = m.render();
+        assert!(r.contains("geoip_lookups_total{result=\"disabled\"} 1"));
+        assert!(r.contains("geoip_lookups_total{result=\"hit\"} 1"));
+        assert!(r.contains("geoip_mismatch_total 1"));
     }
 
     #[tokio::test]

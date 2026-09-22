@@ -15,6 +15,7 @@ mod circuit_breaker;
 mod fingerprint;
 mod free_pool;
 mod gateway;
+mod geo;
 mod metrics;
 mod model;
 mod pool;
@@ -250,6 +251,14 @@ async fn main() {
             log::warn!("[FreePool] FREE_FULL_CHECK_URL must be https, falling back to default");
             full_base = DEFAULT_FULL_CHECK_BASE.to_string();
         }
+        // P3 exit-IP 画像库（`GEOIP_MMDB_PATH` 空/不可读→Disabled 降级，只观察不执法）。
+        let geo_db = Arc::new(geo::GeoDb::open(env_str("GEOIP_MMDB_PATH", "").as_str()));
+        if !geo_db.enabled() {
+            log::info!(
+                "[GeoIP] disabled ({}), free exit-country checks observe-skip",
+                geo_db.reason()
+            );
+        }
         let free_config = FreePoolConfig {
             api_urls: split_env_list("FREE_API_URLS", DEFAULT_API_URL),
             html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
@@ -280,6 +289,7 @@ async fn main() {
         };
         let free_router = router.clone();
         let free_metrics = metrics.clone();
+        let free_geo = geo_db.clone();
         tokio::spawn(async move {
             tokio::time::sleep(startup_jitter()).await;
             log::info!("[FreePool] staggered start (second supply line)");
@@ -288,7 +298,8 @@ async fn main() {
                     free_router.clone(),
                     free_metrics.clone(),
                     free_config.clone(),
-                );
+                )
+                .with_geo(free_geo.clone());
                 async move { w.run(reqwest::Client::new()).await }
             })
             .await;

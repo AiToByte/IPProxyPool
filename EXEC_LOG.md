@@ -320,3 +320,26 @@
   - `curl.exe` 直连 httpbin 空回（疑走代理 env），reqwest 直连/中继皆通——E2E 基址沿 reqwest 实测为准，不以 curl 为准。
   - 无 socks 节点时 socks 显式请求 503 属正确（无候选），非回归。
 - **下一步建议**：Phase 2 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 3（GeoIP／JA4 门／per-tier 遗忘）／完工总结。教训：新模块先 dry-run 编译再写单测断言，减少红灯噪音。
+
+### [2026-09-22] 步骤 12 立项: Phase 3 画像与学习增强计划冻结（先落库再执行）
+- 计划操作：基于可行性勘察新建`plan/2026年9月22日-Phase3-画像与学习增强实施计划.md`（P3-1~P3-6，TDD checkbox）；`TASK_PLAN.md` 步骤 12 置进行中；本文件 append-only 记立项。
+- 勘察结论：cargo 可达 crates.io（`cargo search maxminddb` 通，`maxminddb 0.32.0` 已 fetch 入缓存；`curl.exe` 对部分 hosts 异常是本机工具问题，不以其为准）；crate 包内无测试 mmdb（test-data 为 git submodule，未随包发布）；Github raw 沙箱被墙（000）；GeoLite2 需 license key（账号墙）。三重确认沙箱无库——P3-4 降级交付（Disabled＋纯逻辑＋指标），全路径编译＋走查，生产配库（OUT- honest limitation，计划 F0/约束三处声明）。bandit（tier 字段＋updates 节拍器俱全，分档遗忘可直接落）／套利（`arbitrage_action` 纯核＋worker 循环可加 free 分支）／Health（score×延迟双因子俱全，加留存即 composite）皆就绪。dashboard 4 面板（加 1 free 面板）。
+- 诚实裁剪：JA4 漂移门 OUT（SPIKE-R2 NO-GO 延续，无 TLS 面变化；P3-1 风险溢价为诚实替代）；dLinUCB-change-detection／P2C OUT（per-tier forgetting 已覆盖）；mismatch 执法 OUT（观察→执法需运营数据，Phase 4）；GeoLite2 自动更新 OUT（运维事项）。
+- 预期验证方式：P3-6 四门（139±2/bench/release-bandit<200ns 复测＋4 live 真过）＋存量 curl＋E2E 五断言重跑＋dashboard JSON 有效。
+- 范围：新 crate 仅 maxminddb 0.32；真 Key 灰度／Linux 50k 仍待用户输入（并行不阻塞）。
+
+### [2026-09-22] 步骤 12 已完成: Phase 3 画像与学习增强（P3-1~P3-6 全✅ + E2E 重跑）
+- **实际操作**：P3-1（`forget_every_for_tier` free 1k/他 10k＋`FREE_RISK_PREMIUM` 0.15 进 UCB＋tier 转正，2 单测）/P3-2（`free_pool_action` 50/80 分档＋`scale_vendor_weights` 等比＋`audit_free_once` 快照枚举 free-*，2 单测）/P3-3（`Health::composite`＝score×留存因子＋weight 切换，`score()` 冻结，1 单测）/P3-4（`geo.rs` open/disabled/country＋fail-open 矩阵＋Worker 观察接线＋`note_geo_lookup/mismatch`＋main 装配＋env，5 单测；maxminddb 0.32 新依赖）/P3-5（dashboard 第 5 面板＋OPERATION§4 两行/§6 配库＋compose env）。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ 零告警（修 scale `.min(u32::MAX)` 恒真＋doc-list 体裁＋reason/disabled 未读＋main mod 重行）。
+  - [门3-测试] ✅ `cargo test` 136 通过/0 失败/4 ignored（Phase 2 基线 127，+9；计划预估 139±2，实际 136——geo 由 4 并为 3 有效单测＋计数，以实测为准）；`-- --ignored` 4 真过（先验 PONG/1，无 SKIP）。[门4-性能] ✅ bench 编译过；`cargo test --release bandit` 12 过（含 8 臂 <200ns 断言，P3-1 比较开销无回归）。
+  - [存量回归] ✅ 网关 PID:5288（P3 构建，`log/gw12.out/err`，FREE 指本地 E2E）：US 粘性两次 mock-a-us、Proxy-Auth mock-b-jp、坏 Key 403、GB mock-c-gb、缺 Host 400、/metrics 200——P3 改动零扰动。
+  - [E2E 重跑] ✅ `tick=1 pool=1`（composite 上线后合并正常）；`by_proto{socks5}=1`；`geo disabled(unset)` 启动行＋`geoip_lookups{disabled} 1`（首 tick 一次）＋`mismatch 0`；socks 显式→mock-a-us；默认→mock-b-jp；12 流量后 XLEN 9732→9744（+12）、CH 3304→3316（+12）；dashboard JSON 有效＋5 panels。
+  - 综合判定：✅ Phase 3 全绿收官（136 单测＋4 真 live＋release bandit＋四门绿＋E2E 重跑）。在线：网关 5288＋relay/list/mocks（沿 Phase 2 环境）。
+- **遇到的问题与解决**：
+  - 单测 gap 数学笔误（premium−cost 差＝0.10 非 0.15）→断言按构成式锁定＋注释写明（教训：含多项修正的公式先手算再断言）。
+  - maxminddb 0.32 API 为 `lookup→LookupResult→decode::<City>` 两段式（非直返模型），`City.country` 非 Option——以 registry 源码为准逐项核对（教训延续：manual/记忆不可靠）。
+  - exit 语义由“缺失 false”修正为 fail-open（未知不刷 mismatch 噪音；计划原文已更正，以实现为准；执法留 Phase 4）。
+  - `curl.exe` 直连 httpbin 仍空回而 reqwest 通——E2E 基址以 reqwest 实测为准（Phase 2 同结论复现）。
+  - 存量 `health_score_math` 零修改通过（composite 映射边界设计正确，冻结成立）。
+- **下一步建议**：Phase 3 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 4（mismatch 执法＋GeoLite2 自动更新＋JA4 待 TLS 面）／完工总结。

@@ -57,6 +57,27 @@
         }
       ],
       "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 }
+    },
+    {
+      "id": 5,
+      "title": "Free tier water/verify/geo",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(free_pool_nodes_by_proto)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (result) (free_pool_verify_total)",
+          "refId": "B"
+        },
+        {
+          "expr": "geoip_mismatch_total",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 }
     }
   ]
 }

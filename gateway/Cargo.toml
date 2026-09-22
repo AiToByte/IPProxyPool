@@ -58,6 +58,10 @@ chrono = "0.4"
 governor = "0.6"
 nonzero_ext = "0.3"
 
+# P3 exit-IP 画像：MaxMind DB 读取（DB 文件运营方配给，见 GEOIP_MMDB_PATH；
+# 沙箱无库时走 Disabled 降级，见 geo.rs 与计划 F0）。
+maxminddb = "0.32"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 

@@ -275,6 +275,32 @@ impl RouterEngine {
             .collect();
         self.pools.store(Arc::new(next));
     }
+
+    /// P3 免费独立套利：按 vendor×country 等比缩放权重（`factor` 来自 `free_pool_action`）。
+    /// 写时复制同 `adjust_vendor_weight`；`factor<=0` 即摘除（matches 滤 0），
+    /// 复检 upsert 按 health 重置权重即恢复；`factor>1` 不用（free 永不自动抬权，调用方保证）。
+    pub fn scale_vendor_weights(&self, vendor: &str, country: &str, factor: f64) {
+        let guard = self.pools.load();
+        let next: Vec<Arc<ProxyNode>> = guard
+            .iter()
+            .map(|n| {
+                if n.provider == vendor && n.country.eq_ignore_ascii_case(country) {
+                    let mut updated = (**n).clone();
+                    // factor<=0 即摘除（matches 滤 0）；round 后 as u32（非负 finite 必命中，
+                    // NaN/负数走下分支显式钳 0，不依赖饱和语义）。
+                    updated.weight = if factor <= 0.0 {
+                        0
+                    } else {
+                        (n.weight as f64 * factor).round() as u32
+                    };
+                    Arc::new(updated)
+                } else {
+                    Arc::clone(n)
+                }
+            })
+            .collect();
+        self.pools.store(Arc::new(next));
+    }
 }
 
 /// R2-1 加权随机核心（纯函数，可单测）：累计权重 roll，`total==0` 退化均匀。
@@ -745,6 +771,58 @@ mod tests {
         };
         let n = r.select_node(&free_spec).expect("node");
         assert!(n.provider.starts_with("free-"));
+    }
+
+    #[test]
+    fn scale_vendor_weights_proportional() {
+        // P3-2：按 vendor×country 等比缩放（round；factor≤0 即摘除，可恢复）。
+        // 非目标前缀节点不动；country 精确匹配（大小写不敏感沿 adjust 惯例）。
+        let a1 = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        let a2 = ProxyNode::new(
+            "10.0.0.2".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            6,
+        );
+        let paid = ProxyNode::new(
+            "10.0.0.3".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let r = RouterEngine::new(vec![a1, a2, paid]);
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.5);
+        let snap = r.snapshot_all();
+        let w = |ip: &str| snap.iter().find(|n| n.ip == ip).map(|n| n.weight);
+        assert_eq!(w("10.0.0.1"), Some(5));
+        assert_eq!(w("10.0.0.2"), Some(3));
+        assert_eq!(w("10.0.0.3"), Some(100));
+        // factor 0 → 摘除（matches 过滤）；factor>1 不用（free 永不自动抬权，注释写明）。
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.0);
+        assert_eq!(
+            r.snapshot_all()
+                .iter()
+                .find(|n| n.ip == "10.0.0.1")
+                .map(|n| n.weight),
+            Some(0)
+        );
     }
 
     #[test]

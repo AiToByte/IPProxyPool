@@ -23,9 +23,25 @@ pub const COST_RESIDENTIAL: f64 = 1.0;
 pub const COST_MOBILE: f64 = 3.0;
 /// R2-6 遗忘节拍：每 N 次 `update` 做一次轻 reset（向先验回 blended 10%），
 /// 重开探索空间。N=10k 按当前 QPS 约数小时一次，开销可忽略（一次 O(d²) blending）。
+/// 存量冻结（付费线行为）；免费线走短窗（P3-1）。
 pub const FORGET_EVERY_N_UPDATES: u64 = 10_000;
+/// P3 免费臂遗忘短窗（v2-F7：免费/residential IP 高 churn，平均可见 4.56 天，
+/// 60% 九十天只出现一次——声誉半衰期短一个量级，遗忘快 10 倍）。
+pub const FORGET_EVERY_FREE_UPDATES: u64 = 1_000;
+/// P3 免费风险溢价（v2-F5：免费≈全数据中心 IP→高 JA4 风控面；全 JA4 门需 TLS 面仍 out，
+/// 此处为诚实替代：UCB 上的可解释常数惩罚，不碰 context 维度，不过拟合）。
+pub const FREE_RISK_PREMIUM: f64 = 0.15;
 /// 轻 reset 保留比例（学到方向的 90% + 先验的 10%）。
 pub const FORGET_KEEP: f64 = 0.9;
+
+/// P3：按 tier 取遗忘节拍（大小写不敏感；未知 tier 走付费默认——fail-safe 向保守）。
+pub fn forget_every_for_tier(tier: &str) -> u64 {
+    if tier.eq_ignore_ascii_case("free") {
+        FORGET_EVERY_FREE_UPDATES
+    } else {
+        FORGET_EVERY_N_UPDATES
+    }
+}
 
 pub type VectorD = SVector<f64, CONTEXT_DIM>;
 pub type MatrixD = SMatrix<f64, CONTEXT_DIM, CONTEXT_DIM>;
@@ -54,8 +70,7 @@ pub fn compute_reward(status_code: u16, latency: Duration) -> f64 {
 pub struct BanditArm {
     /// Arm key (`ip:port`); doubles as the routing lookup key.
     pub key: String,
-    /// Egress tier (kept for GW-4 arbitrage/analytics; cost folded into `cost_weight`).
-    #[allow(dead_code)]
+    /// Egress tier（GW-4 套利/遥测 join 键；P3 起消费：分档遗忘节拍＋免费风险溢价）。
     pub tier: String,
     /// Single lock for the (matrix, vector) pair: one acquire per score.
     pub state: RwLock<ArmState>,
@@ -101,15 +116,21 @@ impl BanditArm {
         // Uncertainty bound sqrt(xᵀ A_inv x), clamped at 0 for fp noise.
         let a_inv_x = state.a_inv * context;
         let variance = context.dot(&a_inv_x).max(0.0).sqrt();
-        expected_reward + alpha * variance - 0.05 * self.cost_weight
+        let mut score = expected_reward + alpha * variance - 0.05 * self.cost_weight;
+        // P3 免费风险溢价（tier 精确匹配 free；大小写不敏感，key 隔离见 cost 惯例）。
+        if self.tier.eq_ignore_ascii_case("free") {
+            score -= FREE_RISK_PREMIUM;
+        }
+        score
     }
 
     /// Online update after passive feedback (Sherman-Morrison, O(d²)).
     ///
-    /// R2-6 遗忘：每 `FORGET_EVERY_N_UPDATES` 次触发一次轻 reset（见
-    /// [`apply_forgetting`]）。方案原议的 `A_inv *= 0.999 / b *= 0.999` 未采用：
-    /// 逆矩阵参数化下均匀收缩只会加速 `A_inv → 0`（探索更快归零，且抹掉已学
-    /// 方向）；向先验的 blend 才是打开不确定性的正确方向（单测锁定数学形态）。
+    /// R2-6 遗忘：节拍触发一次轻 reset（见 [`apply_forgetting`]）。方案原议的
+    /// `A_inv *= 0.999 / b *= 0.999` 未采用：逆矩阵参数化下均匀收缩只会加速
+    /// `A_inv → 0`（探索更快归零，且抹掉已学方向）；向先验的 blend 才是打开
+    /// 不确定性的正确方向（单测锁定数学形态）。
+    /// P3：节拍按臂 tier 分档（free 1k，其余 10k；见 [`forget_every_for_tier`]）。
     pub fn update(&self, context: &VectorD, reward: f64) {
         let mut state = self.state.write();
         state.b += reward * context;
@@ -118,7 +139,10 @@ impl BanditArm {
         let numerator = a_inv_x * a_inv_x.transpose();
         state.a_inv -= numerator / denominator;
         state.updates += 1;
-        if state.updates.is_multiple_of(FORGET_EVERY_N_UPDATES) {
+        if state
+            .updates
+            .is_multiple_of(forget_every_for_tier(&self.tier))
+        {
             apply_forgetting(&mut state);
         }
     }
@@ -337,6 +361,54 @@ mod tests {
         assert_eq!(compute_reward(502, Duration::from_millis(10)), 0.2);
         // 2s+ latency clamps the penalty at 0.5.
         assert_eq!(compute_reward(200, Duration::from_millis(5000)), 0.5);
+    }
+
+    #[test]
+    fn forgetting_is_faster_for_free_tier() {
+        // P3-1：免费臂 1k 即 blend（短窗），付费臂 10k 不变；blend 数学与 R2-6 同 90/10。
+        assert_eq!(forget_every_for_tier("free"), FORGET_EVERY_FREE_UPDATES);
+        assert_eq!(forget_every_for_tier("FREE"), FORGET_EVERY_FREE_UPDATES);
+        assert_eq!(forget_every_for_tier("residential"), FORGET_EVERY_N_UPDATES);
+        assert_eq!(forget_every_for_tier("datacenter"), FORGET_EVERY_N_UPDATES);
+        let x = fixed_context();
+        let free = BanditArm::new("10.0.0.9:8080".to_string(), "free".to_string());
+        let res = BanditArm::new("10.0.0.1:8080".to_string(), "residential".to_string());
+        for _ in 0..FORGET_EVERY_FREE_UPDATES {
+            free.update(&x, 1.0);
+            res.update(&x, 1.0);
+        }
+        // 同序列更新下唯一差别是一次 blend → 矩阵必分叉；residential 侧 1k 内无 blend。
+        let fa = free.state.read().a_inv;
+        let ra = res.state.read().a_inv;
+        assert!(
+            (fa - ra).norm() > 1e-9,
+            "free arm must have blended at 1k while residential did not"
+        );
+        assert_eq!(free.state.read().updates, FORGET_EVERY_FREE_UPDATES);
+    }
+
+    #[test]
+    fn free_arm_pays_risk_premium() {
+        // P2-1：同 context 下 free 臂 UCB 低于 residential 臂。
+        // gap 构成：premium(0.15) − cost 差(0.05×(1.0−0.0)＝0.05) ＝ 0.10
+        // （free cost 0 本就优惠 0.05，premium 净效应仍为罚 0.10，方向正确）；
+        // DC/mobile 公式不变（R2-6 形态冻结）。
+        let x = fixed_context();
+        let norm = (x.transpose() * x)[(0, 0)].sqrt();
+        let free = BanditArm::new("10.0.0.9:8080".to_string(), "free".to_string());
+        let res = BanditArm::new("10.0.0.1:8080".to_string(), "residential".to_string());
+        let gap =
+            res.compute_ucb_score(&x, DEFAULT_ALPHA) - free.compute_ucb_score(&x, DEFAULT_ALPHA);
+        let expected_gap =
+            FREE_RISK_PREMIUM - 0.05 * (COST_RESIDENTIAL - cost_weight_for_tier("free"));
+        assert!(
+            (gap - expected_gap).abs() < 1e-12,
+            "gap={gap} want={expected_gap}"
+        );
+        assert!(gap > 0.0, "premium must net-penalize free arms");
+        let dc = BanditArm::new("10.0.0.2:8080".to_string(), "dc".to_string());
+        let expected_dc = DEFAULT_ALPHA * norm - 0.05 * COST_DC;
+        assert!((dc.compute_ucb_score(&x, DEFAULT_ALPHA) - expected_dc).abs() < 1e-12);
     }
 
     /// Plan acceptance: mean `select_best_arm` cost < 200ns (release).

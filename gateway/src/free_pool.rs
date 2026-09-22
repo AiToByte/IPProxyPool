@@ -716,9 +716,18 @@ impl Health {
     }
 
     /// 成功率主项×延迟惩罚（可解释双因子；延迟惩罚＝中性点/(中性点+超额)，超额≤0 时为 1）。
+    /// P3 起本体冻结（`health_score_math` 逐字守护）；权重走 [`Health::composite`]。
     pub fn score(&self) -> f64 {
         let over = (self.ewma_latency_ms - HEALTH_NEUTRAL_LATENCY_MS).max(0.0);
         self.ewma_success * (HEALTH_NEUTRAL_LATENCY_MS / (HEALTH_NEUTRAL_LATENCY_MS + over))
+    }
+
+    /// P3 复合分（ProxyStats 方法学可落地子集）：`score()` × 留存因子。
+    /// 留存因子＝0.5＋0.5×min(1, streak/3)：连续存活（survival streak，Thordata top-trusted
+    /// 同族思想）满 3 即满权；新节点半权起步（不搞 0/1 硬阈值抖动，不断流只降权）。
+    pub fn composite(&self) -> f64 {
+        let retention = 0.5 + 0.5 * ((self.streak as f64) / (TRUSTED_MIN_STREAK as f64)).min(1.0);
+        self.score() * retention
     }
 
     pub fn trusted(&self) -> bool {
@@ -728,13 +737,14 @@ impl Health {
     }
 
     /// 连续权重 1..=上限（低分保底 1 不断流；trusted 封顶 TRUSTED_MAX）。
+    /// P3 起走 composite（score 本体冻结；存量四断言复算守护，见 `health_score_math`）。
     pub fn weight(&self) -> u32 {
         let cap = if self.trusted() {
             FREE_POOL_WEIGHT_TRUSTED_MAX
         } else {
             FREE_POOL_WEIGHT
         };
-        ((self.score() * cap as f64).round() as u32).clamp(1, cap)
+        ((self.composite() * cap as f64).round() as u32).clamp(1, cap)
     }
 
     pub fn backed_off(&self, now: Instant) -> bool {
@@ -1039,6 +1049,8 @@ pub struct FreePoolWorker {
     tick: u64,
     /// 已泄漏源名 intern 池（URL 稳定时零增长；防每轮 `Box::leak` 微泄漏）。
     leaked_names: HashSet<&'static str>,
+    /// P3 exit-IP 画像库（None＝Disabled 快捷；main 有 path 才建 Live，见 P3-4）。
+    geo: Option<Arc<crate::geo::GeoDb>>,
 }
 
 impl FreePoolWorker {
@@ -1062,6 +1074,52 @@ impl FreePoolWorker {
             guards,
             tick: 0,
             leaked_names: HashSet::new(),
+            geo: None,
+        }
+    }
+
+    /// P3：装配画像库（main 在 `GEOIP_MMDB_PATH` 可用时调用；单测默认 None）。
+    pub fn with_geo(mut self, geo: Arc<crate::geo::GeoDb>) -> Self {
+        self.geo = Some(geo);
+        self
+    }
+
+    /// P3 geo 观察（只观察不执法）：FullCheck 成功且有 exit_ip 时比对声明国家。
+    /// mismatch 只记指标＋debug（DB 陈旧时执法会误杀好节点；执法留 Phase 4）。
+    fn observe_geo(&self, raw: &RawNode, exit_ip: Option<&str>) {
+        use crate::geo::exit_matches_source;
+        let Some(geo) = self.geo.as_ref() else {
+            // Disabled 快捷：首 tick 记一次（每轮都记会刷计数器，注释写明）。
+            if self.tick == 1 {
+                self.metrics.note_geo_lookup("disabled");
+            }
+            return;
+        };
+        if !geo.enabled() {
+            if self.tick == 1 {
+                self.metrics.note_geo_lookup("disabled");
+            }
+            return;
+        }
+        let Some(exit) = exit_ip else {
+            return; // 无 exit（降级分支）不查
+        };
+        match geo.country(exit) {
+            Some(code) => {
+                self.metrics.note_geo_lookup("hit");
+                if !exit_matches_source(raw.country.as_deref(), Some(&code)) {
+                    self.metrics.note_geo_mismatch();
+                    log::debug!(
+                        "[GeoIP] mismatch {}:{} declared={:?} exit={exit} looked_up={code}",
+                        raw.ip,
+                        raw.port,
+                        raw.country
+                    );
+                }
+            }
+            None => {
+                self.metrics.note_geo_lookup("miss");
+            }
         }
     }
 
@@ -1232,6 +1290,8 @@ impl FreePoolWorker {
                         AnonLevel::Transparent => "transparent",
                         AnonLevel::Unknown => "unknown",
                     });
+                    // P3 geo 观察（只观察不执法；降级分支无 exit_ip 不查）。
+                    self.observe_geo(&raw, res.exit_ip.as_deref());
                 }
                 Ok((raw, None)) => {
                     self.metrics.note_free_verify("full_fail");
@@ -1717,6 +1777,26 @@ mod tests {
             bad.note_failure(Instant::now());
         }
         assert_eq!(bad.weight(), 1);
+    }
+
+    #[test]
+    fn composite_rewards_streak() {
+        // P3-3：composite＝score×(0.5＋0.5×min(1,streak/3))。
+        // fresh（streak 0）→ 0.25（score 本体 0.5 冻结）；50 连成功→factor 1→composite==score；
+        // 单次成功（streak 1）介于两者之间；连败比同 score 更低（方向不断精确值）。
+        let fresh = Health::fresh();
+        assert!((fresh.composite() - 0.25).abs() < 1e-9);
+        let mut hot = Health::fresh();
+        hot.anon = AnonLevel::Elite;
+        for _ in 0..50 {
+            hot.note_success(100);
+        }
+        assert!((hot.composite() - hot.score()).abs() < 1e-9);
+        let mut warm = Health::fresh();
+        warm.note_success(100);
+        assert!(warm.composite() > fresh.composite());
+        assert!(warm.composite() < warm.score());
+        assert!(warm.composite() < hot.composite());
     }
 
     #[test]
