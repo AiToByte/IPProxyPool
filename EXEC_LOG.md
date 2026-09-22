@@ -428,3 +428,35 @@
   - exit 语义 fail-open 修正（计划同步）。
   - 脚本文件名连字符改下划线（可 import＋仓惯例）。
 - **下一步建议**：Phase 4 冻结；剩余待用户：真 Key 灰度／Linux 节点／JA4（待 TLS 面）／完工总结。
+
+### [2026-09-22] 步骤 15 立项: Phase 5 韧性验证计划冻结（先落库再执行）
+- 计划操作：用户指令“提交＋继续下一阶段”——Phase 4 已提交（`79d7526`）；真 Key／Linux／JA4 皆需外部输入，
+  唯一可自主高价值阶段为韧性演练（三条降级/恢复路径从未 E2E 验证）。新建
+  `plan/2026年9月22日-Phase5-韧性验证实施计划.md`（P5-1~P5-4，演练即断言）；`TASK_PLAN.md` 步骤 15
+  置进行中；本文件 append-only 记立项。
+- 勘察结论（断言依据）：CB 内存隔离不依赖 Redis（先写内存，Redis 操作皆 `unwrap_or(())`）；
+  telemetry 中断走 dropped/channel 双口径（不断言单一）；sink hold-ack 以 rows_cap 为界，
+  恢复看 CH 追齐不看 XLEN 缩；connect 失败不进 quarantine（重启 mock 后应立即 200）。
+- 范围：零代码变更预期（暴露真 bug 则走 §4 修复位）；FREE 关闭降噪；supervisor 杀任务不可行
+  （线程非进程，单测覆盖）；演练日志 gitignored；结束必复原环境。
+
+### [2026-09-22] 步骤 15 已完成: Phase 5 韧性验证（P5-1~P5-4 全✅ + 抓获 P0 真 bug）
+- **P5-1 Redis 中断**：网关 PID:19256（默认 env，`log/gw15.out/err`）：基线 XLEN 9793/CH 3365/
+  dropped 0/0 → `docker stop` → 10×200（数据面独立）＋`/metrics` 200＋PID 不变＋无 panic →
+  `docker start`（PONG）→ 10 流量 → XLEN 9813（+20 全追回）/CH 3385（+20）/dropped 仍双零。
+  诚实修正：F2 假设错——manager 重连阻塞 flush 而非快速失败，语义为滞留-恢复（零丢失），比预期更优。
+- **P5-2 CH 中断＋P0 修复**：基线 XLEN 9813/CH 3385/RSS 20.8MB → `docker stop` → 10×200＋
+  `insert failed holding acks`＋RSS 平稳（有界） → `docker start`（`/ping` Ok）→90s 后
+  CH 仍 3385、pending 归零、无 `landed`——10 行静默丢失。根因：hold 条目被 autoclaim 取回
+  （同 stream id）时撞 SeenIds 去重窗→误判重复→skip＋ack（去重窗本只对消重试新条目）。
+  修复：`classify_entry` 加 `is_redelivery`（reclaim 传 true 直通，fresh 传 false；调用点 2＋
+  单测 5 处同步；`too_many_arguments` 沿惯例放行）＋回归单测 `redelivered_hold_is_not_a_duplicate`。
+  同条件重演（网关 PID:33624，`log/gw15b.out/err`）：`landed 4＋6`、CH 3390→3400（+10 全追回）、
+  pending 归零。R2-5 三单测语义不变全绿。见计划 §4 BUG-5-1。
+- **P5-3 Mock 中断**：半挂 mock-b（kill 30636）→10 普通流量全 200 零 503（bandit 换臂至 mock-a）；
+  全挂（kill 11444/1436）→3×503（正确语义）；重拉三 mocks（22732/31508/2032，
+  `log/mockA15|B15|C15`）→首请求即 200（connect 失败不进 quarantine，F4 成立）。
+- **P5-4 门禁**：fmt clean／clippy 零告警／144 过／4 真 live／bench 编译过（bandit 未动，
+  release 跳过并注明）；四容器 Up（CH unhealthy 为已知 wget 探针 artifact，SELECT/落库正常，
+  GW-5 既有结论）＋网关/mocks 在线＋dashboard 5 面板有效。
+- **下一步建议**：Phase 5 冻结；剩余待用户：真 Key 灰度／Linux 节点／JA4（待 TLS 面）／完工总结。

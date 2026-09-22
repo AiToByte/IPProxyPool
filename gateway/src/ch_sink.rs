@@ -115,7 +115,13 @@ impl ChSinkWorker {
     /// - 有效 → `rows` + `valid_ids`（超 `rows_cap` 则两边都不进，
     ///   不 ack 不丢，留待下轮，内存有界）；
     /// - 空 id 老事件 → 按有效处理（永不去重）。
+    /// - P5 重放直通：`is_redelivery` 为 true（autoclaim 取回的 hold 条目，
+    ///   同 stream id 重现）时跳过去重检查，直进 rows——hold 条目首读已进过去重窗，
+    ///   若再检查必被误判重复而吞掉（P5-2 CH 中断演练抓获的静默丢数，见 EXEC_LOG）。
+    ///   重试新条目恒走 fresh 路径（不同 stream id），去重语义不受影响。
     ///   自由函数（不借 `self`）：单测无需构造 worker（免 Redis/CH）。
+    // 8 参数沿 ProxyNode::new 惯例放行（调用点皆为固定容器＋标量，打包反增分配）。
+    #[allow(clippy::too_many_arguments)]
     fn classify_entry(
         seen: &mut SeenIds,
         id: String,
@@ -124,10 +130,11 @@ impl ChSinkWorker {
         valid_ids: &mut Vec<String>,
         skip_ids: &mut Vec<String>,
         rows_cap: usize,
+        is_redelivery: bool,
     ) {
         match parse_entry(fields) {
             Some((row, event_id)) => {
-                if !event_id.is_empty() && seen.check_and_insert(&event_id) {
+                if !is_redelivery && !event_id.is_empty() && seen.check_and_insert(&event_id) {
                     log::debug!("[ChSink] duplicate {event_id} ({id}) acked+skipped");
                     skip_ids.push(id);
                 } else if rows.len() < rows_cap {
@@ -177,6 +184,7 @@ impl ChSinkWorker {
                     &mut valid_ids,
                     &mut skip_ids,
                     rows_cap,
+                    true, // P5：重放直通（hold 条目首读已进窗，再检查必误判重复而吞数）
                 );
             }
         }
@@ -202,6 +210,7 @@ impl ChSinkWorker {
                             &mut valid_ids,
                             &mut skip_ids,
                             rows_cap,
+                            false, // 新条目走去重检查（重试 XADD 对消于此）
                         );
                     }
                 }
@@ -379,6 +388,7 @@ mod tests {
             &mut valid,
             &mut skip,
             10,
+            false,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(valid, vec!["1-0".to_string()]);
@@ -392,6 +402,7 @@ mod tests {
             &mut valid,
             &mut skip,
             10,
+            false,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(skip, vec!["1-1".to_string()]);
@@ -404,6 +415,7 @@ mod tests {
             &mut valid,
             &mut skip,
             10,
+            false,
         );
         assert_eq!(skip.len(), 2);
         // cap=1 且已有 1 行 → 新有效（新 id，非重复）两边都不进（留待下轮）。
@@ -415,10 +427,59 @@ mod tests {
             &mut valid,
             &mut skip,
             1,
+            false,
         );
         assert_eq!(rows.len(), 1);
         assert!(!valid.contains(&"held-0".to_string()));
         assert!(!skip.contains(&"held-0".to_string()));
+    }
+
+    #[test]
+    fn redelivered_hold_is_not_a_duplicate() {
+        // P5 真 bug 回归：hold-and-redeliver（同 stream id＋同 event_id，insert 失败
+        // hold 后被 autoclaim 取回）必须再次进 rows，不能被去重窗吞掉。
+        // 去重窗只对消“重试产生的新 stream 条目”（不同 stream id，同 event_id）。
+        let mut seen = SeenIds::new(SEEN_IDS_CAP);
+        let (mut rows, mut valid, mut skip) = (Vec::new(), Vec::new(), Vec::new());
+        let f = fields(&valid_payload());
+        // 首读：有效。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "7-0".into(),
+            &f,
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+            false,
+        );
+        assert_eq!(rows.len(), 1);
+        // hold 后重放（redelivery=true）：仍有效，不是重复。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "7-0".into(),
+            &f,
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+            true,
+        );
+        assert_eq!(rows.len(), 2, "redelivered hold must re-enter rows");
+        assert!(skip.is_empty());
+        // 而重试新条目（不同 stream id，同 event_id）仍被去重。
+        ChSinkWorker::classify_entry(
+            &mut seen,
+            "7-1".into(),
+            &f,
+            &mut rows,
+            &mut valid,
+            &mut skip,
+            10,
+            false,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skip, vec!["7-1".to_string()]);
     }
 
     /// 同一有效载荷换新 event_id（cap/去重单测用，不碰线上 valid_payload）。
@@ -442,6 +503,7 @@ mod tests {
                 &mut valid,
                 &mut skip,
                 10,
+                false,
             );
         }
         assert!(rows.is_empty());
