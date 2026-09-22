@@ -15,8 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// （IP 填 `0.0.0.1`＋尾部跟域名）；回包第 2 字节须 `0x5A`。
 /// 超时由调用方包 `tokio::time::timeout`（各调用方口径不同，本模块不管时间）。
 /// 错误文案 String（沿 free_pool 惯例，零新依赖）。
-/// P2-2 落地时仅单测消费（P2-5 Verifier／P2-6 prewarmer 接入），按 `reload_nodes` 惯例放行 dead。
-#[allow(dead_code)]
 pub async fn establish(
     proxy_ip: &str,
     proxy_port: u16,
@@ -39,8 +37,7 @@ pub async fn establish(
     Ok(s)
 }
 
-/// Socks5 子握手（被 `establish` 调用；dead 放行随 `establish`）。
-#[allow(dead_code)]
+/// Socks5 子握手（被 `establish` 调用）。
 async fn establish_v5(
     s: &mut tokio::net::TcpStream,
     username: Option<&str>,
@@ -143,8 +140,7 @@ async fn establish_v5(
     Ok(())
 }
 
-/// Socks4 子握手（被 `establish` 调用；dead 放行随 `establish`）。
-#[allow(dead_code)]
+/// Socks4 子握手（被 `establish` 调用）。
 async fn establish_v4(
     s: &mut tokio::net::TcpStream,
     username: Option<&str>,
@@ -190,8 +186,6 @@ async fn establish_v4(
 /// greeting-only 存活探测（prewarmer 用：证明端口说 SOCKS，不对外 CONNECT）。
 /// Socks5 打法：发 greeting，服务端回版本 `0x05` 且方法≠`0xFF` 即 Ok；
 /// Socks4 无 greeting 语义，TCP 建链成功即 Ok（建链失败由 connect Err 覆盖）。
-/// P2-2 落地时仅单测消费（P2-6 prewarmer 接入），按 `reload_nodes` 惯例放行 dead。
-#[allow(dead_code)]
 pub async fn greet_only(proxy_ip: &str, proxy_port: u16, proto: EgressProto) -> Result<(), String> {
     let mut s = tokio::net::TcpStream::connect((proxy_ip, proxy_port))
         .await

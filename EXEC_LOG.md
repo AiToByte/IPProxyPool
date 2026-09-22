@@ -364,3 +364,17 @@
   - `u32::MAX` min 恒真＋redundant closure 两 clippy 修；`with_proto` 陈旧 allow 已清（转正生产消费）。
   - 单测数 141 vs 预估 145±2：R3-3/R3-4 为删除/移动类变更无新增单测，差值合理，以实测为准。
 - **下一步建议**：OPT-R3 冻结；剩余待用户：真 Key 灰度／Linux 节点／Phase 4／完工总结。
+
+### [2026-09-22] 硬化 sweep：编译＋漏洞＋性能三件套（OPT-R3 后）
+- **H-A 编译**：`cargo check --workspace --all-targets`（debug）＋`--release` 双 profile，
+  零错误零警告。`cargo test --release --workspace` 141 过（含 8 臂 <200ns 断言激活态）。
+- **H-B 漏洞**：生产代码零 `unwrap/expect/panic`（仅 main 三处启动 fail-fast＋单测断言）；
+  零 `unsafe/todo/unimplemented/unreachable`（仅 SQL 注入守卫文案含 unsafe 单词）；
+  算术有界（debug 溢出检查随 141 单测全过；`as` 转换逐项复核：延迟/字节/重试/权重皆不可能溢出）；
+  增长有界（会话/隔离 sweep、臂 prune、Client 双 TTL、注册表 cap＋TTL、SeenIds 环、
+  intern 池 URL 集有界、遥测通道 1 万封顶）；CB 隔离与遥测耦合经 R3-2 双检闭合。
+  修复 1 项：`socks_handshake.rs` 4 处 `#[allow(dead_code)]` 陈旧（P2-5/P2-6 后已转正生产消费），
+  清除后 clippy/test 复绿，证实非死代码。其余 9 处放行皆为控制面/测试 API（逐项复核保留）。
+- **H-C 性能**：热点路径无变化（R3-1 新增 Copy＋同类 bandit 选择，bench 断言持绿）；
+  `snapshot_all` Arc 克隆／render 串构造皆为既有接受态；无可执行优化项，不虚构。
+- **结论**：硬化零负载问题（1 处卫生修复）。本条随修复同提交。
