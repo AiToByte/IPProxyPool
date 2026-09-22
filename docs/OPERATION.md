@@ -41,8 +41,9 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 2. `main.rs` 初始池把对应 `mock-x` 换成真实 `ip:port + username/password`，
    provider 名改为真实名（`oxylabs` / `brightdata` / `netnut`），country 照实；
 3. 观察：`query_provider_sla` 5min 窗 + Grafana 403 比面板；
-   套利阈值不变（<80 降权 0 / >95 恢复 100），降权只是 `retain` 摘除，
-   恢复需重启（GW-1 `adjust_vendor_weight` retain/remove 垫片，GW-R2 改真权重）；
+   套利阈值不变（<80 降权 0 / >95 恢复 100），降权即 `weight→0`（选路过滤摘除，
+   池内保留可恢复），恢复 `weight→100` 即时生效，无需重启
+   （R2-1 起真权重语义，`matches` 过滤 `weight==0`；GW-1 的 retain/remove 已退役）；
 4. 计费对账：`tenant.total_bytes × tier单价` 与供应商账单按周对（另起 GW-R2）；
 5. 全量：逐家逐国放开，每步至少观察 1 个 60s 套利周期。
 
@@ -56,8 +57,8 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 | 带宽/余额 | panel 4 / tenant balance | 余额不足先 `set_active(key,false)` 停服再充值 |
 | 熔断 key | `quarantine:{domain}:{ip}` | TTL 到自愈；内存 TTL 独立，DEL 键不清内存 |
 | Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长=CB 消费组 lag，查 `XINFO GROUPS`；R2-5 起 XADD 带 MAXLEN ~10 万（消费组全挂时老数据先丢，XLEN 封顶）；sink 启动清幽灵消费者，毒丸/重复即时 ack 不进仓 |
-| 后台并发 | 网关日志 `[Prober]/[Prewarmer]/[Sweep]/[Arbitrage]` | R2-7 起三 60s ticker 启动错峰（`staggered start` 行对齐验证）；prober 20 并发 + Client 闲置 10min 淘汰；prewarmer 真 TCP 探测 100 并发封顶，`tickets`==探测节点数（票据环已删） |
-| 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；后台 CB/sink/arbitrage 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
+| 后台并发 | 网关日志 `[Prober]/[Prewarmer]/[Sweep]/[Arbitrage]` | R2-7 起三 60s ticker 启动错峰（`staggered start` 行对齐验证）；prober 20 并发 + Client 闲置 10min 淘汰；prewarmer 建链/握手探测 100 并发封顶（http 建链＋socks greeting，P2-6 起），`tickets`==探测节点数（票据环已删） |
+| 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；后台 CB/sink/arbitrage/free_pool 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
 | 免费线水位 | `free_pool_nodes_total` / 日志`[FreePool] tick` | 默认关闭（`FREE_ENABLED=1` 开）；水位突降=源站熔断（`free_pool_source_suspended{source}=1`）或质检门限过严（`free_pool_verify_total` 看 fail 分布）；country 缺省 ZZ，只服务无归属要求的流量；`FREE_REQUIRE_ELITE=1` 时仅 Elite 进池 |
 | 免费线健康 | `free_pool_source_yield_total` / `free_pool_anonymity_total` | yield 骤降=源站挂；transparent 占比突增=源站质量恶化，考虑开 REQUIRE_ELITE；单节点转发延迟看 registry 日志（debug） |
 | SOCKS 桥 | `free_pool_nodes_by_proto{proto}` / 日志`[SocksBridge]` | P2 起仅显式 `X-Proxy-Proto: socks5/socks4` 请求走桥；默认流量永不命中 socks（router 默认隔离＋peer 守卫＋粘滞 proto 复核三保险）；body 超 `SOCKS_MAX_BODY_BYTES`（默认 10MB）按失败计＋warn＋换节点重试 |
@@ -65,7 +66,7 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 | GeoIP 画像 | `geoip_lookups_total{result}` / `geoip_mismatch_total` | 无库 Disabled 只观察不执法（首 tick 记一次 disabled）；mismatch 突增＝源站地理造假或库陈旧，先查库版本再定；执法留 Phase 4 |
 
 租户管理：`register_tenant(id,key,qps,max_c,burst)` 注册（R2-3 起 burst 必传，常规取 `qps/10`）；`set_active` 启停；
-计费 DC $0.2 / Res $3 / Mobile $15 每 GB。R2-3 起余额≤0 鉴权直接 402（欠费），与 403（坏 Key/停用）区分；当次流量可扣成负数，下次请求拦截。
+计费 DC $0.2 / Res $3 / Mobile $15 每 GB；Free $0（计量字节但不计费，FreePool 节点 tier，Task 1 冻结）。R2-3 起余额≤0 鉴权直接 402（欠费），与 403（坏 Key/停用）区分；当次流量可扣成负数，下次请求拦截。
 OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节，失败 attempt
 的字节在重试前清零，不进账单；`logging` 侧不做补偿。
 

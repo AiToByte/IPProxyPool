@@ -460,3 +460,20 @@
   release 跳过并注明）；四容器 Up（CH unhealthy 为已知 wget 探针 artifact，SELECT/落库正常，
   GW-5 既有结论）＋网关/mocks 在线＋dashboard 5 面板有效。
 - **下一步建议**：Phase 5 冻结；剩余待用户：真 Key 灰度／Linux 节点／JA4（待 TLS 面）／完工总结。
+
+### [2026-09-22] 步骤 16 立项: DOC-R1 文档一致性审计＋修复（先落库再执行）
+- 计划操作：用户指令“提交＋继续下一阶段迭代”——Phase 5 已提交（`99661e4`）；真 Key／Linux／JA4
+  皆需外部输入，唯一可自主高价值工作为文档一致性审计。已执行审计：dashboard 5 面板 PromQL
+  逐名核对 `render()` 输出（7 个指标名全存在，零漂移）；OPERATION 全文逐断言核对代码，
+  发现 1 中 2 小。新建`plan/2026年9月22日-DOC-R1文档一致性修复实施计划.md`（D1~D4，零代码变更）；
+  `TASK_PLAN.md` 步骤 16 置进行中；本文件 append-only 记立项。
+- 审计结论：D1（§3 套利 retain/remove 垫片＋恢复需重启——R2-1 后实为真权重即时语义，中）；
+  D2（supervisor 名单缺 free_pool＋prewarmer 握手口径，小）；D3（租户行缺 free $0，小）。
+  评估无动作：§2 curl（Host 默认带仍 200）、P99 基线注（65ms 在带内）、EGRESS_MESH/SPIKE（冻结）。
+- 范围：只改 `docs/OPERATION.md` 三处；dashboard 不动；零代码变更。
+
+### [2026-09-22] 步骤 16 已完成: DOC-R1 文档一致性修复（D1~D4 全✅）
+- **审计结论**：dashboard 5 面板 7 个指标名逐名核对 `render()` 输出，全存在（`proxy_requests_total{2xx/4xx/5xx/other}`／`forbidden_by_provider`／`transferred_bytes`／`duration_bucket(+Inf)`／`free_pool_nodes_by_proto`／`free_pool_verify_total`／`geoip_mismatch_total`）——零漂移，dashboard 不动。
+- **实际操作**：D1（§3 套利 `retain` 垫片＋恢复需重启→真权重即时语义，R2-1 EXEC_LOG 为证）/D2（supervisor 名单加 free_pool＋prewarmer 建链/握手口径，`supervise("free_pool")`＋`greet_only` 分支为证）/D3（租户行加 Free $0，`PRICE_FREE_PER_GB` 为证）。
+- **验证结果**：三处重读＋代码交叉确认（本条即证据；零代码变更，无编译门禁项）。
+- **下一步建议**：DOC-R1 冻结；剩余待用户：真 Key 灰度／Linux 节点／JA4（待 TLS 面）／完工总结。

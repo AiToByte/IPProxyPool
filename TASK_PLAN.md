@@ -21,6 +21,7 @@
 - [x] **步骤 13**: OPT-R3 优化（R3-1 socks选路对齐bandit/R3-2 out_ip+exit隔离/R3-3 删冗余注记/R3-4 日志移出/R3-5 源礼貌轮询/R3-6门禁）方案见`plan/2026年9月22日-OPT-R3优化方案.md` ✅ 已完成（141 单测+4 真 live+release bandit+四门绿+存量零变化+E2E重跑+CH out_ip断言，证据见 EXEC_LOG 步骤 13 条+log/gw13-socks.out/err）
 - [x] **步骤 14**: Phase 4 执法与运维（mismatch执法开关/GeoLite2更新脚本）方案见`plan/2026年9月22日-Phase4-执法与运维实施计划.md`（P4-1~P4-3） ✅ 已完成（143 单测+4 真 live+四门绿+存量零变化+E2E重跑+enforce对照，证据见 EXEC_LOG 步骤 14 条+log/gw14-socks.out/err+gw14-enforce.out/err）
 - [x] **步骤 15**: Phase 5 韧性验证（Redis/CH/Mock断电演练）方案见`plan/2026年9月22日-Phase5-韧性验证实施计划.md`（P5-1~P5-4） ✅ 已完成（144 单测+4 真 live+四门绿+三演练全自愈+抓获P0真bug已修，证据见 EXEC_LOG 步骤 15 条+log/gw15*.out/err）
+- [x] **步骤 16**: DOC-R1 文档一致性修复（dashboard零漂移/OPERATION 1中2小）方案见`plan/2026年9月22日-DOC-R1文档一致性修复实施计划.md` ✅ 已完成（dashboard逐名验证零漂移+OPERATION三处修复，证据见 EXEC_LOG 步骤 16 条）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring
