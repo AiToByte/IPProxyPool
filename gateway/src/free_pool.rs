@@ -1,0 +1,1762 @@
+//! FreePool 第二供应线：公开免费源抓取 → 两级质检 → TTL 注册 → Router 合并。
+//!
+//! Phase 1 只收 HTTP(S)（零网关转发改动）；SOCKS 只解析标注、merge 过滤
+//! （Phase 2 做 SOCKS egress）。默认关闭（`FREE_ENABLED=1` 开启）。
+//! 免费线零信任（arXiv:2403.02445：16,923 篡改内容）：复检基址 https-only＋
+//! canary 防篡改＋OPERATION 禁敏感流量。
+
+use std::time::Duration;
+use std::time::Instant;
+/// 抓取协议（Phase 1 仅 Http/Https 进池，见 `Registry::snapshot` 过滤）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeProto {
+    Http,
+    Https,
+    Socks4,
+    Socks5,
+}
+
+impl FreeProto {
+    fn from_token(tok: &str) -> Option<Self> {
+        match tok.to_ascii_lowercase().as_str() {
+            "http" => Some(FreeProto::Http),
+            "https" => Some(FreeProto::Https),
+            "socks4" => Some(FreeProto::Socks4),
+            "socks5" => Some(FreeProto::Socks5),
+            _ => None,
+        }
+    }
+
+    /// 是否允许进池（Phase 1 仅 HTTP(S)；SOCKS 标注保留待 Phase 2）。
+    pub fn poolable(self) -> bool {
+        matches!(self, FreeProto::Http | FreeProto::Https)
+    }
+}
+
+/// 源站吐出的原始节点（未质检）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawNode {
+    pub ip: String,
+    pub port: u16,
+    pub proto: FreeProto,
+    pub country: Option<String>,
+    pub source: String,
+}
+
+/// 抓取结果（v2：304 NotModified 显式信号，供 SourceGuard 区分“未变更”与“零产出”）。
+#[derive(Debug)]
+pub struct FetchOutcome {
+    pub nodes: Vec<RawNode>,
+    /// true＝源站明确表示未变更（GitHub ETag/304），调用方不得计零产出轮次。
+    pub not_modified: bool,
+}
+
+impl FetchOutcome {
+    pub fn nodes(nodes: Vec<RawNode>) -> Self {
+        Self {
+            nodes,
+            not_modified: false,
+        }
+    }
+
+    pub fn not_modified() -> Self {
+        Self {
+            nodes: Vec::new(),
+            not_modified: true,
+        }
+    }
+}
+
+/// 抓取源插件接口（API / HTML / GitHub 各一实现；零新依赖，错误文案 String）。
+#[async_trait::async_trait]
+pub trait Source: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String>;
+}
+
+/// JSON API 源（默认 Geonode；URL env 可配，见 Task 12）。
+/// port 兼容字符串/数字双形态；缺 country 视为 None（后继标 ZZ）。
+pub struct ApiSource {
+    pub name: &'static str,
+    pub url: String,
+}
+
+impl ApiSource {
+    pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
+        let v: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let arr = v.get("data").and_then(|d| d.as_array());
+        let mut out = Vec::new();
+        for item in arr.into_iter().flatten() {
+            let ip = item.get("ip").and_then(|s| s.as_str()).unwrap_or("");
+            if ip.is_empty() {
+                continue;
+            }
+            let port: Option<u16> = match item.get("port") {
+                Some(serde_json::Value::Number(n)) => {
+                    n.as_u64().and_then(|p| u16::try_from(p).ok())
+                }
+                Some(serde_json::Value::String(s)) => s.parse::<u16>().ok(),
+                _ => None,
+            };
+            let port = match port {
+                Some(p) if p > 0 => p,
+                _ => continue,
+            };
+            let proto = item
+                .get("protocols")
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|s| s.as_str())
+                .and_then(FreeProto::from_token)
+                .unwrap_or(FreeProto::Http);
+            let country = item
+                .get("country")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_string());
+            out.push(RawNode {
+                ip: ip.to_string(),
+                port,
+                proto,
+                country,
+                source: source.to_string(),
+            });
+        }
+        out
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for ApiSource {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
+        let body = client
+            .get(&self.url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {} failed: {e}", self.url))?
+            .text()
+            .await
+            .map_err(|e| format!("read {} failed: {e}", self.url))?;
+        Ok(FetchOutcome::nodes(Self::parse(self.name, &body)))
+    }
+}
+
+/// HTML 表格源（默认 free-proxy-list.net；URL env 可配）。
+/// 无 HTML 解析依赖：字节扫描 `a.b.c.d[:port]|</td><td>port` 形态，octet≤255、
+/// 端口 1..=65535；行内含 `socks4`/`socks5`（大小写不敏感）则标对应协议
+///（Phase 1 Verifier 跳过）。
+pub struct HtmlSource {
+    pub name: &'static str,
+    pub url: String,
+    pub default_proto: FreeProto,
+}
+
+impl HtmlSource {
+    pub fn extract(source: &str, html: &str, default_proto: FreeProto) -> Vec<RawNode> {
+        let bytes = html.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            // Token 边界：IP 起始前不得是数字或 `.`（否则 `999.1.1.1` 的子串
+            // `99.1.1.1` 会被误判为合法 IP；非法 octet 整 token 跳过）。
+            if i > 0 && (bytes[i - 1].is_ascii_digit() || bytes[i - 1] == b'.') {
+                i += 1;
+                continue;
+            }
+            if let Some((ip, port, consumed)) = Self::match_ip_port(&bytes[i..]) {
+                // 行级协议嗅探：向前 200B 窗口找 socks 标记。
+                let from = i.saturating_sub(200);
+                let window = String::from_utf8_lossy(&bytes[from..i]).to_ascii_lowercase();
+                let proto = if window.contains("socks5") {
+                    FreeProto::Socks5
+                } else if window.contains("socks4") {
+                    FreeProto::Socks4
+                } else {
+                    default_proto
+                };
+                out.push(RawNode {
+                    ip,
+                    port,
+                    proto,
+                    country: None,
+                    source: source.to_string(),
+                });
+                i += consumed;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// 在切片头部匹配 `a.b.c.d`＋可选 `:port`／紧随 `<…>port`；非法返回 None。
+    fn match_ip_port(b: &[u8]) -> Option<(String, u16, usize)> {
+        let mut octets = [0u32; 4];
+        let mut pos = 0;
+        for (k, octet) in octets.iter_mut().enumerate() {
+            let start = pos;
+            while pos < b.len() && b[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if start == pos {
+                return None;
+            }
+            *octet = std::str::from_utf8(&b[start..pos])
+                .ok()?
+                .parse::<u32>()
+                .ok()?;
+            if *octet > 255 {
+                return None;
+            }
+            if k < 3 {
+                if pos >= b.len() || b[pos] != b'.' {
+                    return None;
+                }
+                pos += 1;
+            }
+        }
+        // 端口：`:port` 或 `</td><td>` 类标签序列后的数字（多标签循环跳过）。
+        let mut ppos = pos;
+        if ppos < b.len() && b[ppos] == b':' {
+            ppos += 1;
+        } else {
+            let mut p = ppos;
+            loop {
+                // 跳过标签间空白与已闭合的 `>`。
+                while p < b.len()
+                    && (b[p] == b' '
+                        || b[p] == b'\t'
+                        || b[p] == b'\r'
+                        || b[p] == b'\n'
+                        || b[p] == b'>')
+                {
+                    p += 1;
+                }
+                if p < b.len() && b[p].is_ascii_digit() {
+                    ppos = p;
+                    break;
+                }
+                if p < b.len() && b[p] == b'<' {
+                    // 跳过一整个 `<…>` 标签后继续找数字。
+                    while p < b.len() && b[p] != b'>' {
+                        p += 1;
+                    }
+                    if p < b.len() {
+                        p += 1; // 跳过 `>`
+                        continue;
+                    }
+                }
+                return None;
+            }
+        }
+        let start = ppos;
+        while ppos < b.len() && b[ppos].is_ascii_digit() {
+            ppos += 1;
+        }
+        if start == ppos {
+            return None;
+        }
+        let port: u16 = std::str::from_utf8(&b[start..ppos]).ok()?.parse().ok()?;
+        if port == 0 {
+            return None;
+        }
+        let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        Some((ip, port, ppos))
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for HtmlSource {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
+        let body = client
+            .get(&self.url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {} failed: {e}", self.url))?
+            .text()
+            .await
+            .map_err(|e| format!("read {} failed: {e}", self.url))?;
+        Ok(FetchOutcome::nodes(Self::extract(
+            self.name,
+            &body,
+            self.default_proto,
+        )))
+    }
+}
+
+/// GitHub raw 仓源（默认 clarketm/proxy-list raw；URL env 可配）。
+/// 行格式：`ip:port`（`#` 开头与空行跳过；行尾 `socks4`/`socks5` 标记协议）。
+/// 礼貌轮询：ETag 缓存＋If-None-Match，304 返回 `not_modified`（Task 10 不计零产出）。
+pub struct GitHubSource {
+    pub name: &'static str,
+    pub url: String,
+    etag: parking_lot::Mutex<Option<String>>,
+}
+
+impl GitHubSource {
+    pub fn new(name: &'static str, url: String) -> Self {
+        Self {
+            name,
+            url,
+            etag: parking_lot::Mutex::new(None),
+        }
+    }
+
+    pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            let proto = if lower.contains("socks5") {
+                FreeProto::Socks5
+            } else if lower.contains("socks4") {
+                FreeProto::Socks4
+            } else {
+                FreeProto::Http
+            };
+            let addr = line.split_whitespace().next().unwrap_or("");
+            let (ip, port) = match addr.rsplit_once(':') {
+                Some((ip, port)) => (ip, port.parse::<u16>().ok()),
+                None => continue,
+            };
+            let port = match port {
+                Some(p) if p > 0 => p,
+                _ => continue,
+            };
+            if ip.split('.').count() != 4 {
+                continue;
+            }
+            out.push(RawNode {
+                ip: ip.to_string(),
+                port,
+                proto,
+                country: None,
+                source: source.to_string(),
+            });
+        }
+        out
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for GitHubSource {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
+        let mut req = client.get(&self.url);
+        if let Some(etag) = self.etag.lock().clone() {
+            req = req.header("If-None-Match", etag);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("GET {} failed: {e}", self.url))?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(FetchOutcome::not_modified());
+        }
+        if let Some(v) = resp.headers().get("etag").and_then(|h| h.to_str().ok()) {
+            *self.etag.lock() = Some(v.to_string());
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("read {} failed: {e}", self.url))?;
+        Ok(FetchOutcome::nodes(Self::parse(self.name, &body)))
+    }
+}
+
+/// 质检器：TCP 建链（超时）＋延迟门。Phase 1 只收 Http/Https，其余协议
+/// 直接跳过（None；Phase 2 加 SOCKS 握手探测）。
+/// TCP 通过只代表“端口开放”，匿名度与转发能力由 Task 8 FullChecker 判定；
+/// 返回的建链延迟供 Registry 初值，权重主信号是 FullCheck 的转发延迟。
+#[derive(Clone)]
+pub struct Verifier {
+    timeout: Duration,
+    max_latency_ms: u64,
+}
+
+impl Verifier {
+    pub fn new(timeout: Duration, max_latency_ms: u64) -> Self {
+        Self {
+            timeout,
+            max_latency_ms,
+        }
+    }
+
+    /// 通过返回建链延迟 ms；失败/超门/非 HTTP(S) 返回 None。
+    pub async fn verify(&self, raw: &RawNode) -> Option<u64> {
+        match raw.proto {
+            FreeProto::Http | FreeProto::Https => {}
+            _ => {
+                log::debug!(
+                    "[FreePool] skip unsupported proto {:?} {}:{}",
+                    raw.proto,
+                    raw.ip,
+                    raw.port
+                );
+                return None;
+            }
+        }
+        let start = std::time::Instant::now();
+        let ok = tokio::time::timeout(
+            self.timeout,
+            tokio::net::TcpStream::connect((raw.ip.as_str(), raw.port)),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
+        if !ok {
+            return None;
+        }
+        let ms = start.elapsed().as_millis() as u64;
+        if ms <= self.max_latency_ms {
+            Some(ms)
+        } else {
+            log::debug!("[FreePool] slow {}:{} {ms}ms over gate", raw.ip, raw.port);
+            None
+        }
+    }
+}
+
+/// 匿名度三级（openproxyhub/MiyaIP 定义）：Elite 最安全；Transparent 泄漏真实 IP，
+/// 永不服务认证租户流量（merge 门＋OPERATION 硬规则）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonLevel {
+    Elite,
+    Anonymous,
+    Transparent,
+    Unknown,
+}
+
+/// 7 头披露检查表（MiyaIP 方法学；比较时全小写）。
+pub const DISCLOSURE_HEADERS: [&str; 7] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "client-ip",
+    "via",
+    "proxy-connection",
+    "x-proxy-id",
+];
+
+/// 纯函数分级：基线（直连出口）vs 经代理观测（出口＋回显头）。
+pub fn classify_anonymity(
+    baseline_ip: &str,
+    exit_ip: Option<&str>,
+    echoed_headers: &std::collections::HashMap<String, String>,
+) -> AnonLevel {
+    let exit = match exit_ip {
+        Some(e) => e,
+        None => return AnonLevel::Unknown,
+    };
+    if exit.trim() == baseline_ip.trim() {
+        return AnonLevel::Transparent;
+    }
+    let disclosed = echoed_headers
+        .keys()
+        .any(|k| DISCLOSURE_HEADERS.contains(&k.to_ascii_lowercase().as_str()));
+    if disclosed {
+        AnonLevel::Anonymous
+    } else {
+        AnonLevel::Elite
+    }
+}
+
+/// canary 标记（`/anything/freepool-canary` 回显 url 须含此串，否则判篡改）。
+pub const FULL_CHECK_MARKER: &str = "freepool-canary";
+
+/// 实转复检结果（主健康信号）。
+pub struct FullCheckResult {
+    pub anon: AnonLevel,
+    pub exit_ip: Option<String>,
+    /// 经代理 GET 全程耗时（含代理转发；为主延迟信号，替代 TCP 建链延迟参与 EWMA）。
+    pub fwd_latency_ms: u64,
+}
+
+/// 实转复检器：经候选代理 GET 基址三端点（`/ip` 出口＋`/headers` 回显＋
+/// `/anything/{marker}` canary）。任一步失败/超门/canary 失配→None（失败）。
+/// 非 HTTP(S) 直接 None（Phase 2 前 SOCKS 不复检）。
+#[derive(Clone)]
+pub struct FullChecker {
+    base_url: String,
+    timeout: Duration,
+}
+
+impl FullChecker {
+    pub fn new(base_url: String, timeout: Duration) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            timeout,
+        }
+    }
+
+    pub async fn check(&self, raw: &RawNode, baseline_ip: &str) -> Option<FullCheckResult> {
+        match raw.proto {
+            FreeProto::Http | FreeProto::Https => {}
+            _ => return None,
+        }
+        let proxy_url = format!("http://{}:{}", raw.ip, raw.port);
+        let proxy = reqwest::Proxy::all(&proxy_url).ok()?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(self.timeout)
+            .build()
+            .ok()?;
+        let start = std::time::Instant::now();
+        // 1. 出口。
+        let ip_body: serde_json::Value = client
+            .get(format!("{}/ip", self.base_url))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let exit = ip_body
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // 2. 回显头。
+        let h_body: serde_json::Value = client
+            .get(format!("{}/headers", self.base_url))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let mut echoed = std::collections::HashMap::new();
+        if let Some(map) = h_body.get("headers").and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    echoed.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+        // 3. canary（内容篡改检测；arXiv:2403.02445 16,923 篡改样本）。
+        let c_body: serde_json::Value = client
+            .get(format!("{}/anything/{}", self.base_url, FULL_CHECK_MARKER))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let canary_ok = c_body
+            .get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|u| u.contains(FULL_CHECK_MARKER));
+        if !canary_ok {
+            log::warn!(
+                "[FreePool] canary mismatch {}:{} (tamper suspected)",
+                raw.ip,
+                raw.port
+            );
+            return None;
+        }
+        let anon = classify_anonymity(baseline_ip, exit.as_deref(), &echoed);
+        Some(FullCheckResult {
+            anon,
+            exit_ip: exit,
+            fwd_latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// 免费线池权重上限（vs 付费 60~100，加权混合中占少数；bandit free cost 0 不再叠加）。
+/// v2：10 为非 trusted 上限，实际权重由 Health 连续映射 1..=上限。
+pub const FREE_POOL_WEIGHT: u32 = 10;
+/// v2 trusted 加成后硬上限（仍远低于付费线，避免免费淹没付费）。
+pub const FREE_POOL_WEIGHT_TRUSTED_MAX: u32 = 20;
+/// 无归属国家的缺省标记（只服务无 country 要求的流量，见 RouterEngine::matches）。
+pub const FREE_UNKNOWN_COUNTRY: &str = "ZZ";
+/// EWMA 衰减（proxyhive 同款 α=0.3；成功率与延迟共用）。
+pub const HEALTH_EWMA_ALPHA: f64 = 0.3;
+/// 延迟中性点（== FREE_MAX_LATENCY_MS 默认 3000；ewma_latency 高于此则惩罚<1）。
+pub const HEALTH_NEUTRAL_LATENCY_MS: f64 = 3000.0;
+/// trusted 门：streak≥3＋Elite＋ewma 延迟<1500ms（Thordata top-trusted 思想）。
+pub const TRUSTED_MIN_STREAK: u32 = 3;
+pub const TRUSTED_MAX_LATENCY_MS: f64 = 1500.0;
+/// backoff：60s 起指数增长，封顶 1h。
+pub const BACKOFF_BASE_SECS: u64 = 60;
+pub const BACKOFF_MAX_SECS: u64 = 3600;
+
+use crate::model::ProxyNode;
+use crate::router::RouterEngine;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+/// 单节点健康（EWMA 成功率×延迟惩罚；声誉不跨 TTL：条目删除即清零，IP 复用重计）。
+pub struct Health {
+    pub ewma_success: f64,
+    pub ewma_latency_ms: f64,
+    pub streak: u32,
+    pub fail_streak: u32,
+    pub backoff_until: Option<Instant>,
+    pub anon: AnonLevel,
+    pub exit_ip: Option<String>,
+}
+
+impl Health {
+    pub fn fresh() -> Self {
+        Self {
+            ewma_success: 0.5,
+            ewma_latency_ms: HEALTH_NEUTRAL_LATENCY_MS,
+            streak: 0,
+            fail_streak: 0,
+            backoff_until: None,
+            anon: AnonLevel::Unknown,
+            exit_ip: None,
+        }
+    }
+
+    pub fn note_success(&mut self, fwd_latency_ms: u64) {
+        self.ewma_success += HEALTH_EWMA_ALPHA * (1.0 - self.ewma_success);
+        self.ewma_latency_ms += HEALTH_EWMA_ALPHA * (fwd_latency_ms as f64 - self.ewma_latency_ms);
+        self.streak += 1;
+        self.fail_streak = 0;
+        self.backoff_until = None;
+    }
+
+    pub fn note_failure(&mut self, now: Instant) {
+        self.ewma_success += HEALTH_EWMA_ALPHA * (0.0 - self.ewma_success);
+        self.streak = 0;
+        self.fail_streak += 1;
+        // fail_streak≥1 恒成立（先自增），min(7)-1 无下溢；60s 起指数增长，封顶 1h。
+        let secs =
+            (BACKOFF_BASE_SECS * 2u64.pow(self.fail_streak.min(7) - 1)).min(BACKOFF_MAX_SECS);
+        self.backoff_until = Some(now + Duration::from_secs(secs));
+    }
+
+    /// 成功率主项×延迟惩罚（可解释双因子；延迟惩罚＝中性点/(中性点+超额)，超额≤0 时为 1）。
+    pub fn score(&self) -> f64 {
+        let over = (self.ewma_latency_ms - HEALTH_NEUTRAL_LATENCY_MS).max(0.0);
+        self.ewma_success * (HEALTH_NEUTRAL_LATENCY_MS / (HEALTH_NEUTRAL_LATENCY_MS + over))
+    }
+
+    pub fn trusted(&self) -> bool {
+        self.anon == AnonLevel::Elite
+            && self.streak >= TRUSTED_MIN_STREAK
+            && self.ewma_latency_ms < TRUSTED_MAX_LATENCY_MS
+    }
+
+    /// 连续权重 1..=上限（低分保底 1 不断流；trusted 封顶 TRUSTED_MAX）。
+    pub fn weight(&self) -> u32 {
+        let cap = if self.trusted() {
+            FREE_POOL_WEIGHT_TRUSTED_MAX
+        } else {
+            FREE_POOL_WEIGHT
+        };
+        ((self.score() * cap as f64).round() as u32).clamp(1, cap)
+    }
+
+    pub fn backed_off(&self, now: Instant) -> bool {
+        self.backoff_until.is_some_and(|t| t > now)
+    }
+}
+
+struct Entry {
+    node: ProxyNode,
+    health: Health,
+    expires_at: Instant,
+}
+
+/// TTL 注册表：多源按 `addr` 去重（首见 source 获胜）；到期仅经复检续命；
+/// 声誉不跨 TTL（条目删除即清零，IP 复用重计，防新旧污染双向错误）。
+pub struct Registry {
+    ttl: Duration,
+    max_nodes: usize,
+    entries: HashMap<String, Entry>,
+}
+
+impl Registry {
+    /// 默认容量构造（稳定 API：单测＋未来调用方；线上 Worker 走 `with_capacity`）。
+    /// 按 `reload_nodes` 惯例放行 dead。
+    #[allow(dead_code)]
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            max_nodes: 2000,
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn with_capacity(ttl: Duration, max_nodes: usize) -> Self {
+        Self {
+            ttl,
+            max_nodes,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// 质检通过即插入/刷新（已存在 addr：续期＋health 更新，不覆盖 source；首见获胜）。
+    /// 非 poolable 协议（SOCKS）入口即丢弃（G7；Phase 2 前不进池）。
+    /// v1 `upsert(raw, latency, now)` 语义由本函数替代（TCP-only 降级时 anon=Unknown/lat=tcp）。
+    pub fn upsert_full(
+        &mut self,
+        raw: &RawNode,
+        fwd_latency_ms: u64,
+        anon: AnonLevel,
+        exit_ip: Option<String>,
+        now: Instant,
+    ) {
+        if !raw.proto.poolable() {
+            log::debug!(
+                "[FreePool] skip non-poolable proto {:?} {}:{}",
+                raw.proto,
+                raw.ip,
+                raw.port
+            );
+            return;
+        }
+        let addr = format!("{}:{}", raw.ip, raw.port);
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.expires_at = now + self.ttl;
+            e.health.note_success(fwd_latency_ms);
+            e.health.anon = anon;
+            e.health.exit_ip = exit_ip;
+            e.node.weight = e.health.weight();
+            log::debug!(
+                "[FreePool] upsert {addr} anon={:?} exit={:?} score={:.3} weight={}",
+                e.health.anon,
+                e.health.exit_ip,
+                e.health.score(),
+                e.node.weight
+            );
+            return;
+        }
+        let mut health = Health::fresh();
+        health.note_success(fwd_latency_ms);
+        health.anon = anon;
+        health.exit_ip = exit_ip;
+        let node = ProxyNode::new(
+            raw.ip.clone(),
+            raw.port,
+            None,
+            None,
+            raw.country
+                .clone()
+                .unwrap_or_else(|| FREE_UNKNOWN_COUNTRY.to_string()),
+            "free".to_string(),
+            format!("free-{}", raw.source),
+            health.weight(),
+        );
+        self.entries.insert(
+            addr,
+            Entry {
+                node,
+                health,
+                expires_at: now + self.ttl,
+            },
+        );
+        self.evict_if_over_capacity();
+    }
+
+    /// 复检失败（TCP/Full 任一）：EWMA 记失败＋backoff，TTL 内保留（自动恢复）。
+    pub fn note_verify_failed(&mut self, addr: &str, now: Instant) {
+        if let Some(e) = self.entries.get_mut(addr) {
+            e.health.note_failure(now);
+            e.node.weight = e.health.weight();
+        }
+    }
+
+    /// 复检：通过由 `upsert_full` 续期；失败记 backoff（TTL 内保留，而非删除）。
+    /// 当前 Worker 通过路径走 `upsert_full`（附带健康更新），本函数为稳定 API
+    /// （轻量续命入口，供运维/Phase 3 调用），按 `reload_nodes` 惯例放行 dead。
+    #[allow(dead_code)]
+    pub fn reverify(&mut self, addr: &str, passed: bool, now: Instant) {
+        if passed {
+            if let Some(e) = self.entries.get_mut(addr) {
+                e.expires_at = now + self.ttl;
+            }
+        } else {
+            self.note_verify_failed(addr, now);
+        }
+    }
+
+    /// 容量淘汰：先逐 backoff 条目（其中最低分），再逐全局最低分。
+    /// 分数非负故 `to_bits` 保序（min_by_key 可用）；总数收敛即正确。
+    fn evict_if_over_capacity(&mut self) {
+        while self.entries.len() > self.max_nodes {
+            let now = Instant::now();
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.health.backed_off(now))
+                .min_by_key(|(_, e)| e.health.score().to_bits())
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.health.score().to_bits())
+                })
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    self.entries.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 可进池快照：未过期＋非 backoff＋匿名度门。
+    /// `require_elite=true` 时仅 Elite（FREE_REQUIRE_ELITE=1）。
+    pub fn snapshot(&self, now: Instant, require_elite: bool) -> Vec<ProxyNode> {
+        self.entries
+            .values()
+            .filter(|e| e.expires_at > now)
+            .filter(|e| !e.health.backed_off(now))
+            .filter(|e| !require_elite || e.health.anon == AnonLevel::Elite)
+            .map(|e| e.node.clone())
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// 源站零产出熔断（连续 MAX_ZERO_CYCLES 轮零产出→暂停；304 不计；每 N tick 试探）。
+pub struct SourceGuard {
+    max_zero: u32,
+    retry_every: u64,
+    zero_cycles: u32,
+    suspended_at_tick: Option<u64>,
+}
+
+impl SourceGuard {
+    pub fn new(max_zero: u32, retry_every: u64) -> Self {
+        Self {
+            max_zero: max_zero.max(1),
+            retry_every: retry_every.max(1),
+            zero_cycles: 0,
+            suspended_at_tick: None,
+        }
+    }
+
+    pub fn should_fetch(&self, tick: u64) -> bool {
+        match self.suspended_at_tick {
+            None => true,
+            Some(t) => tick >= t && (tick - t).is_multiple_of(self.retry_every),
+        }
+    }
+
+    /// 有产出/304→恢复或维持；零产出→计数，达阈值熔断（记录熔断 tick）。
+    pub fn note_outcome(&mut self, outcome: &FetchOutcome, tick: u64) {
+        if outcome.not_modified || !outcome.nodes.is_empty() {
+            self.zero_cycles = 0;
+            self.suspended_at_tick = None;
+            return;
+        }
+        self.zero_cycles += 1;
+        if self.zero_cycles >= self.max_zero {
+            if self.suspended_at_tick.is_none() {
+                log::warn!(
+                    "[FreePool] source suspended after {} zero-yield cycles",
+                    self.zero_cycles
+                );
+            }
+            self.suspended_at_tick.get_or_insert(tick);
+        }
+    }
+
+    pub fn suspended(&self) -> bool {
+        self.suspended_at_tick.is_some()
+    }
+}
+
+/// 并发抓取全源（`join_all` 按源序并发＋per-source 15s 超时；输出与输入同序，
+/// 保证去重“首见获胜”确定性：调用方保证 `sources` 配置序＝优先级序）。
+/// 暂停源跳过（其 guard 不计数，保持旧集）；超时/失败 hold 旧集（registry 不动）。
+pub async fn fetch_all(
+    sources: &[Box<dyn Source>],
+    guards: &mut [SourceGuard],
+    client: &reqwest::Client,
+    tick: u64,
+) -> Vec<RawNode> {
+    let futs: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| guards[*i].should_fetch(tick))
+        .map(|(i, s)| async move {
+            let r = tokio::time::timeout(Duration::from_secs(15), s.fetch(client)).await;
+            (i, r)
+        })
+        .collect();
+    let results = futures::future::join_all(futs).await; // 输出与输入同序
+    let mut raws = Vec::new();
+    for (i, r) in results {
+        match r {
+            Ok(Ok(outcome)) => {
+                guards[i].note_outcome(&outcome, tick);
+                if !outcome.not_modified {
+                    raws.extend(outcome.nodes);
+                }
+            }
+            Ok(Err(e)) => {
+                log::warn!("[FreePool] source fetch failed: {e} (holding last good set)")
+            }
+            Err(_) => {
+                log::warn!("[FreePool] source fetch timed out (15s, holding last good set)")
+            }
+        }
+    }
+    // 去重（首见获胜；源序＝配置序：api > html > github，调用方保证 sources 顺序）。
+    let mut seen = HashSet::new();
+    raws.retain(|r| seen.insert(format!("{}:{}", r.ip, r.port)));
+    raws
+}
+
+/// Worker 配置（main 从 env 组装；默认值见计划 §2 Env 总表）。
+#[derive(Debug, Clone)]
+pub struct FreePoolConfig {
+    pub api_urls: Vec<String>,
+    pub html_urls: Vec<String>,
+    pub github_urls: Vec<String>,
+    pub fetch_interval: Duration,
+    pub ttl: Duration,
+    pub verify_timeout: Duration,
+    pub max_latency_ms: u64,
+    pub max_concurrent: usize,
+    pub full_concurrent: usize,
+    pub max_nodes: usize,
+    pub full_check_base: String,
+    pub require_elite: bool,
+    pub max_zero_cycles: u32,
+    pub suspend_retry_every: u64,
+}
+
+/// Source 默认 URL（全 env 可覆盖；单源挂了只 hold 旧集，不清空池）。
+pub const DEFAULT_API_URL: &str = "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc";
+pub const DEFAULT_HTML_URL: &str = "https://free-proxy-list.net/";
+pub const DEFAULT_GITHUB_URL: &str =
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt";
+pub const DEFAULT_FULL_CHECK_BASE: &str = "https://httpbin.org";
+
+/// FullCheck 任务装配 helper（许可拿不到按失败计，沿 R2-7 `?`-in-bool 教训）。
+fn spawn_full_check(
+    set: &mut tokio::task::JoinSet<(RawNode, Option<FullCheckResult>)>,
+    sem: Arc<tokio::sync::Semaphore>,
+    checker: FullChecker,
+    raw: RawNode,
+    baseline: String,
+) {
+    set.spawn(async move {
+        if sem.acquire_owned().await.is_err() {
+            return (raw, None);
+        }
+        let res = checker.check(&raw, &baseline).await;
+        (raw, res)
+    });
+}
+
+pub struct FreePoolWorker {
+    router: Arc<RouterEngine>,
+    metrics: Arc<crate::metrics::MetricsRegistry>,
+    config: FreePoolConfig,
+    registry: Registry,
+    guards: Vec<SourceGuard>,
+    tick: u64,
+    /// 已泄漏源名 intern 池（URL 稳定时零增长；防每轮 `Box::leak` 微泄漏）。
+    leaked_names: HashSet<&'static str>,
+}
+
+impl FreePoolWorker {
+    pub fn new(
+        router: Arc<RouterEngine>,
+        metrics: Arc<crate::metrics::MetricsRegistry>,
+        config: FreePoolConfig,
+    ) -> Self {
+        let ttl = config.ttl;
+        let max_nodes = config.max_nodes;
+        let n_sources =
+            (config.api_urls.len() + config.html_urls.len() + config.github_urls.len()).max(1);
+        let guards = (0..n_sources)
+            .map(|_| SourceGuard::new(config.max_zero_cycles, config.suspend_retry_every))
+            .collect();
+        Self {
+            router,
+            metrics,
+            config,
+            registry: Registry::with_capacity(ttl, max_nodes),
+            guards,
+            tick: 0,
+            leaked_names: HashSet::new(),
+        }
+    }
+
+    /// 源名 intern（`Source::name` 需 `'static`；URL 稳定时集合大小恒定）。
+    fn intern_name(&mut self, s: String) -> &'static str {
+        if let Some(existing) = self.leaked_names.get(s.as_str()).copied() {
+            return existing;
+        }
+        let leaked: &'static str = Box::leak(s.into_boxed_str());
+        self.leaked_names.insert(leaked);
+        leaked
+    }
+
+    /// 组装三类源（配置序＝去重优先级：api > html > github；URL 集合变化时重建
+    /// guards 以对齐下标）。
+    fn build_sources(&mut self) -> Vec<Box<dyn Source>> {
+        // 先克隆 URL 表（避免 config 不可变借用与 intern_name 可变借用冲突）。
+        let api_urls = self.config.api_urls.clone();
+        let html_urls = self.config.html_urls.clone();
+        let github_urls = self.config.github_urls.clone();
+        let mut sources: Vec<Box<dyn Source>> = Vec::new();
+        for (i, url) in api_urls.iter().enumerate() {
+            let name = self.intern_name(format!("api{i}"));
+            sources.push(Box::new(ApiSource {
+                name,
+                url: url.clone(),
+            }));
+        }
+        for (i, url) in html_urls.iter().enumerate() {
+            let name = self.intern_name(format!("html{i}"));
+            sources.push(Box::new(HtmlSource {
+                name,
+                url: url.clone(),
+                default_proto: FreeProto::Http,
+            }));
+        }
+        for (i, url) in github_urls.iter().enumerate() {
+            let name = self.intern_name(format!("gh{i}"));
+            sources.push(Box::new(GitHubSource::new(name, url.clone())));
+        }
+        if self.guards.len() != sources.len() {
+            self.guards = (0..sources.len())
+                .map(|_| {
+                    SourceGuard::new(self.config.max_zero_cycles, self.config.suspend_retry_every)
+                })
+                .collect();
+        }
+        sources
+    }
+
+    /// 单轮：并发抓取 → TCP 初筛（信号量封顶）→ FullCheck 复检（信号量 20，
+    /// 基址探活失败则降级 TCP-only，anon=Unknown）→ upsert/失败记 backoff →
+    /// 过期自然掉出 → merge（require_elite 门）→ 水位计＋扩展指标。
+    pub async fn run_once(&mut self, client: &reqwest::Client) {
+        self.tick += 1;
+        let tick = self.tick;
+        // 1-2. 组装＋并发抓取（失败 hold 旧集）＋ suspend 指标同步。
+        let sources = self.build_sources();
+        let raws = fetch_all(&sources, &mut self.guards, client, tick).await;
+        for (i, s) in sources.iter().enumerate() {
+            self.metrics
+                .set_free_source_suspended(s.name(), self.guards[i].suspended());
+        }
+        // yield 按源聚合（>0 才记行；零产出源由 suspend gauge 覆盖）。
+        {
+            let mut per_source: HashMap<&str, u64> = HashMap::new();
+            for r in &raws {
+                *per_source.entry(r.source.as_str()).or_insert(0) += 1;
+            }
+            for (s, n) in per_source {
+                self.metrics.note_free_source_yield(s, n);
+            }
+        }
+        // 3. 直连基线：GET {base}/ip → origin（5s 超时；失败→None＝降级 TCP-only）。
+        // 基线获取失败不计节点失败（源站侧问题，非节点问题）。
+        let baseline: Option<String> = {
+            let r = tokio::time::timeout(
+                Duration::from_secs(5),
+                client
+                    .get(format!("{}/ip", self.config.full_check_base))
+                    .send(),
+            )
+            .await;
+            match r {
+                Ok(Ok(resp)) => resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                    v.get("origin")
+                        .and_then(|o| o.as_str())
+                        .map(|s| s.to_string())
+                }),
+                _ => None,
+            }
+        };
+        if baseline.is_none() {
+            log::warn!("[FreePool] baseline unreachable, degrading to TCP-only this tick");
+        }
+        // 4a. TCP 初筛（信号量 max_concurrent；非 poolable 在 upsert 入口丢弃，
+        // 此处直接跳过并记 backoff_skip，避免无效建链）。
+        let verifier = Verifier::new(self.config.verify_timeout, self.config.max_latency_ms);
+        let tcp_sem = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent.max(1),
+        ));
+        let mut set = tokio::task::JoinSet::new();
+        for raw in raws {
+            if !raw.proto.poolable() {
+                log::debug!(
+                    "[FreePool] skip non-poolable proto {:?} {}:{}",
+                    raw.proto,
+                    raw.ip,
+                    raw.port
+                );
+                self.metrics.note_free_verify("backoff_skip");
+                continue;
+            }
+            let sem = tcp_sem.clone();
+            let vf = verifier.clone();
+            set.spawn(async move {
+                if sem.acquire_owned().await.is_err() {
+                    return (raw, None);
+                }
+                let latency = vf.verify(&raw).await;
+                (raw, latency)
+            });
+        }
+        // 4b. 通过 TCP 者→FullCheck（信号量 full_concurrent；基线缺失则跳过，
+        // anon=Unknown＋tcp 延迟；REQUIRE_ELITE=1 时此类条目被 merge 门过滤，语义自洽）。
+        let full_sem = Arc::new(tokio::sync::Semaphore::new(
+            self.config.full_concurrent.max(1),
+        ));
+        let checker = FullChecker::new(
+            self.config.full_check_base.clone(),
+            self.config.verify_timeout,
+        );
+        let now = Instant::now();
+        let mut fset = tokio::task::JoinSet::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((raw, Some(ms))) => {
+                    if let Some(ref base) = baseline {
+                        spawn_full_check(
+                            &mut fset,
+                            full_sem.clone(),
+                            checker.clone(),
+                            raw,
+                            base.clone(),
+                        );
+                    } else {
+                        self.registry
+                            .upsert_full(&raw, ms, AnonLevel::Unknown, None, now);
+                        self.metrics.note_free_verify("pass");
+                        self.metrics.note_free_anonymity("unknown");
+                    }
+                }
+                Ok((raw, None)) => {
+                    self.metrics.note_free_verify("tcp_fail");
+                    self.registry
+                        .note_verify_failed(&format!("{}:{}", raw.ip, raw.port), now);
+                }
+                Err(e) => log::warn!("[FreePool] tcp task join failed: {e:?}"),
+            }
+        }
+        while let Some(joined) = fset.join_next().await {
+            match joined {
+                Ok((raw, Some(res))) => {
+                    self.registry.upsert_full(
+                        &raw,
+                        res.fwd_latency_ms,
+                        res.anon,
+                        res.exit_ip.clone(),
+                        now,
+                    );
+                    self.metrics.note_free_verify("pass");
+                    self.metrics.note_free_anonymity(match res.anon {
+                        AnonLevel::Elite => "elite",
+                        AnonLevel::Anonymous => "anonymous",
+                        AnonLevel::Transparent => "transparent",
+                        AnonLevel::Unknown => "unknown",
+                    });
+                }
+                Ok((raw, None)) => {
+                    self.metrics.note_free_verify("full_fail");
+                    self.registry
+                        .note_verify_failed(&format!("{}:{}", raw.ip, raw.port), now);
+                }
+                Err(e) => log::warn!("[FreePool] full task join failed: {e:?}"),
+            }
+        }
+        // 5. 合并（过期/backoff 条目自然掉出快照）＋ tick 日志。
+        Self::merge_once(
+            &self.router,
+            &self.metrics,
+            &self.registry,
+            self.config.require_elite,
+        );
+        log::info!(
+            "[FreePool] tick={tick} pool={} interval={:?}",
+            self.registry.len(),
+            self.config.fetch_interval
+        );
+    }
+
+    /// 纯合并步（可单测）：快照 → 路由 → 水位计。
+    pub fn merge_once(
+        router: &Arc<RouterEngine>,
+        metrics: &Arc<crate::metrics::MetricsRegistry>,
+        registry: &Registry,
+        require_elite: bool,
+    ) {
+        let now = Instant::now();
+        let snap = registry.snapshot(now, require_elite);
+        metrics.set_free_pool_nodes(snap.len() as u64);
+        router.replace_vendor_nodes("free-", snap);
+    }
+
+    /// 常驻循环（supervisor 托管；单轮 panic 由 supervisor 捕获重启）。
+    pub async fn run(mut self, client: reqwest::Client) {
+        loop {
+            self.run_once(&client).await;
+            tokio::time::sleep(self.config.fetch_interval).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_source_parses_geonode_shape() {
+        let body = r#"{"data":[
+            {"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"},
+            {"ip":"bad","port":"x","protocols":["http"],"country":"US"},
+            {"ip":"192.0.2.1","port":"1080","protocols":["socks5"],"country":"US"}
+        ]}"#;
+        let nodes = ApiSource::parse("geonode", body);
+        // 坏行丢弃；socks5 解析保留（Phase 1 由 Verifier 跳过，不在此处丢）。
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].port, 8080);
+        assert_eq!(nodes[0].proto, FreeProto::Http);
+        assert_eq!(nodes[1].proto, FreeProto::Https);
+        assert_eq!(nodes[2].proto, FreeProto::Socks5);
+        assert_eq!(nodes[0].country.as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn html_source_extracts_ip_ports() {
+        let html = r#"<table><tr><td>203.0.113.7</td><td>8080</td><td>yes</td></tr>
+            <tr><td>999.1.1.1</td><td>80</td></tr>
+            <tr><td>198.51.100.9:3128</td></tr>
+            <tr><td>10.0.0.1</td><td>70000</td></tr></table>"#;
+        let nodes = HtmlSource::extract("fpl", html, FreeProto::Http);
+        // 非法 octet/超范围端口丢弃；`ip:port` 紧凑形态同样识别。
+        assert_eq!(nodes.len(), 2);
+        assert_eq!((nodes[0].ip.as_str(), nodes[0].port), ("203.0.113.7", 8080));
+        assert_eq!(
+            (nodes[1].ip.as_str(), nodes[1].port),
+            ("198.51.100.9", 3128)
+        );
+        assert!(nodes
+            .iter()
+            .all(|n| n.proto == FreeProto::Http && n.source == "fpl"));
+    }
+
+    #[test]
+    fn github_source_parses_line_list() {
+        let body =
+            "203.0.113.7:8080\n\n# comment\n198.51.100.9:3128 socks5\nbad-line\n10.0.0.1:0\n";
+        let nodes = GitHubSource::parse("gh", body);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].proto, FreeProto::Http);
+        assert_eq!(nodes[1].proto, FreeProto::Socks5);
+    }
+
+    #[tokio::test]
+    async fn github_source_fetches_from_local_server() {
+        // 零外部依赖：本地临时 HTTP 服务冒充 raw 仓（沿用 metrics 单测手法换端口）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await;
+            let body = "203.0.113.7:8080\n";
+            let _ = s
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let client = reqwest::Client::new();
+        let src = GitHubSource::new("gh", format!("http://127.0.0.1:{port}/list.txt"));
+        let outcome = src.fetch(&client).await.expect("fetch");
+        assert!(!outcome.not_modified);
+        assert_eq!(outcome.nodes.len(), 1);
+        assert_eq!(outcome.nodes[0].ip, "203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn github_source_etag_not_modified() {
+        // ETag 礼貌轮询：首轮存 ETag；次轮带 If-None-Match，被 304 后 not_modified=true
+        // 且调用方（SourceGuard）不得计零产出（见 Task 10 单测联动）。
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen_if_none_match: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen = seen_if_none_match.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let inm = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("if-none-match:"))
+                    .map(|l| {
+                        l.split_once(':')
+                            .map(|(_, v)| v.trim().to_string())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                seen.lock().expect("lock").push(inm.clone());
+                if inm == "\"v1\"" {
+                    let _ = s
+                        .write_all(b"HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n")
+                        .await;
+                } else {
+                    let body = "203.0.113.7:8080\n";
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            }
+        });
+        let client = reqwest::Client::new();
+        let src = GitHubSource::new("gh", format!("http://127.0.0.1:{port}/list.txt"));
+        let first = src.fetch(&client).await.expect("first");
+        assert_eq!(first.nodes.len(), 1);
+        assert!(!first.not_modified);
+        let second = src.fetch(&client).await.expect("second");
+        assert!(second.not_modified);
+        assert!(second.nodes.is_empty());
+        let seen = seen_if_none_match.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[1].contains("v1"),
+            "second request must carry If-None-Match, got {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_admits_fast_listener() {
+        // 本地 listener 必连上（OPT-6 手法），延迟门内放行。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let v = Verifier::new(Duration::from_secs(3), 3000);
+        let raw = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        let ok = v.verify(&raw).await;
+        assert!(ok.is_some());
+        assert!(ok.expect("latency") < 3000);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_refused_and_slow() {
+        // 拒连端口（127.0.0.1:1）必失败；socks 协议 Phase 1 跳过（None）。
+        let v = Verifier::new(Duration::from_secs(3), 3000);
+        let refused = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: 1,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        assert!(v.verify(&refused).await.is_none());
+        let socks = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: 1,
+            proto: FreeProto::Socks5,
+            country: None,
+            source: "t".to_string(),
+        };
+        assert!(v.verify(&socks).await.is_none());
+    }
+
+    #[test]
+    fn anonymity_classification_matrix() {
+        // 三级矩阵（openproxyhub 定义）：出口==基线→Transparent；否则 7 头有披露→Anonymous；无→Elite。
+        use std::collections::HashMap;
+        let empty: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            classify_anonymity("1.1.1.1", Some("1.1.1.1"), &empty),
+            AnonLevel::Transparent
+        );
+        assert_eq!(
+            classify_anonymity("1.1.1.1", Some("9.9.9.9"), &empty),
+            AnonLevel::Elite
+        );
+        let mut disclosed = HashMap::new();
+        disclosed.insert("via".to_string(), "1.0 proxy".to_string());
+        assert_eq!(
+            classify_anonymity("1.1.1.1", Some("9.9.9.9"), &disclosed),
+            AnonLevel::Anonymous
+        );
+        let mut upper = HashMap::new();
+        upper.insert("X-Forwarded-For".to_string(), "1.1.1.1".to_string());
+        assert_eq!(
+            classify_anonymity("1.1.1.1", Some("9.9.9.9"), &upper),
+            AnonLevel::Anonymous
+        );
+        // 出口未知（代理失败）→Unknown，调用方按失败计。
+        assert_eq!(
+            classify_anonymity("1.1.1.1", None, &empty),
+            AnonLevel::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn checker_rejects_refused_proxy() {
+        // 拒连代理（127.0.0.1:1）→ None（失败），不 panic。
+        let c = FullChecker::new("http://127.0.0.1:1/".to_string(), Duration::from_secs(3));
+        let raw = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: 1,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        assert!(c.check(&raw, "9.9.9.9").await.is_none());
+    }
+
+    /// 本地微型 HTTP 代理 stub（单测内联 ~40 行）：读绝对 URI 首行，按 path
+    /// 返回固定 JSON（`/ip` 出口／`/headers` 回显空头／`/anything` canary）。
+    /// `tamper=true` 时 canary 的 url 缺 marker（模拟内容篡改）。
+    async fn spawn_stub_proxy(tamper: bool) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            // 一次 check 发 3 请求（server 回 connection:close，故 3 连接）。
+            for _ in 0..3 {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                // 绝对 URI（经代理）与源形态（直连）双兼容：截 path。
+                let path = path
+                    .split_once("://")
+                    .map(|(_, rest)| rest.find('/').map(|i| &rest[i..]).unwrap_or("/"))
+                    .unwrap_or(&path)
+                    .to_string();
+                let body = if path.starts_with("/ip") {
+                    r#"{"origin":"10.9.9.9"}"#.to_string()
+                } else if path.starts_with("/headers") {
+                    r#"{"headers":{}}"#.to_string()
+                } else if path.contains(FULL_CHECK_MARKER) {
+                    if tamper {
+                        r#"{"url":"tampered"}"#.to_string()
+                    } else {
+                        format!(r#"{{"url":"http://x/anything/{FULL_CHECK_MARKER}"}}"#)
+                    }
+                } else {
+                    r#"{}"#.to_string()
+                };
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn checker_detects_tampered_canary() {
+        // 篡改 stub（canary url 缺 marker）→ check 判失败（None）。
+        let stub = spawn_stub_proxy(true).await;
+        let c = FullChecker::new(format!("http://127.0.0.1:{stub}"), Duration::from_secs(3));
+        let raw = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: stub,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        assert!(c.check(&raw, "1.2.3.4").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn checker_records_forward_latency() {
+        // 正常 stub：出口 10.9.9.9 ≠ 基线 → Elite；转发延迟 < 3000ms。
+        let stub = spawn_stub_proxy(false).await;
+        let c = FullChecker::new(format!("http://127.0.0.1:{stub}"), Duration::from_secs(3));
+        let raw = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: stub,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        let res = c.check(&raw, "1.2.3.4").await.expect("pass");
+        assert_eq!(res.anon, AnonLevel::Elite);
+        assert_eq!(res.exit_ip.as_deref(), Some("10.9.9.9"));
+        assert!(res.fwd_latency_ms < 3000);
+    }
+
+    fn raw(ip: &str, source: &str) -> RawNode {
+        RawNode {
+            ip: ip.to_string(),
+            port: 8080,
+            proto: FreeProto::Http,
+            country: Some("US".to_string()),
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_ttl_expiry() {
+        // TTL 到即快照不可见（可测版本注入未来时间，沿用 sweep_expired_at 手法）。
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        reg.upsert_full(
+            &raw("10.0.0.1", "a"),
+            50,
+            AnonLevel::Elite,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(reg.snapshot(Instant::now(), false).len(), 1);
+        assert!(reg
+            .snapshot(Instant::now() + Duration::from_secs(1801), false)
+            .is_empty());
+    }
+
+    #[test]
+    fn registry_reverify_renews() {
+        // 复检：失败记 backoff（TTL 内保留），成功路径由 upsert_full 续期。
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        let now = Instant::now();
+        reg.upsert_full(&raw("10.0.0.1", "a"), 50, AnonLevel::Elite, None, now);
+        // TTL 1800s：2000s 处已过期不可见；1000s 处（TTL 内）可见。
+        assert_eq!(
+            reg.snapshot(now + Duration::from_secs(2000), false).len(),
+            0
+        );
+        // 新鲜条目在 TTL 内可见。
+        assert_eq!(
+            reg.snapshot(now + Duration::from_secs(1000), false).len(),
+            1
+        );
+        // 失败→backoff：快照不可见但条目保留（len 不变）。
+        reg.reverify("10.0.0.1:8080", false, now + Duration::from_secs(1000));
+        assert!(reg
+            .snapshot(now + Duration::from_secs(1000), false)
+            .is_empty());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn registry_dedupes_across_sources() {
+        // 多源同 addr 只留首见 source；快照转 ProxyNode（provider free-{source}/tier free/weight/country 缺省 ZZ）。
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        let now = Instant::now();
+        reg.upsert_full(&raw("10.0.0.1", "a"), 50, AnonLevel::Elite, None, now);
+        reg.upsert_full(&raw("10.0.0.1", "b"), 60, AnonLevel::Elite, None, now);
+        let snap = reg.snapshot(now, false);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].provider, "free-a");
+        assert_eq!(snap[0].tier, "free");
+        assert_eq!(snap[0].addr, "10.0.0.1:8080");
+        let mut no_country = raw("10.0.0.2", "a");
+        no_country.country = None;
+        reg.upsert_full(&no_country, 50, AnonLevel::Elite, None, now);
+        // 快照为 HashMap 迭代序（不定），按 addr 查找断言 ZZ 缺省。
+        let snap = reg.snapshot(now, false);
+        assert_eq!(snap.len(), 2);
+        let zz = snap
+            .iter()
+            .find(|n| n.addr == "10.0.0.2:8080")
+            .expect("zz node");
+        assert_eq!(zz.country, "ZZ");
+    }
+
+    #[test]
+    fn health_score_math() {
+        // 健康分＝EWMA成功率×延迟惩罚；权重 1..20 连续映射；trusted 加成封顶 20。
+        let mut h = Health::fresh();
+        assert!((h.score() - 0.5).abs() < 1e-9);
+        // Elite＋快＋全成功→trusted→封顶 20。
+        h.anon = AnonLevel::Elite;
+        for _ in 0..50 {
+            h.note_success(100);
+        }
+        assert!(h.ewma_success > 0.99);
+        assert!(h.trusted());
+        assert_eq!(h.weight(), 20);
+        // 高延迟→惩罚生效（Unknown 非 trusted，cap 10）。
+        let mut slow = Health::fresh();
+        for _ in 0..50 {
+            slow.note_success(9000);
+        }
+        assert!(slow.score() < h.score(), "latency penalty must bite");
+        assert!(slow.weight() < 20);
+        // 连败→保底 1（不断流，只降权）。
+        let mut bad = Health::fresh();
+        for _ in 0..10 {
+            bad.note_failure(Instant::now());
+        }
+        assert_eq!(bad.weight(), 1);
+    }
+
+    #[test]
+    fn backoff_and_capacity() {
+        // backoff：连续失败→merge 不可见；TTL 内保留；成功恢复。
+        // 容量：超量逐最低分淘汰（backoff 优先）。
+        let mut reg = Registry::with_capacity(Duration::from_secs(1800), 2);
+        let now = Instant::now();
+        reg.upsert_full(&raw("10.0.0.1", "a"), 50, AnonLevel::Elite, None, now);
+        reg.upsert_full(&raw("10.0.0.2", "a"), 50, AnonLevel::Elite, None, now);
+        // 灌第三个→淘汰最低分之一（初分相同，允许淘汰任一，但总数恒 2）。
+        reg.upsert_full(&raw("10.0.0.3", "a"), 50, AnonLevel::Elite, None, now);
+        assert_eq!(reg.snapshot(now, false).len(), 2);
+        // backoff：连 fail 3 次→快照不可见但 len 仍计入（TTL 内保留）。
+        // 注：容量淘汰后 10.0.0.2 可能已被逐出；取快照现存任一节点做 backoff。
+        let victim = reg.snapshot(now, false)[0].addr.clone();
+        for _ in 0..3 {
+            reg.note_verify_failed(&victim, now);
+        }
+        let snap = reg.snapshot(now, false);
+        assert!(snap.iter().all(|n| n.addr != victim));
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn source_guard_trips_and_recovers() {
+        // 连续 3 轮零产出→暂停；304 不计数；暂停后每 3 tick 试探一次；有产出即恢复。
+        let mut g = SourceGuard::new(3, 3);
+        assert!(g.should_fetch(0));
+        g.note_outcome(&FetchOutcome::nodes(vec![]), 0);
+        g.note_outcome(&FetchOutcome::nodes(vec![]), 1);
+        assert!(g.should_fetch(2));
+        g.note_outcome(&FetchOutcome::nodes(vec![]), 2); // 第 3 轮零产出→熔断
+        assert!(!g.should_fetch(3), "suspended");
+        assert!(!g.should_fetch(4));
+        assert!(g.should_fetch(5), "probe every 3rd tick"); // tick 2 熔断→5 试探（2+3）
+                                                            // 304 不计轮次。
+        let mut g2 = SourceGuard::new(3, 3);
+        g2.note_outcome(&FetchOutcome::not_modified(), 0);
+        g2.note_outcome(&FetchOutcome::nodes(vec![]), 1);
+        assert!(g2.should_fetch(2), "304 must not count as zero-yield");
+        // 有产出清零。
+        g.note_outcome(&FetchOutcome::nodes(vec![raw("10.0.0.1", "a")]), 5);
+        assert!(g.should_fetch(6));
+    }
+
+    struct StubSource {
+        name: &'static str,
+        nodes: Vec<RawNode>,
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for StubSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn fetch(&self, _client: &reqwest::Client) -> Result<FetchOutcome, String> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Ok(FetchOutcome::nodes(self.nodes.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_all_preserves_source_order() {
+        // 并发抓取但结果按源序拼接（去重“首见获胜”确定性；G9）。
+        // 慢源（200ms）配置在前，快源（0ms）在后：慢源条目恒在前。
+        let slow: Box<dyn Source> = Box::new(StubSource {
+            name: "slow",
+            nodes: vec![raw("10.0.0.1", "slow")],
+            delay_ms: 200,
+        });
+        let fast: Box<dyn Source> = Box::new(StubSource {
+            name: "fast",
+            nodes: vec![raw("10.0.0.2", "fast")],
+            delay_ms: 0,
+        });
+        let sources = vec![slow, fast];
+        let mut guards = vec![SourceGuard::new(3, 3), SourceGuard::new(3, 3)];
+        let client = reqwest::Client::new();
+        let raws = fetch_all(&sources, &mut guards, &client, 0).await;
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[0].source, "slow");
+        assert_eq!(raws[1].source, "fast");
+    }
+
+    #[tokio::test]
+    async fn worker_merge_pushes_snapshot_to_router() {
+        // Worker 合并语义：registry 快照经 replace_vendor_nodes 进池；水位计同步。
+        use crate::metrics::MetricsRegistry;
+        use crate::router::RouterEngine;
+        use std::sync::Arc;
+        let router = Arc::new(RouterEngine::new(vec![]));
+        let metrics = Arc::new(MetricsRegistry::new());
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        reg.upsert_full(
+            &raw("10.0.0.1", "a"),
+            50,
+            AnonLevel::Elite,
+            None,
+            Instant::now(),
+        );
+        FreePoolWorker::merge_once(&router, &metrics, &reg, false);
+        assert_eq!(router.snapshot_all().len(), 1);
+        assert!(metrics.render().contains("free_pool_nodes_total 1"));
+    }
+}

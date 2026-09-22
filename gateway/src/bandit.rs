@@ -35,6 +35,8 @@ pub fn cost_weight_for_tier(tier: &str) -> f64 {
     match tier.to_ascii_lowercase().as_str() {
         "datacenter" | "dc" => COST_DC,
         "mobile" => COST_MOBILE,
+        // 免费线探索成本 0（池权重 10 已压住其选中率，此处不再双重惩罚）。
+        "free" => 0.0,
         _ => COST_RESIDENTIAL,
     }
 }
@@ -216,6 +218,7 @@ mod tests {
         assert_eq!(cost_weight_for_tier("residential"), 1.0);
         assert_eq!(cost_weight_for_tier("mobile"), 3.0);
         assert_eq!(cost_weight_for_tier("unknown"), 1.0);
+        assert_eq!(cost_weight_for_tier("free"), 0.0);
     }
 
     #[test]

@@ -71,6 +71,22 @@ services:
   #     SWEEP_INTERVAL_SECS: "60"
   #     ARBITRAGE_INTERVAL_SECS: "60"
   #     PREWARM_INTERVAL_SECS: "30"
+  #     # FreePool 第二供应线（默认关闭；FREE_ENABLED=1 开；全量 env 见计划 §2）。
+  #     FREE_ENABLED: "1"
+  #     FREE_API_URLS: "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc"
+  #     FREE_HTML_URLS: "https://free-proxy-list.net/"
+  #     FREE_GITHUB_URLS: "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt"
+  #     FREE_FETCH_INTERVAL_SECS: "600"
+  #     FREE_TTL_SECS: "1800"
+  #     FREE_VERIFY_TIMEOUT_SECS: "3"
+  #     FREE_MAX_LATENCY_MS: "3000"
+  #     FREE_MAX_CONCURRENT: "50"
+  #     FREE_FULL_CONCURRENT: "20"
+  #     FREE_MAX_NODES: "2000"
+  #     FREE_FULL_CHECK_URL: "https://httpbin.org"
+  #     FREE_REQUIRE_ELITE: "0"
+  #     FREE_SOURCE_MAX_ZERO_CYCLES: "3"
+  #     FREE_SUSPEND_RETRY_EVERY: "3"
 
 volumes:
   redis-data:

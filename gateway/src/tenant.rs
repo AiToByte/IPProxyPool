@@ -17,12 +17,15 @@ use std::sync::Arc;
 pub const PRICE_DC_PER_GB: f64 = 0.2;
 pub const PRICE_RESIDENTIAL_PER_GB: f64 = 3.0;
 pub const PRICE_MOBILE_PER_GB: f64 = 15.0;
+/// 免费线 $/GB 单价（R2-FreePool：免费节点仍计量字节，单价 0）。
+pub const PRICE_FREE_PER_GB: f64 = 0.0;
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 pub fn price_per_gb(tier: &str) -> f64 {
     match tier.to_ascii_lowercase().as_str() {
         "residential" | "res" => PRICE_RESIDENTIAL_PER_GB,
         "mobile" => PRICE_MOBILE_PER_GB,
+        "free" => PRICE_FREE_PER_GB,
         _ => PRICE_DC_PER_GB,
     }
 }
@@ -166,6 +169,7 @@ mod tests {
         assert_eq!(price_per_gb("residential"), 3.0);
         assert_eq!(price_per_gb("mobile"), 15.0);
         assert_eq!(price_per_gb("weird"), 0.2);
+        assert_eq!(price_per_gb("free"), 0.0);
     }
 
     #[test]

@@ -229,6 +229,20 @@ impl RouterEngine {
             .store(Arc::new(new_nodes.into_iter().map(Arc::new).collect()));
     }
 
+    /// 按 provider 前缀原子替换（FreePool 合并入口）。
+    /// 只移除 `provider.starts_with(prefix)` 的旧节点并追加新集；其余节点复用
+    /// 旧 `Arc`（引用不断，粘滞绑定/臂状态不受影响）；空 `nodes` 即清空该前缀。
+    pub fn replace_vendor_nodes(&self, prefix: &str, nodes: Vec<ProxyNode>) {
+        let guard = self.pools.load();
+        let mut next: Vec<Arc<ProxyNode>> = guard
+            .iter()
+            .filter(|n| !n.provider.starts_with(prefix))
+            .map(Arc::clone)
+            .collect();
+        next.extend(nodes.into_iter().map(Arc::new));
+        self.pools.store(Arc::new(next));
+    }
+
     /// 供应商套利调权（0=摘除熔断，100=恢复满权）。
     /// R2-1：只改数字不增删（摘除即可恢复）；选路侧 `matches` 过滤 `weight==0`。
     /// R2-6：写时复制——未命中节点复用旧 `Arc`（零克隆），命中节点重建
@@ -576,5 +590,135 @@ mod tests {
         let excluded = vec!["10.0.0.1:8080".to_string()];
         let second = r.select_node_excluding(&spec, &excluded).expect("migrate");
         assert_eq!(second.ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn replace_vendor_nodes_keeps_paid() {
+        // 免费线合并语义：只动 `free-` 前缀节点，付费节点保持同一分配（ptr_eq）。
+        use crate::model::ProxyNode;
+        let paid = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let r = RouterEngine::new(vec![paid]);
+        let before = r.snapshot_all();
+        let free1 = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-geonode".to_string(),
+            10,
+        );
+        r.replace_vendor_nodes("free-", vec![free1]);
+        let after = r.snapshot_all();
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().any(|n| n.provider == "mock-a"));
+        assert!(after.iter().any(|n| n.provider == "free-geonode"));
+        // 付费节点仍是池内原分配。
+        assert!(after.iter().any(|n| Arc::ptr_eq(n, &before[0])));
+        // 二次合并替换旧免费节点，不堆积。
+        let free2 = ProxyNode::new(
+            "8.8.8.8".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-github".to_string(),
+            10,
+        );
+        r.replace_vendor_nodes("free-", vec![free2]);
+        let again = r.snapshot_all();
+        assert_eq!(again.len(), 2);
+        assert!(again.iter().all(|n| n.provider != "free-geonode"));
+    }
+
+    #[test]
+    fn free_tier_isolation_and_zz_semantics() {
+        // G12：tier=residential 请求不命中 free 节点；US 约束不命中 ZZ 节点；
+        // 无约束请求按权重混合（free 占少数但可见）；tier=free 只命中免费。
+        let paid = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let free_node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-geonode".to_string(),
+            10,
+        );
+        let r = RouterEngine::new(vec![paid, free_node]);
+        // residential 请求恒命中付费。
+        let res_spec = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: Some("residential".to_string()),
+            target_domain: "x.example".to_string(),
+        };
+        for _ in 0..20 {
+            let n = r.select_node(&res_spec).expect("node");
+            assert_eq!(n.provider, "mock-a");
+        }
+        // US 约束请求不命中 ZZ 免费节点。
+        let us_spec = RoutingSpec {
+            country: Some("US".to_string()),
+            session_id: None,
+            tier: None,
+            target_domain: "x.example".to_string(),
+        };
+        for _ in 0..20 {
+            let n = r.select_node(&us_spec).expect("node");
+            assert_eq!(n.provider, "mock-a");
+        }
+        // 无约束请求按权重混合（100:10，100 次内必见 free，P(不见)~8e-5）。
+        let open = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: None,
+            target_domain: "x.example".to_string(),
+        };
+        let mut saw_free = false;
+        for _ in 0..100 {
+            if r.select_node(&open)
+                .expect("node")
+                .provider
+                .starts_with("free-")
+            {
+                saw_free = true;
+                break;
+            }
+        }
+        assert!(
+            saw_free,
+            "free nodes must serve unconstrained traffic sometimes"
+        );
+        // tier=free 请求只命中免费。
+        let free_spec = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: Some("free".to_string()),
+            target_domain: "x.example".to_string(),
+        };
+        let n = r.select_node(&free_spec).expect("node");
+        assert!(n.provider.starts_with("free-"));
     }
 }

@@ -1447,19 +1447,19 @@ TASK_PLAN 步骤 10 更新。tier 隔离与 REQUIRE_ELITE 两档结果如实记�
 
 | 子项 | 内容 | 优先级 | 状态 | 验收 |
 |------|------|--------|------|------|
-| Task 1 | free 档经济模型（沿用 v1） | P0 | ⬜ 待开始 | 断言扩展＋存量绿 |
-| Task 2 | replace_vendor_nodes（沿用 v1） | P0 | ⬜ 待开始 | 付费 ptr_eq＋二次合并无堆积 |
-| Task 3 | 水位计（沿用 v1） | P0 | ⬜ 待开始 | render 常驻行 |
-| Task 4 | 骨架＋Source trait FetchOutcome 版 | P0 | ⬜ 待开始 | Geonode 双 port 形态 |
-| Task 5 | HtmlSource（沿用 v1） | P0 | ⬜ 待开始 | 4 行/2 行锁定 |
-| Task 6 | GitHubSource＋ETag/304 | P0 | ⬜ 待开始 | If-None-Match 断言＋not_modified |
-| Task 7 | Verifier TCP 初筛（沿用 v1） | P0 | ⬜ 待开始 | 拒连/socks 双拒 |
-| Task 8 | FullCheck＋匿名度＋canary（新增） | P0 | ⬜ 待开始 | 三级矩阵＋篡改检出＋转发延迟 |
-| Task 9 | Registry＋EWMA＋backoff＋容量（修订） | P0 | ⬜ 待开始 | 分数数学＋backoff 不可见＋淘汰收敛 |
-| Task 10 | SourceGuard＋fetch 并发（新增） | P0 | ⬜ 待开始 | 熔断恢复＋源序确定性 |
-| Task 11 | metrics 四组扩展（新增） | P1 | ⬜ 待开始 | render 四组行 |
-| Task 12 | Worker＋main 全 env＋运维落盘（修订） | P0 | ⬜ 待开始 | free_pool 20 单测＋main 1 |
-| Task 13 | 最终门禁＋两档回归 | 门禁 | ⬜ 待开始 | 103±1＋4 live 真过＋ELITE 两档 |
+| Task 1 | free 档经济模型（沿用 v1） | P0 | ✅ 已完成（2026-09-22：tenant price 0＋bandit cost 0 断言在树，107 单测绿） | 断言扩展＋存量绿 |
+| Task 2 | replace_vendor_nodes（沿用 v1） | P0 | ✅ 已完成（2026-09-22：ptr_eq＋二次无堆积在树） | 付费 ptr_eq＋二次合并无堆积 |
+| Task 3 | 水位计（沿用 v1） | P0 | ✅ 已完成（2026-09-22：render 常驻行在树） | render 常驻行 |
+| Task 4 | 骨架＋Source trait FetchOutcome 版 | P0 | ✅ 已完成（2026-09-22：Geonode 双 port 在树） | Geonode 双 port 形态 |
+| Task 5 | HtmlSource（沿用 v1） | P0 | ✅ 已完成（2026-09-22：4 行/2 行在树） | 4 行/2 行锁定 |
+| Task 6 | GitHubSource＋ETag/304 | P0 | ✅ 已完成（2026-09-22：If-None-Match＋not_modified 在树） | If-None-Match 断言＋not_modified |
+| Task 7 | Verifier TCP 初筛（沿用 v1） | P0 | ✅ 已完成（2026-09-22：拒连/socks 双拒在树） | 拒连/socks 双拒 |
+| Task 8 | FullCheck＋匿名度＋canary（新增） | P0 | ✅ 已完成（2026-09-22：三级矩阵＋篡改检出＋转发延迟在树） | 三级矩阵＋篡改检出＋转发延迟 |
+| Task 9 | Registry＋EWMA＋backoff＋容量（修订） | P0 | ✅ 已完成（2026-09-22：分数数学＋backoff 不可见＋淘汰收敛在树） | 分数数学＋backoff 不可见＋淘汰收敛 |
+| Task 10 | SourceGuard＋fetch 并发（新增） | P0 | ✅ 已完成（2026-09-22：熔断恢复＋源序确定性在树） | 熔断恢复＋源序确定性 |
+| Task 11 | metrics 四组扩展（新增） | P1 | ✅ 已完成（2026-09-22：render 四组行在树） | render 四组行 |
+| Task 12 | Worker＋main 全 env＋运维落盘（修订） | P0 | ✅ 已完成（2026-09-22：free_pool 21＋main 3 在树；OPERATION§4/§6＋compose 全 env 在树；tier 隔离 `free_tier_isolation_and_zz_semantics` 在树） | free_pool 20 单测＋main 1 |
+| Task 13 | 最终门禁＋两档回归 | 门禁 | ✅ 已完成（2026-09-22：107 过/4 真 live＋ELITE 0/1 两档 curl 全绿，见 EXEC_LOG 步骤 10 条） | 103±1＋4 live 真过＋ELITE 两档 |
 
 ---
 

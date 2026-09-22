@@ -280,3 +280,20 @@
 - 前沿锚点：arXiv:2403.02445（64万免费代理30月纵向：仅34.5%活跃/16,923篡改内容→零信任+canary+禁敏感流量）；Thordata/openproxyhub/VPSLab流水线（多源→验证→GeoIP→延迟分档→匿名度→streak→top-trusted；15min级复检→本计划fetch 600s/TTL 1800s/streak≥3 trusted）；MiyaIP 7头+直连基线（Task 8分级法）；proxyhive EWMA α=0.3+指数backoff+自动恢复+httpbin复检（Task 9/10）；JA4/FoxIO+Cloudflare 2026文档+httpcloak（免费≈全数据中心IP→高JA4风控面→ZZ+ tier门收敛+Phase 3上浮DomainRisk）；dLinUCB/DiscountedUCB/LARL非平稳三法（R2-6 coarse-restart够付费线，免费churn由注册表层EWMA+backoff+prune吸收，per-tier forgetting记Phase 3）；IPinfo 2026（住宅IP平均可见4.56天/60%一次性→TTL短持有+声誉不跨TTL）；ProxyStats/Proxyway 2026（成功率主项×延迟惩罚可解释双因子，付费80/95阈值不动、free独立连续权重1..20）。
 - 预期验证方式：Task 13 四门（fmt/clippy/test 103±1/bench编译+4 live真过，先验依赖+无SKIP检查）+ FREE_REQUIRE_ELITE 0/1 两档curl回归 + tier隔离验证。
 - 范围：零新依赖（futures/reqwest-json复用已有）；SOCKS egress→Phase 2；本地GeoIP/per-tier forgetting/free独立套利/composite健康→Phase 3；真Key灰度/Linux 50k验收仍待用户输入（explicitly out，见v2 §4）。
+
+### [2026-09-22] 步骤 10 已完成: FreePool v2 第二供应线（Task 1~13 全✅ + 两档回归）
+- **前置说明（诚实记录）**：本轮进入时 Task 1~12 代码已在工作树（含 `free_pool.rs` 全量 + tenant/bandit/router/metrics/main 接线 + OPERATION/compose 落盘 + `free_tier_isolation_and_zz_semantics`），系此前未记日志的一轮工作所留（残留证据：`log/gw10.out|err` 18:50 当日 `[FreePool] tick=1 pool=6`）。本轮未重写实现，按 v2 计划逐项复核代码与计划一致后，执行 Task 13 门禁与两档回归并落库；单测数以本轮实测为准。
+- **实际操作**：复核 Task 1（`PRICE_FREE_PER_GB`/`price_per_gb("free")==0`）/Task 2（`replace_vendor_nodes` ptr_eq）/Task 3（`free_pool_nodes_total` 常驻行）/Task 4~7（FetchOutcome/Source三适配器/ETag-304/Verifier）/Task 8（`classify_anonymity` 7 头＋canary＋fwd 延迟）/Task 9（EWMA α=0.3＋backoff 60s×2^n封顶1h＋容量逐最低分＋merge 门）/Task 10（SourceGuard 304 不计数＋`join_all` 源序并发）/Task 11（yield/verify/anonymity/suspend 四组）/Task 12（§2 全 16 env 接线＋https/SSRF 护栏＋supervise＋tier 隔离单测）全在树；`cargo test` 四门 + 两档网关回归（FREE_REQUIRE_ELITE=0/1）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean。
+  - [门2-静态] ✅ `cargo clippy --workspace --all-targets -- -D warnings` 零告警。
+  - [门3-测试] ✅ `cargo test --workspace` 107 通过/0 失败/4 ignored（R2-9 基线 82，+25：free_pool 21＋router 2/replace+isolation＋metrics 2＋main 1 free_env/split_filter＋其余在树；计划预估 103±1，实际 107，以实测为准）；`-- --ignored --nocapture` 4 真过（先验 Redis PONG＋CH Ok，无 SKIP 行）。
+  - [门4-性能] ✅ `cargo bench --workspace --no-run` 编译过（1m05s）。
+  - [一档 ELITE=0] ✅ 网关 PID:36308（`log/gw10-free0.out/err`，mocks 复用 11444/30636/1436）：普通→mock-b-jp 200；US 粘性 gw10-task1 两次→mock-a-us 200；Proxy-Auth JP→mock-b-jp 200；坏 Key→403；GB→mock-c-gb 200；缺 Host→400；/metrics→200。`[FreePool] tick=1 pool=0`（yield api0=100：50 backoff_skip SOCKS＋45 tcp_fail＋5 full_fail；html 超时/gh 直连失败 hold 旧集；基址可达故无降级行）；`free_pool_nodes_total 0`＋四组行齐；10 流量后 XLEN 9692→9702（+10）、CH 3264→3274（+10）；`telemetry_dropped_total 0`。
+  - [二档 ELITE=1] ✅ 网关 PID:26632（`log/gw10-free1.out/err`）：六用例语义不变（普通 mock-b-jp/US mock-a-us/GB mock-c-gb/Proxy-Auth mock-b-jp/坏 Key 403/缺 Host 400/metrics 200）；`tick=1 pool=0`（水位≤一档成立；两档皆 0 系源站质量约束——公网免费节点存活率极低，门逻辑由 `snapshot(require_elite)`＋merge 单测覆盖）；四组 metrics 行常驻。
+  - 综合判定：✅ FreePool v2 全绿收官（107 单测＋4 真 live＋四门绿＋ELITE 两档回归）。网关 PID:26632 在线（ELITE=1 档）。
+- **遇到的问题与解决**：
+  - 沙箱外网受限：html 源 15s 超时、github raw 直连失败、httpbin 基址首轮曾不可达（历史 gw10 降级 TCP-only pool=6）——均为计划内 hold semantics（SourceGuard 计数＋旧集保持＋降级 anon=Unknown），非 bug；本轮两档 tick 均正常落盘 warn＋tick 行。
+  - 水位 0 属正常（计划 Task 13 已预言：源站直连受限即 hold 空集）；tier 隔离由单测锁定（residential/US 约束不命中 free-ZZ，无约束按 100:10 权重混合），curl 抽查普通流量仍命中付费大权重（mock-b-jp），无稀释异常。
+  - `wmic` 在本机不可用（改 `Get-CimInstance Win32_Process` 查 mock 命令行）；CH 无密码查询报 AUTHENTICATION_FAILED（改 `-u proxy:123456`）。
+- **下一步建议**：FreePool 冻结（默认关闭，线上开需 `FREE_ENABLED=1`）；GW-R2 剩余仍待用户输入：三家真 Key（staging 1% 灰度）+ Linux 性能节点（50k/<1ms 验收）。教训：实现轮必须同步记 EXEC_LOG，否则后轮需先考古再回归（本轮即如此）。

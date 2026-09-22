@@ -44,6 +44,18 @@ pub struct MetricsRegistry {
     log_sample_seq: AtomicU64,
     /// R2-8 被采样掉的非 5xx 日志数（`gateway_logs_sampled_total` 渲染，可观测）。
     logs_sampled: AtomicU64,
+    /// FreePool 免费池在池节点数（worker 每次合并后设置，只写不参与 observe）。
+    free_pool_nodes: AtomicU64,
+    /// FreePool per-source 抓取产出（`free_pool_source_yield_total{source}` 渲染）。
+    free_source_yield: DashMap<String, AtomicU64>,
+    /// FreePool 质检结果计数（`free_pool_verify_total{result}` 渲染；
+    /// result∈pass/tcp_fail/full_fail/backoff_skip，调用方保证集合）。
+    free_verify: DashMap<String, AtomicU64>,
+    /// FreePool 匿名度分级计数（`free_pool_anonymity_total{level}` 渲染；
+    /// level∈elite/anonymous/transparent/unknown，调用方保证集合）。
+    free_anonymity: DashMap<String, AtomicU64>,
+    /// FreePool 源站熔断 gauge（`free_pool_source_suspended{source}` 0/1 渲染）。
+    free_suspended: DashMap<String, AtomicU64>,
 }
 
 impl MetricsRegistry {
@@ -75,6 +87,11 @@ impl MetricsRegistry {
             supervisor_restarts: DashMap::new(),
             log_sample_seq: AtomicU64::new(0),
             logs_sampled: AtomicU64::new(0),
+            free_pool_nodes: AtomicU64::new(0),
+            free_source_yield: DashMap::new(),
+            free_verify: DashMap::new(),
+            free_anonymity: DashMap::new(),
+            free_suspended: DashMap::new(),
         }
     }
 
@@ -115,6 +132,44 @@ impl MetricsRegistry {
             self.logs_sampled.fetch_add(1, Ordering::Relaxed);
             false
         }
+    }
+
+    /// 免费池在池节点数（FreePool worker 每次合并后设置，只写不参与 observe）。
+    pub fn set_free_pool_nodes(&self, n: u64) {
+        self.free_pool_nodes.store(n, Ordering::Relaxed);
+    }
+
+    /// FreePool 源站抓取产出累加（worker 每轮按 source 聚合计数；零产出源不记，
+    /// 其熔断由 suspend gauge 可见）。
+    pub fn note_free_source_yield(&self, source: &str, n: u64) {
+        self.free_source_yield
+            .entry(source.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// FreePool 质检结果计数（result 调用方保证∈pass/tcp_fail/full_fail/backoff_skip）。
+    pub fn note_free_verify(&self, result: &str) {
+        self.free_verify
+            .entry(result.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FreePool 匿名度分级计数（level 调用方保证∈elite/anonymous/transparent/unknown）。
+    pub fn note_free_anonymity(&self, level: &str) {
+        self.free_anonymity
+            .entry(level.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FreePool 源站熔断 gauge（worker 每轮同步各源 suspend 状态）。
+    pub fn set_free_source_suspended(&self, source: &str, suspended: bool) {
+        self.free_suspended
+            .entry(source.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(u64::from(suspended), Ordering::Relaxed);
     }
 
     /// Record one finished proxied response (called from `logging`).
@@ -244,6 +299,68 @@ impl MetricsRegistry {
             "gateway_logs_sampled_total {}\n",
             self.logs_sampled.load(Ordering::Relaxed)
         ));
+        out.push_str(
+            "# HELP free_pool_nodes_total Free-tier nodes currently merged into the pool.\n",
+        );
+        out.push_str("# TYPE free_pool_nodes_total gauge\n");
+        out.push_str(&format!(
+            "free_pool_nodes_total {}\n",
+            self.free_pool_nodes.load(Ordering::Relaxed)
+        ));
+        // FreePool per-source 抓取产出（label 源名内部生成，无引号；调用方保证集合）。
+        out.push_str("# HELP free_pool_source_yield_total FreePool fetched nodes by source.\n");
+        out.push_str("# TYPE free_pool_source_yield_total counter\n");
+        let mut yields: Vec<(String, u64)> = self
+            .free_source_yield
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        yields.sort();
+        for (s, n) in yields {
+            out.push_str(&format!(
+                "free_pool_source_yield_total{{source=\"{s}\"}} {n}\n"
+            ));
+        }
+        // FreePool 质检结果分布。
+        out.push_str("# HELP free_pool_verify_total FreePool verify outcomes by result.\n");
+        out.push_str("# TYPE free_pool_verify_total counter\n");
+        let mut verifies: Vec<(String, u64)> = self
+            .free_verify
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        verifies.sort();
+        for (r, n) in verifies {
+            out.push_str(&format!("free_pool_verify_total{{result=\"{r}\"}} {n}\n"));
+        }
+        // FreePool 匿名度分级分布。
+        out.push_str("# HELP free_pool_anonymity_total FreePool anonymity levels by level.\n");
+        out.push_str("# TYPE free_pool_anonymity_total counter\n");
+        let mut anons: Vec<(String, u64)> = self
+            .free_anonymity
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        anons.sort();
+        for (l, n) in anons {
+            out.push_str(&format!("free_pool_anonymity_total{{level=\"{l}\"}} {n}\n"));
+        }
+        // FreePool 源站熔断状态（0/1 gauge；无数据时无线，保持 exposition 干净）。
+        out.push_str(
+            "# HELP free_pool_source_suspended FreePool source suspended flag by source.\n",
+        );
+        out.push_str("# TYPE free_pool_source_suspended gauge\n");
+        let mut susps: Vec<(String, u64)> = self
+            .free_suspended
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        susps.sort();
+        for (s, n) in susps {
+            out.push_str(&format!(
+                "free_pool_source_suspended{{source=\"{s}\"}} {n}\n"
+            ));
+        }
         out
     }
 }
@@ -412,6 +529,35 @@ mod tests {
         }
         assert!(m.sample_full_log(200), "seq 1000 must be full again");
         assert!(m.render().contains("gateway_logs_sampled_total 999"));
+    }
+
+    #[test]
+    fn free_pool_nodes_rendered() {
+        // 免费池水位：默认 0 常驻行；set 后渲染新值。
+        let m = MetricsRegistry::new();
+        assert!(m.render().contains("free_pool_nodes_total 0"));
+        m.set_free_pool_nodes(37);
+        assert!(m.render().contains("free_pool_nodes_total 37"));
+    }
+
+    #[test]
+    fn free_pool_extended_rendered() {
+        // Task 3 水位计存量断言保留；新增四组：
+        let m = MetricsRegistry::new();
+        m.note_free_source_yield("api0", 12);
+        m.note_free_verify("pass");
+        m.note_free_verify("tcp_fail");
+        m.note_free_anonymity("elite");
+        m.set_free_source_suspended("gh0", true);
+        let r = m.render();
+        assert!(r.contains("free_pool_source_yield_total{source=\"api0\"} 12"));
+        assert!(r.contains("free_pool_verify_total{result=\"pass\"} 1"));
+        assert!(r.contains("free_pool_anonymity_total{level=\"elite\"} 1"));
+        assert!(r.contains("free_pool_source_suspended{source=\"gh0\"} 1"));
+        m.set_free_source_suspended("gh0", false);
+        assert!(m
+            .render()
+            .contains("free_pool_source_suspended{source=\"gh0\"} 0"));
     }
 
     #[tokio::test]

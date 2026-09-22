@@ -13,6 +13,7 @@ mod bandit;
 mod ch_sink;
 mod circuit_breaker;
 mod fingerprint;
+mod free_pool;
 mod gateway;
 mod metrics;
 mod model;
@@ -28,6 +29,10 @@ use bandit::{LinUCBEngine, DEFAULT_ALPHA};
 use ch_sink::ChSinkWorker;
 use circuit_breaker::{parse_delta_message, PassiveCircuitBreaker, DELTA_CHANNEL};
 use dashmap::DashMap;
+use free_pool::{
+    FreePoolConfig, FreePoolWorker, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE, DEFAULT_GITHUB_URL,
+    DEFAULT_HTML_URL,
+};
 use gateway::{SmartProxyGateway, DEFAULT_API_KEY};
 use metrics::{serve_metrics, MetricsRegistry, METRICS_ADDR};
 use model::{ProxyNode, RoutingSpec};
@@ -79,6 +84,17 @@ fn env_secs(key: &str, default_secs: u64) -> Duration {
         .filter(|v| *v > 0)
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(default_secs))
+}
+
+/// FreePool 逗号分隔 URL 列表读值（去空白＋去空项＋仅 http/https，file/dict/gopher
+/// 一律过滤防 SSRF；缺省走 default）。
+fn split_env_list(key: &str, default: &str) -> Vec<String> {
+    env_str(key, default)
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        .collect()
 }
 
 /// R2-8 后台 supervisor：worker 退出（panic 由 `JoinHandle` 捕获/意外返回）
@@ -223,6 +239,58 @@ async fn main() {
     let prewarmer = ConnectionPrewarmer::new(router.clone())
         .with_interval(env_secs("PREWARM_INTERVAL_SECS", 30));
     tokio::spawn(prewarmer.run());
+
+    // 4e. FreePool 第二供应线（默认关闭；FREE_ENABLED=1 开启；全 env 见计划 §2）。
+    if env_str("FREE_ENABLED", "0") == "1" {
+        let mut full_base = env_str("FREE_FULL_CHECK_URL", DEFAULT_FULL_CHECK_BASE);
+        if !full_base.starts_with("https://") {
+            log::warn!("[FreePool] FREE_FULL_CHECK_URL must be https, falling back to default");
+            full_base = DEFAULT_FULL_CHECK_BASE.to_string();
+        }
+        let free_config = FreePoolConfig {
+            api_urls: split_env_list("FREE_API_URLS", DEFAULT_API_URL),
+            html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
+            github_urls: split_env_list("FREE_GITHUB_URLS", DEFAULT_GITHUB_URL),
+            fetch_interval: env_secs("FREE_FETCH_INTERVAL_SECS", 600),
+            ttl: env_secs("FREE_TTL_SECS", 1800),
+            verify_timeout: env_secs("FREE_VERIFY_TIMEOUT_SECS", 3),
+            max_latency_ms: env_str("FREE_MAX_LATENCY_MS", "3000")
+                .parse::<u64>()
+                .unwrap_or(3000),
+            max_concurrent: env_str("FREE_MAX_CONCURRENT", "50")
+                .parse::<usize>()
+                .unwrap_or(50),
+            full_concurrent: env_str("FREE_FULL_CONCURRENT", "20")
+                .parse::<usize>()
+                .unwrap_or(20),
+            max_nodes: env_str("FREE_MAX_NODES", "2000")
+                .parse::<usize>()
+                .unwrap_or(2000),
+            full_check_base: full_base,
+            require_elite: env_str("FREE_REQUIRE_ELITE", "0") == "1",
+            max_zero_cycles: env_str("FREE_SOURCE_MAX_ZERO_CYCLES", "3")
+                .parse::<u32>()
+                .unwrap_or(3),
+            suspend_retry_every: env_str("FREE_SUSPEND_RETRY_EVERY", "3")
+                .parse::<u64>()
+                .unwrap_or(3),
+        };
+        let free_router = router.clone();
+        let free_metrics = metrics.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(startup_jitter()).await;
+            log::info!("[FreePool] staggered start (second supply line)");
+            supervise("free_pool", free_metrics.clone(), move || {
+                let w = FreePoolWorker::new(
+                    free_router.clone(),
+                    free_metrics.clone(),
+                    free_config.clone(),
+                );
+                async move { w.run(reqwest::Client::new()).await }
+            })
+            .await;
+        });
+    }
 
     if let Some(ref conn) = redis_conn {
         // Telemetry batch worker → Redis Stream（OPT-4：传入共享丢弃计数器）。
@@ -478,5 +546,31 @@ mod tests {
         std::env::set_var("R2T_SECS_KEY", "0");
         assert_eq!(env_secs("R2T_SECS_KEY", 60), Duration::from_secs(60));
         std::env::remove_var("R2T_SECS_KEY");
+    }
+
+    #[test]
+    fn free_env_defaults() {
+        // 免费线总开关默认关闭；显式开生效（key 唯一防并行污染，用后清理）。
+        assert_eq!(env_str("R2T_FREE_ENABLED_XYZ", "0"), "0");
+        std::env::set_var("R2T_FREE_FLAG", "1");
+        assert_eq!(env_str("R2T_FREE_FLAG", "0"), "1");
+        std::env::remove_var("R2T_FREE_FLAG");
+    }
+
+    #[test]
+    fn split_env_list_filters_non_http() {
+        // SSRF 护栏：仅 http/https 源保留，file/dict/gopher 一律过滤。
+        std::env::set_var(
+            "R2T_FREE_URLS",
+            "https://a.example/list, file:///etc/passwd ,dict://b:80/x,, http://c.example/p",
+        );
+        let urls = split_env_list("R2T_FREE_URLS", "https://dflt.example/");
+        assert_eq!(urls, vec!["https://a.example/list", "http://c.example/p"]);
+        std::env::remove_var("R2T_FREE_URLS");
+        // 缺省值同样经过滤（默认皆 https，不受影响）。
+        assert_eq!(
+            split_env_list("R2T_FREE_URLS_MISSING_XYZ", "https://dflt.example/"),
+            vec!["https://dflt.example/"]
+        );
     }
 }

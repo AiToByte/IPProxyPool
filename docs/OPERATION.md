@@ -58,6 +58,8 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 | Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长=CB 消费组 lag，查 `XINFO GROUPS`；R2-5 起 XADD 带 MAXLEN ~10 万（消费组全挂时老数据先丢，XLEN 封顶）；sink 启动清幽灵消费者，毒丸/重复即时 ack 不进仓 |
 | 后台并发 | 网关日志 `[Prober]/[Prewarmer]/[Sweep]/[Arbitrage]` | R2-7 起三 60s ticker 启动错峰（`staggered start` 行对齐验证）；prober 20 并发 + Client 闲置 10min 淘汰；prewarmer 真 TCP 探测 100 并发封顶，`tickets`==探测节点数（票据环已删） |
 | 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；后台 CB/sink/arbitrage 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
+| 免费线水位 | `free_pool_nodes_total` / 日志`[FreePool] tick` | 默认关闭（`FREE_ENABLED=1` 开）；水位突降=源站熔断（`free_pool_source_suspended{source}=1`）或质检门限过严（`free_pool_verify_total` 看 fail 分布）；country 缺省 ZZ，只服务无归属要求的流量；`FREE_REQUIRE_ELITE=1` 时仅 Elite 进池 |
+| 免费线健康 | `free_pool_source_yield_total` / `free_pool_anonymity_total` | yield 骤降=源站挂；transparent 占比突增=源站质量恶化，考虑开 REQUIRE_ELITE；单节点转发延迟看 registry 日志（debug） |
 
 租户管理：`register_tenant(id,key,qps,max_c,burst)` 注册（R2-3 起 burst 必传，常规取 `qps/10`）；`set_active` 启停；
 计费 DC $0.2 / Res $3 / Mobile $15 每 GB。R2-3 起余额≤0 鉴权直接 402（欠费），与 403（坏 Key/停用）区分；当次流量可扣成负数，下次请求拦截。
@@ -80,6 +82,8 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 ## 6. 故障速查
 
 - 网关 503 全域：池被 quarantine 摘空（查 CB 日志 + Redis key）或 mocks 挂了；
+- 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（网关层不强制，租户侧规约：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
+- 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；
 - 后台工人停转：CB/sink/arbitrage 由 supervisor 托管，`supervisor_restarts_total{worker}` 涨即正在自愈（指数 backoff 1s 起 60s 封顶）；
 - 403 全拦截：X-API-Key 未注册（默认 `default_key` 已在 main 注册）；
