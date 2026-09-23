@@ -138,6 +138,16 @@ impl TenantManager {
     ///
     /// R2-3：允许一次扣成负数（当次流量不断流），欠费由下次 `authenticate` 拦截。
     pub fn release_and_meter(&self, tenant: &TenantAccount, bytes: u64, tier: &str) {
+        // REVIEW-R2 Q6：误调（槽已空）不得 wrap 到 MAX（永久熔断该租户并发）；
+        // 加回＋warn 可观测，正常单次释放行为不变。
+        if tenant.in_flight.load(Ordering::Relaxed) == 0 {
+            // 误调整单直接丢弃（首次释放已计量，重复计量即双重扣费）；只 warn 可观测。
+            log::warn!(
+                "[Tenant] release without slot tenant={} (double-release suspected, dropped)",
+                tenant.tenant_id
+            );
+            return;
+        }
         tenant.in_flight.fetch_sub(1, Ordering::Relaxed);
         tenant.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         let cost = (bytes as f64 / BYTES_PER_GB) * price_per_gb(tier);
@@ -193,6 +203,21 @@ mod tests {
         m.release_and_meter(&a, 512, "residential");
         assert_eq!(a.in_flight.load(Ordering::Relaxed), 0);
         assert_eq!(a.total_bytes.load(Ordering::Relaxed), 512);
+    }
+
+    #[test]
+    fn double_release_does_not_wrap() {
+        // REVIEW-R2 Q6：误调第二次 release 不得 wrap 到 MAX（永久熔断并发）；槽回 0。
+        let m = manager_with("k-double", 10_000, 100);
+        let a = m.authenticate_and_throttle("k-double").expect("auth");
+        m.release_and_meter(&a, 0, "datacenter");
+        assert_eq!(a.in_flight.load(Ordering::Relaxed), 0);
+        m.release_and_meter(&a, 0, "datacenter");
+        assert_eq!(
+            a.in_flight.load(Ordering::Relaxed),
+            0,
+            "double release must not wrap in_flight"
+        );
     }
 
     #[test]

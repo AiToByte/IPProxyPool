@@ -178,8 +178,11 @@ impl TelemetryWorker {
         }
         let batch_len = batch.len() as u64;
         let mut pipe = redis::pipe();
+        // REVIEW-R2 Q9：serde 全失败极端下空 pipe 不 query（计数仍按整批丢失口径累加）。
+        let mut queued = 0u64;
         for event in &batch {
             if let Ok(json_data) = serde_json::to_string(&event) {
+                queued += 1;
                 // R2-9：XADD 必须用自动 ID `*`。R2-4 的显式 ID（`{ms}-{pid}-{seq}`
                 // 三段式）不是合法 Redis Stream ID（只允许数字型 `<ms>-<seq>`），
                 // 对真 Redis 全部落库失败（R2-9 curl 回归抓获；此前 live 全为
@@ -204,6 +207,9 @@ impl TelemetryWorker {
         // OPT-4：失败 → 睡 100ms 重发一次 → 仍失败则丢弃并计数（原来静默丢）。
         // R2-9：重试是同一 pipe 重放（自动 ID 下产生新条目，重复由 sink 侧
         // payload `event_id` 去重窗对消）；计数按整批事件数累加，供 SLA 审计。
+        if queued == 0 {
+            return;
+        }
         let mut conn = self.redis_conn.clone();
         if let Err(first) = pipe.query_async::<()>(&mut conn).await {
             log::warn!("[TelemetryWorker] flush failed ({first:?}), retrying once");

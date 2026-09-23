@@ -301,7 +301,8 @@ impl SmartProxyGateway {
                 }
             }
         };
-        let attempts = ctx.max_retries + 1;
+        // REVIEW-R2 Q9：`+1` 改饱和加（`usize::MAX` 极端下不 panic/wrap；当前常量 3 行为不变）。
+        let attempts = ctx.max_retries.saturating_add(1);
         let has_session = ctx.routing_spec.session_id.is_some();
         // R3-1：bandit 上下文已在上文算好存 ctx（logging 复用）；此处 clone 出来
         // 供无状态 LinUCB 选路（`VectorD` 为 Copy，零分配）。
@@ -331,9 +332,10 @@ impl SmartProxyGateway {
             };
             match bridge.fetch(&node, breq).await {
                 Ok(resp) => {
-                    let bytes = resp.body.len() as u64;
+                    // REVIEW-R2 Q9：egress 已发生即记账（写下游失败仍计量出站成本；
+                    // OPT-3 只计最后 attempt 口径不变，`?` 前先赋值）。
+                    ctx.transferred_bytes = resp.body.len() as u64;
                     self.write_bridge_response(session, resp).await?;
-                    ctx.transferred_bytes = bytes;
                     return Ok(());
                 }
                 Err(e) => {

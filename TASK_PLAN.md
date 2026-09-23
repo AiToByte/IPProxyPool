@@ -24,6 +24,8 @@
 - [x] **步骤 16**: DOC-R1 文档一致性修复（dashboard零漂移/OPERATION 1中2小）方案见`plan/2026年9月22日-DOC-R1文档一致性修复实施计划.md` ✅ 已完成（dashboard逐名验证零漂移+OPERATION三处修复，证据见 EXEC_LOG 步骤 16 条）
 - [x] **步骤 17**: 剩余事项执行计划（真Key灰度/ Linux验收/JA4复核/完工冻结）方案见`plan/2026年9月22日-剩余事项执行计划.md` ✅ 已完成（REM-1/REM-2 冻结等输入＋REM-3 JA4复核仍OUT＋REM-4 完工盘点；证据见 EXEC_LOG 步骤 17 条）
 - [x] **步骤 18**: FreeProxy 实测（小批量拉取免费节点代理测试：直探对照+网关两档+存量回归）方案见`plan/2026年9月23日-FreeProxy实测计划.md`（F1~F6） ✅ 已完成（直探 13候选0过+网关 ELITE0 pool0/ELITE1 pool1 elite+存量回归全绿+147单测，证据见 EXEC_LOG 步骤 18 条+log/gw16*+free_probe_report）
+- [x] **步骤 19**: FreeProxy大样本复测（生产默认limit=100单快照：并发直探+网关4tick稳定性）方案见`plan/2026年9月23日-FreeProxy大样本复测计划.md`（F1~F6） ✅ 已完成（直探57候选0过+网关Elite socks5偶发1+间隔无漂移+回归精确对账，证据见 EXEC_LOG 步骤 19 条+log/gw19*+free_big_report）
+- [x] **步骤 20**: REVIEW-R2 全局复审修复优化（三路审计→2×P0+6×P1+P2批）方案见`plan/2026年9月23日-REVIEW-R2修复优化实施计划.md`（Q1~Q10） ✅ 已完成（156 单测+4 live+release bandit<200ns+curl回归XLEN/CH精确+10，证据见 EXEC_LOG 步骤 20 条+log/gw20.out/err）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring

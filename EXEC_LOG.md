@@ -535,3 +535,35 @@
   - ELITE=1 pool1＞ELITE=0 pool0（M<=N 跨轮不成立）→系 Geonode lastChecked 实时轮转（不同快照），非门失效；门语义由 `snapshot(require_elite)` 单测锁定，以本条为准，不重跑刷数。
   - 20 流量 free 行未涨→权重＋LinUCB 偏付费为设计内（100:10），FullCheck pass（pool=1/elite=1）即质检通过证据，不强求流量命中。
 - **下一步建议**：FreeProxy 实测冻结（默认关闭，线上开需 `FREE_ENABLED=1`）；生产建议 `FREE_REQUIRE_ELITE=1`（Transparent 高占比）；GW-R2 剩余仍待用户输入：三家真 Key＋Linux 节点。教训：免费线结论必须带基线＋计数＋明细三件套，否则无法区分“源站挂”与“门限严”。
+
+### [2026-09-23] 步骤 19 立项: FreeProxy大样本复测计划冻结（先落库再执行）
+- 计划操作：用户选定新方向“更大样本复测”。新建`plan/2026年9月23日-FreeProxy大样本复测计划.md`（F1~F6）；`TASK_PLAN.md` 步骤 19 置进行中；本文件 append-only 记立项。
+- 问题：步骤 18 小样本下 Elite 捕获是否稳定（直探 0/13 vs 网关 ELITE=1 pool=1 疑源站轮转）。
+- 方案要点：生产默认 Geonode limit=100 单快照；20 并发直探给基线率；网关生产默认并发（50/20）120s 节拍跑 4 tick（ELITE=0×3＋ELITE=1×1），重点看 tick 间隔漂移；跨快照只定性不定量；零代码变更预期。
+- 预期验证方式：F2 count 100＋F3 三数＋F4 pool 轨迹/间隔 120±15s＋F5 定性一致/六用例/链路涨＋F6 回滚/四门。
+- 范围：生产默认不动；敏感流量禁测；真 Key/Linux/JA4 延续 out。
+
+### [2026-09-23] 步骤 19 已完成: FreeProxy大样本复测（limit=100＋4 tick 稳定性）
+- **实际操作**：F1（PONG/Ok＋147 过＋mocks/gw 200）/F2（Geonode 默认 URL 原样：total 2877/count 100，`log/free_big_sample.json`）/F3（`log/probe_free_big.py` 20 并发：候选 57/通过 0/Elite 0——51 tcp_fail＋6 full_fail，`log/free_big_report.md`）/F4（ELITE=0 首轮 PID 14536 tick1~3 pool 0/0/0，间隔 129/132s 无漂移，指标未及抓取即有序退出；次轮 PID 25984 tick1 pool0→tick2 pool1：yield 200/tcp178/full21/pass1 elite＋`by_proto{socks5}=1`；ELITE=1 末轮 PID 8228 tick1/2 pool 0/0：tcp160/full40）/F5（六用例 200/403/400＋metrics 200；XLEN 9905→9920/CH 3467→3482＋15 精确对账＝5＋10）/F6（回滚默认 PID 29720 200＋4 live/bench 绿）。
+- **验证结果**：Elite 捕获间歇稳定——步骤 18 http Elite 1＋本轮 socks5 Elite 1，其余快照 0，直探 http-only 0/57 与网关 socks 捕获属不同人口（诚实声明）；生产默认并发 50/20 在 100 raw 下 tick 间隔 120±15s 内，无超节拍；存量零回归。
+- **遇到的问题与解决**：
+  - 首轮网关在 tick3 后再次有序退出（All runtimes exited＋tokio shutdown panic，Windows 侧第 4 次复现，存活约 7min）致指标快照丢失→pool 轨迹以日志为准有效，另起次轮专抓指标（tick2 后立即查 metrics，赶在退出前）。教训：Windows 实测必须“tick 后立即抓指标”，不得攒到末轮；生产跑 Linux（REM-2）不受此限。
+  - ELITE=1 轮 pool 0 vs ELITE=0 轮 pool 1→跨快照轮转所致（不同 Geonode 快照），非门失效；门语义由单测锁定。
+  - 20 流量 free 行未涨→设计内权重偏好，不强求。
+- **下一步建议**：大样本复测冻结；结论：免费线约为“每 100~200 raw 偶发 1 Elite”，pool 常态 0，付费线不受扰；生产开线建议 `FREE_ENABLED=1＋REQUIRE_ELITE=1`（既有建议重申）。GW-R2 剩余仍待用户输入：三家真 Key＋Linux 节点。
+
+### [2026-09-23] 步骤 20 立项: REVIEW-R2 全局复审修复优化计划冻结（先落库再执行）
+- 计划操作：用户指令“全局代码 review，进一步提高代码质量，修复 bug，优化性能，先落库再执行”。派三路并行审计（A 数据面6文件／B 免费学习链10文件／C 性能质量运维全仓），约 40 条→主事人逐条读码核实后收敛为 10 项。新建`plan/2026年9月23日-REVIEW-R2修复优化实施计划.md`（Q1~Q10，TDD checkbox）；`TASK_PLAN.md` 步骤 20 置进行中；本文件 append-only 记立项。
+- 核实结论：P0×2 实锤（FreePool 两处信号量许可丢弃致并发无上限 `free_pool.rs:1302/1092`；CB 空 domain／`none` out_ip 写 junk 键 `circuit_breaker.rs:126-164`＋`gateway.rs:597`）；P1×6 确认（降级洗 anon／fetch 失败不计熔断／套利复乘衰减／租户槽下溢／淘汰比较器／tier 逐请求分配）；P2 微批 7 条；落选存疑记计划 §6。
+- 预期验证方式：Q10 四门（fmt/clippy/test＋4 live＋bench＋release bandit<200ns）＋curl 存量回归＋XLEN/CH 涨。
+- 范围：零新依赖；不改架构与既有语义；supervisor 名单等 C 路项实现轮读码复核后才纳入（不预设）。
+
+### [2026-09-23] 步骤 20 已完成: REVIEW-R2 全局复审修复优化（Q1~Q10 全✅）
+- **实际操作**：Q1（两处许可持有＋高水位单测：红 high=8→绿）/Q2（三层空/none 守卫＋2 单测）/Q3（`renew_ttl`＋降级分支改调＋三断言）/Q4（Err/超时视同零产出＋恒错源暂停单测）/Q5（下限 max(1)＋0.3 复乘单测；附记生产 factor 仅 0.0/0.5 本触发不了）/Q6（槽空丢弃＋warn＋wrap 单测：红 MAX→绿）/Q7（`evict_rank` composite＋addr 终裁＋10 轮确定性单测）/Q8（`canonical_tier`＋构造期归一＋入口 hoist＋矩阵单测；生产 tier 本就小写长名零行为变化）/Q9（elapsed→saturating／saturating_add／桥先记账／空 pipe 早返＋OPERATION 2 处＋geoip_update usage 1 处；supervisor 6 裸 spawn 读码后 deferred）。
+- **验证结果**：
+  - [门1-格式] ✅ clean。[门2-静态] ✅ `-D warnings` 零告警。
+  - [门3-测试] ✅ `cargo test` 156 通过/0 失败/4 ignored（基线 147，+9 新，Q9 无新增）；`-- --ignored` 4 真过（先验 PONG/Ok，无 SKIP）。
+  - [门4-性能] ✅ bench 编译过；`cargo test --release bandit` 12 过（含 8 臂 <200ns，无回归）。
+  - [回归] ✅ 重构二进制网关 PID:5636：普通/粘性/鉴权/GB 200＋坏 Key 403＋缺 Host 400＋metrics 200；XLEN 9927→9937/CH 3489→3499 精确 +10。
+  - 综合判定：✅ REVIEW-R2 全绿收官（零新依赖；语义冻结项：生产 factor/生产 tier/空 pipe 行为皆不变）。
+- **下一步建议**：REVIEW-R2 冻结待提交；deferred 记后续：supervisor 全覆盖重构、render/snapshot 测量驱动优化、粘滞 country/tier 复核（语义变更需产品决策）。教训：审计发现必须逐条读码定级（本轮 40→10，Q5/Q9-telemetry 读码后降级/缩 Kludge 均如实记录）。

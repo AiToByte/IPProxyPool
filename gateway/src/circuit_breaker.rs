@@ -34,6 +34,13 @@ pub fn quarantine_ttl_for_status(status: u16) -> Option<u64> {
 /// Parse a `QUARANTINE|domain|ip|ttl` delta message. Strict: exactly 4 parts.
 /// 复审钳制：ttl 为 0 或超上限（24h）直接拒收（毒报文不得进隔离表；
 /// 上限内由 `set_quarantine` 二次钳制兜底，双保险）。
+/// REVIEW-R2 Q2：隔离目标合法性（空 domain／空 ip／网关无节点回落 `"none"` 拒绝）。
+/// 网关 `logging` 无节点时 `out_ip` 回落 `"none"`（`gateway.rs`），此类遥测与毒 PubSub
+/// 不得写入隔离表（junk 键＋跨实例广播噪音；`"none"` 永不命中真实节点，纯属浪费）。
+pub fn valid_quarantine_target(domain: &str, ip: &str) -> bool {
+    !domain.is_empty() && !ip.is_empty() && ip != "none"
+}
+
 pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
     use crate::router::QUARANTINE_MAX_TTL_SECS;
     let mut parts = payload.split('|');
@@ -48,6 +55,7 @@ pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
             .parse::<u64>()
             .ok()
             .filter(|t| *t > 0 && *t <= QUARANTINE_MAX_TTL_SECS)
+            .filter(|_| valid_quarantine_target(domain, ip))
             .map(|t| (domain.to_string(), ip.to_string(), t)),
         _ => None,
     }
@@ -142,12 +150,26 @@ impl PassiveCircuitBreaker {
         };
 
         if let Some(ttl) = quarantine_ttl_for_status(status) {
+            if !valid_quarantine_target(&domain, &event.out_ip) {
+                log::debug!(
+                    "[CircuitBreaker] skip quarantine for empty/none target domain={domain:?} ip={:?}",
+                    event.out_ip
+                );
+                return;
+            }
             self.apply_quarantine(&domain, &event.out_ip, ttl).await;
         }
     }
 
     /// Apply domain isolation: memory first, then Redis persist + broadcast.
     pub async fn apply_quarantine(&self, domain: &str, out_ip: &str, ttl_secs: u64) {
+        // REVIEW-R2 Q2：pub 方法调用方不可信，首行防御（空/none 直接丢弃）。
+        if !valid_quarantine_target(domain, out_ip) {
+            log::debug!(
+                "[CircuitBreaker] refuse quarantine for empty/none target {domain:?}:{out_ip:?}"
+            );
+            return;
+        }
         // 1. Same-process memory isolation (fast path, <50ms).
         self.router.set_quarantine(domain, out_ip, ttl_secs);
 
@@ -208,6 +230,24 @@ mod tests {
             parse_delta_message("QUARANTINE|a.com|10.0.0.1|86400"),
             Some(("a.com".to_string(), "10.0.0.1".to_string(), 86400))
         );
+    }
+
+    #[test]
+    fn quarantine_target_rejects_empty_and_none() {
+        // REVIEW-R2 Q2：空 domain／空 ip／网关无节点回落 "none"（gateway.rs logging）
+        // 不得进隔离表（junk 键＋广播噪音）。
+        assert!(valid_quarantine_target("a.com", "10.0.0.9"));
+        assert!(!valid_quarantine_target("", "10.0.0.9"));
+        assert!(!valid_quarantine_target("a.com", ""));
+        assert!(!valid_quarantine_target("a.com", "none"));
+        assert!(!valid_quarantine_target("", "none"));
+    }
+
+    #[test]
+    fn parse_delta_rejects_empty_and_none() {
+        assert_eq!(parse_delta_message("QUARANTINE||10.0.0.9|60"), None);
+        assert_eq!(parse_delta_message("QUARANTINE|a.com||60"), None);
+        assert_eq!(parse_delta_message("QUARANTINE|a.com|none|60"), None);
     }
 
     #[test]

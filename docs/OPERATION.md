@@ -62,7 +62,7 @@ OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直�
 | 免费线水位 | `free_pool_nodes_total` / 日志`[FreePool] tick` | 默认关闭（`FREE_ENABLED=1` 开）；水位突降=源站熔断（`free_pool_source_suspended{source}=1`）或质检门限过严（`free_pool_verify_total` 看 fail 分布）；country 缺省 ZZ，只服务无归属要求的流量；`FREE_REQUIRE_ELITE=1` 时仅 Elite 进池 |
 | 免费线健康 | `free_pool_source_yield_total` / `free_pool_anonymity_total` | yield 骤降=源站挂；transparent 占比突增=源站质量恶化，考虑开 REQUIRE_ELITE；单节点转发延迟看 registry 日志（debug） |
 | SOCKS 桥 | `free_pool_nodes_by_proto{proto}` / 日志`[SocksBridge]` | P2 起仅显式 `X-Proxy-Proto: socks5/socks4` 请求走桥；默认流量永不命中 socks（router 默认隔离＋peer 守卫＋粘滞 proto 复核三保险）；body 超 `SOCKS_MAX_BODY_BYTES`（默认 10MB）按失败计＋warn＋换节点重试 |
-| 免费套利 | `free_pool_action` 50/80 分档（P3） | 池级成功率<50 摘除（TTL/复检自愈）/50~80 半权/≥80 hold；free 永不自动抬权（恢复走复检/health）；付费 80/95 冻结不动；Grafana 第 5 面板看水位＋verify 分布＋mismatch |
+| 免费套利 | `free_pool_action()` 函数分档（P3，非指标，无 exposition） | 池级成功率<50 摘除（TTL/复检自愈）/50~80 半权/≥80 hold；free 永不自动抬权（恢复走复检/health）；付费 80/95 冻结不动；Grafana 第 5 面板看水位＋verify 分布＋mismatch |
 | GeoIP 画像 | `geoip_lookups_total{result}` / `geoip_mismatch_total` | 无库 Disabled 只观察不执法（首 tick 记一次 disabled）；mismatch 突增＝源站地理造假或库陈旧，先查库版本再定；执法留 Phase 4 |
 
 租户管理：`register_tenant(id,key,qps,max_c,burst)` 注册（R2-3 起 burst 必传，常规取 `qps/10`）；`set_active` 启停；
@@ -89,12 +89,12 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（网关层不强制，租户侧规约：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
 - 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - SOCKS 桥零信任延续：socks 节点同样禁敏感流量（与免费线同规）；握手/CONNECT 只连验证与请求目标，不做扫描；relay 只在 E2E 脚本出现，不进生产；
-- GeoLite2 配库（P3）：MaxMind 账号取 license→下 GeoLite2-City.mmdb→挂载进容器/宿主→`GEOIP_MMDB_PATH` 指向→重启网关（热加载不做）；无库默认 Disabled，免费线行为不变（`geoip_lookups{result="disabled"}` 可见）；
+- GeoLite2 配库（P3）：MaxMind 账号取 license→下 GeoLite2-City.mmdb→挂载进容器/宿主→`GEOIP_MMDB_PATH` 指向→重启网关（热加载不做）；无库默认 Disabled，免费线行为不变（`geoip_lookups_total{result="disabled"}` 可见）；
 - GeoLite2 自动更新（P4，每周三 03:00 UTC）：`MAXMIND_LICENSE_KEY` 环境传入（不要落盘）后跑
   `python deploy/geoip_update.py --out-dir ./data`（干跑验证：无 key 时 exit 2＋usage）；
   Linux cron 例：`0 3 * * 3 cd /opt/IPProxyPool && MAXMIND_LICENSE_KEY=$KEY python3 deploy/geoip_update.py`；
   Windows schtasks 例：`schtasks /create /tn GeoIPUpdate /tr "python D:\IPProxyPool\deploy\geoip_update.py" /sc weekly /d WED /st 03:00`（key 经计划任务环境变量传入）；
-  更新后重启网关（热加载不做）；生效标志：启动行 `[GeoIP] live DB loaded`＋`geoip_lookups{result="hit"}` 上涨；
+  更新后重启网关（热加载不做）；生效标志：启动行 `[GeoIP] live DB loaded`＋`geoip_lookups_total{result="hit"}` 上涨；
   执法开关 `GEOIP_ENFORCE_MISMATCH=1` 仅在库 Live 且观察一段时间无误报后开（默认 0 只观察），
   开后 mismatch 按复检失败计（backoff＋`geo_fail`，TTL 内自愈）；
 - 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；

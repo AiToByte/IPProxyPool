@@ -4,8 +4,8 @@
 更新后重启网关生效（热加载不做，见 OPERATION §6）。
 零第三方依赖（urllib＋tarfile＋os＋sys＋argparse，标准库）。
 Usage:
-  set MAXMIND_LICENSE_KEY=<key> && python deploy/geoip-update.py --out-dir ./data
-  python deploy/geoip-update.py --help
+  set MAXMIND_LICENSE_KEY=<key> && python deploy/geoip_update.py --out-dir ./data
+  python deploy/geoip_update.py --help
 """
 import argparse
 import io

@@ -56,6 +56,17 @@ impl EgressProto {
     }
 }
 
+/// REVIEW-R2 Q8：tier 归一（小写＋短名展开为长名）。节点侧构造期、请求侧选路
+/// 入口各做一次，`matches` 内纯字符串比对零分配。未知档原样小写透传
+///（price/cost 按默认档计，不抛错；全仓生产 tier 本就小写长名，归一无行为变化）。
+pub fn canonical_tier(s: &str) -> String {
+    match s.to_ascii_lowercase().as_str() {
+        "res" => "residential".to_string(),
+        "dc" => "datacenter".to_string(),
+        other => other.to_string(),
+    }
+}
+
 impl ProxyNode {
     /// 全字段构造（`addr` 按 `ip:port` 自动预存，保证一致）。
     /// 8 参数与字段 1:1 对应（builder 属过度设计，参考 `reload_nodes` 惯例放行）。
@@ -80,7 +91,7 @@ impl ProxyNode {
             username,
             password,
             country,
-            tier,
+            tier: canonical_tier(&tier),
             provider,
             weight,
             proto: EgressProto::Http,

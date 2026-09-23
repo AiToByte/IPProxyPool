@@ -136,15 +136,9 @@ impl RouterEngine {
             }
         }
         if let Some(ref t) = spec.tier {
-            // Accept both short (`res`) and long (`residential`) tier names.
-            let want = t.to_ascii_lowercase();
-            let have = node.tier.to_ascii_lowercase();
-            let want_norm = match want.as_str() {
-                "res" => "residential",
-                "dc" => "datacenter",
-                _ => want.as_str(),
-            };
-            if have != want_norm && have != want {
+            // REVIEW-R2 Q8：两侧皆已归一（节点 `ProxyNode::new`＋本文件入口），
+            // 直接比对零分配；短名/大小写语义与旧双分支一致（归一函数单源）。
+            if node.tier != *t {
                 return false;
             }
         }
@@ -179,10 +173,13 @@ impl RouterEngine {
     ) -> Vec<Arc<ProxyNode>> {
         let now = Instant::now();
         let guard = self.pools.load();
+        // REVIEW-R2 Q8：tier 请求侧归一一次（逐节点循环外；matches 内零分配）。
+        let mut spec = spec.clone();
+        spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
         guard
             .iter()
             .filter(|n| !excluded.iter().any(|e| e == &n.addr))
-            .filter(|n| self.matches(n, spec, now))
+            .filter(|n| self.matches(n, &spec, now))
             .cloned()
             .collect()
     }
@@ -222,8 +219,10 @@ impl RouterEngine {
                     .find(|n| n.addr == node.addr)
                     .is_some_and(|n| n.weight > 0 && n.proto == want_proto);
                 let excluded_hit = excluded.iter().any(|e| e == &node.addr);
+                // REVIEW-R2 Q9：`elapsed()` 时钟回拨即 panic（数据面不可炸），与
+                // `sweep_expired_at` 同口径改 saturating（回拨按 0 处理，会话多活一轮）。
                 if !excluded_hit
-                    && created_at.elapsed().as_secs() < SESSION_TTL_SECS
+                    && now.saturating_duration_since(*created_at).as_secs() < SESSION_TTL_SECS
                     && still_live
                     && !self.is_node_quarantined(node, &spec.target_domain, now)
                 {
@@ -234,10 +233,13 @@ impl RouterEngine {
 
         // 2. Filter snapshot.
         let guard = self.pools.load();
+        // REVIEW-R2 Q8：同候选入口，tier 请求侧归一一次。
+        let mut spec = spec.clone();
+        spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
         let candidates: Vec<Arc<ProxyNode>> = guard
             .iter()
             .filter(|n| !excluded.iter().any(|e| e == &n.addr))
-            .filter(|n| self.matches(n, spec, now))
+            .filter(|n| self.matches(n, &spec, now))
             .cloned()
             .collect();
 
@@ -307,12 +309,13 @@ impl RouterEngine {
             .map(|n| {
                 if n.provider == vendor && n.country.eq_ignore_ascii_case(country) {
                     let mut updated = (**n).clone();
-                    // factor<=0 即摘除（matches 滤 0）；round 后 as u32（非负 finite 必命中，
-                    // NaN/负数走下分支显式钳 0，不依赖饱和语义）。
+                    // REVIEW-R2 Q5：factor<=0 即显式摘除（matches 滤 0）；factor>0 下限钳 1——
+                    // 复乘不得几何衰减到 0（生产 factor 仅 0.0/0.5 触发不了，任意小 factor 才暴露；
+                    // 非 finite（NaN）`as u32` 饱和为 0，同样被下限兜住，永不意外摘除）。
                     updated.weight = if factor <= 0.0 {
                         0
                     } else {
-                        (n.weight as f64 * factor).round() as u32
+                        ((n.weight as f64 * factor).round() as u32).max(1)
                     };
                     Arc::new(updated)
                 } else {
@@ -868,6 +871,74 @@ mod tests {
                 .map(|n| n.weight),
             Some(0)
         );
+    }
+
+    #[test]
+    fn scale_never_derates_to_zero_unless_explicit() {
+        // REVIEW-R2 Q5：factor>0 反复调用不得几何衰减到 0（0 只能由 factor<=0 显式摘除）。
+        // 生产 factor 仅 0.0/0.5（0.5 收敛于 1 触发不了）；任意小 factor（如 0.3）10→3→1→0 即红。
+        let n = ProxyNode::new(
+            "10.0.0.9".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        let r = RouterEngine::new(vec![n]);
+        for _ in 0..6 {
+            r.scale_vendor_weights("free-gh0", "ZZ", 0.3);
+        }
+        let w = r
+            .snapshot_all()
+            .iter()
+            .find(|n| n.ip == "10.0.0.9")
+            .map(|n| n.weight)
+            .unwrap();
+        assert!(w >= 1, "repeated factor>0 must not decay to zero, got {w}");
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.0);
+        assert_eq!(
+            r.snapshot_all()
+                .iter()
+                .find(|n| n.ip == "10.0.0.9")
+                .map(|n| n.weight),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn tier_matches_without_per_request_alloc() {
+        // REVIEW-R2 Q8：tier 构造期归一（大小写/短名→长名）；matches 内纯比对。
+        // 节点 "RES" 必须命中 spec "residential"（修前存原文 "RES"，小写后 "res"≠"residential" 即红）。
+        let mk = |tier: &str| {
+            ProxyNode::new(
+                "10.0.0.1".to_string(),
+                8080,
+                None,
+                None,
+                "US".to_string(),
+                tier.to_string(),
+                "mock-a".to_string(),
+                100,
+            )
+        };
+        assert_eq!(mk("Residential").tier, "residential");
+        assert_eq!(mk("RES").tier, "residential");
+        assert_eq!(mk("DC").tier, "datacenter");
+        assert_eq!(mk("free").tier, "free");
+        let r = RouterEngine::new(vec![mk("RES")]);
+        for want in ["res", "RES", "residential", "Residential", "RESIDENTIAL"] {
+            let spec = RoutingSpec {
+                country: None,
+                session_id: None,
+                tier: Some(want.to_string()),
+                target_domain: "x.example".to_string(),
+                proto: None,
+            };
+            assert_eq!(r.get_healthy_candidates(&spec).len(), 1, "{want}");
+        }
     }
 
     #[test]

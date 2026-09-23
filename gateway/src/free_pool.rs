@@ -897,6 +897,14 @@ impl Registry {
         self.evict_if_over_capacity();
     }
 
+    /// REVIEW-R2 Q3：基线缺失降级续命——只续 TTL，不碰 anon/exit_ip/权重/EWMA。
+    /// TCP 建链成功≠转发成功，按整成功加权属虚增；匿名度以最近一次 FullCheck 为准。
+    pub fn renew_ttl(&mut self, addr: &str, now: Instant) {
+        if let Some(e) = self.entries.get_mut(addr) {
+            e.expires_at = now + self.ttl;
+        }
+    }
+
     /// 复检失败（TCP/Full 任一）：EWMA 记失败＋backoff，TTL 内保留（自动恢复）。
     pub fn note_verify_failed(&mut self, addr: &str, now: Instant) {
         if let Some(e) = self.entries.get_mut(addr) {
@@ -920,19 +928,21 @@ impl Registry {
     }
 
     /// 容量淘汰：先逐 backoff 条目（其中最低分），再逐全局最低分。
-    /// 分数非负故 `to_bits` 保序（min_by_key 可用）；总数收敛即正确。
+    /// REVIEW-R2 Q7：`now` 外提（每轮重取无意义）；排名依据与权重同基的
+    /// `composite()`（原 `score()` 与 `weight()` 脱钩）；平局按 addr 终裁
+    /// （HashMap 迭代随机，不得决定受害者）；分数非负故 `to_bits` 保序。
     fn evict_if_over_capacity(&mut self) {
+        let now = Instant::now();
         while self.entries.len() > self.max_nodes {
-            let now = Instant::now();
             let victim = self
                 .entries
                 .iter()
                 .filter(|(_, e)| e.health.backed_off(now))
-                .min_by_key(|(_, e)| e.health.score().to_bits())
+                .min_by(|a, b| eviction_rank(a.0, a.1).cmp(&eviction_rank(b.0, b.1)))
                 .or_else(|| {
                     self.entries
                         .iter()
-                        .min_by_key(|(_, e)| e.health.score().to_bits())
+                        .min_by(|a, b| eviction_rank(a.0, a.1).cmp(&eviction_rank(b.0, b.1)))
                 })
                 .map(|(k, _)| k.clone());
             match victim {
@@ -959,6 +969,11 @@ impl Registry {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// REVIEW-R2 Q7：淘汰排名键（composite 分＋addr 终裁，见 `evict_if_over_capacity`）。
+fn eviction_rank<'a>(addr: &'a str, e: &Entry) -> (u64, &'a str) {
+    (e.health.composite().to_bits(), addr)
 }
 
 /// 源站零产出熔断（连续 MAX_ZERO_CYCLES 轮零产出→暂停；304 不计；每 N tick 试探）。
@@ -1039,9 +1054,13 @@ pub async fn fetch_all(
                 }
             }
             Ok(Err(e)) => {
+                // REVIEW-R2 Q4：传输失败视同零产出计入熔断（否则恒错源每轮空耗 15s 超时）。
+                // 304/有产出仍走恢复路径（`note_outcome` 内豁免），语义不变。
+                guards[i].note_outcome(&FetchOutcome::nodes(Vec::new()), tick);
                 log::warn!("[FreePool] source fetch failed: {e} (holding last good set)")
             }
             Err(_) => {
+                guards[i].note_outcome(&FetchOutcome::nodes(Vec::new()), tick);
                 log::warn!("[FreePool] source fetch timed out (15s, holding last good set)")
             }
         }
@@ -1089,9 +1108,11 @@ fn spawn_full_check(
     baseline: String,
 ) {
     set.spawn(async move {
-        if sem.acquire_owned().await.is_err() {
+        // REVIEW-R2 Q1：许可必须持有跨过 `check` await（临时值即时释放→并发无上限）。
+        // 拿不到许可按失败计（沿 R2-7 `?`-in-bool 教训语义）。
+        let Ok(_permit) = sem.acquire_owned().await else {
             return (raw, None);
-        }
+        };
         let res = checker.check(&raw, &baseline).await;
         (raw, res)
     });
@@ -1299,9 +1320,10 @@ impl FreePoolWorker {
             let sem = tcp_sem.clone();
             let vf = verifier.clone();
             set.spawn(async move {
-                if sem.acquire_owned().await.is_err() {
+                // REVIEW-R2 Q1：同上，许可持有跨过 `verify` await（`pool.rs:92` 同形态）。
+                let Ok(_permit) = sem.acquire_owned().await else {
                     return (raw, None);
-                }
+                };
                 let latency = vf.verify(&raw).await;
                 (raw, latency)
             });
@@ -1319,7 +1341,7 @@ impl FreePoolWorker {
         let mut fset = tokio::task::JoinSet::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((raw, Some(ms))) => {
+                Ok((raw, Some(_))) => {
                     if let Some(ref base) = baseline {
                         spawn_full_check(
                             &mut fset,
@@ -1329,8 +1351,10 @@ impl FreePoolWorker {
                             base.clone(),
                         );
                     } else {
+                        // REVIEW-R2 Q3：降级只续命（存量条目续 TTL；新 addr 本轮不进池，
+                        // 下轮基址恢复后走正常 FullCheck，避免 Unknown 洗掉 Elite）。
                         self.registry
-                            .upsert_full(&raw, ms, AnonLevel::Unknown, None, now);
+                            .renew_ttl(&format!("{}:{}", raw.ip, raw.port), now);
                         self.metrics.note_free_verify("pass");
                         self.metrics.note_free_anonymity("unknown");
                     }
@@ -2074,6 +2098,93 @@ mod tests {
         assert!(g.should_fetch(6));
     }
 
+    #[test]
+    fn degraded_baseline_keeps_anonymity() {
+        // REVIEW-R2 Q3：基线缺失降级续命只续 TTL，不得把存量 Elite 洗成 Unknown、
+        // exit_ip 洗成 None、权重打回初值（同文件子模块，直读 entries 断言）。
+        let mut reg = Registry::with_capacity(Duration::from_secs(1800), 10);
+        let now = Instant::now();
+        let raw9 = RawNode {
+            ip: "10.0.0.9".to_string(),
+            port: 8080,
+            proto: FreeProto::Http,
+            country: Some("US".to_string()),
+            source: "a".to_string(),
+        };
+        reg.upsert_full(
+            &raw9,
+            120,
+            AnonLevel::Elite,
+            Some("9.9.9.9".to_string()),
+            now,
+        );
+        let addr = "10.0.0.9:8080".to_string();
+        let w0 = reg.snapshot(now, false)[0].weight;
+        reg.renew_ttl(&addr, now);
+        let e = reg.entries.get(&addr).expect("entry kept");
+        assert_eq!(e.health.anon, AnonLevel::Elite);
+        assert_eq!(e.health.exit_ip.as_deref(), Some("9.9.9.9"));
+        assert_eq!(e.node.exit_ip.as_deref(), Some("9.9.9.9"));
+        assert_eq!(reg.snapshot(now, false)[0].weight, w0);
+    }
+
+    #[test]
+    fn eviction_is_deterministic() {
+        // REVIEW-R2 Q7：同分平局一律淘汰 addr 最小者（HashMap 迭代随机，不得决定受害者；
+        // 排名依据与权重同基 composite，原 score() 与 weight() 脱钩一并对齐）。
+        // 逐个插入时溢出点集合为 {.3,.1,.2} 全平局→确定淘汰 .1，幸存 {.2,.3}；
+        // 10 轮独立注册表同断言（修前随机受害者，10 轮全中概率 (1/3)^10≈0，几乎必红）。
+        for _ in 0..10 {
+            let mut reg = Registry::with_capacity(Duration::from_secs(1800), 2);
+            let now = Instant::now();
+            for ip in ["10.0.0.3", "10.0.0.1", "10.0.0.2"] {
+                reg.upsert_full(&raw(ip, "a"), 50, AnonLevel::Elite, None, now);
+            }
+            let mut addrs: Vec<String> = reg
+                .snapshot(now, false)
+                .iter()
+                .map(|n| n.addr.clone())
+                .collect();
+            addrs.sort();
+            assert_eq!(
+                addrs,
+                vec!["10.0.0.2:8080".to_string(), "10.0.0.3:8080".to_string()]
+            );
+        }
+    }
+
+    struct FailSource {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FailSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn fetch(&self, _client: &reqwest::Client) -> Result<FetchOutcome, String> {
+            Err("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_source_trips_guard() {
+        // REVIEW-R2 Q4：传输失败（Err/超时）视同零产出计入熔断；连续 3 轮即暂停。
+        let bad: Box<dyn Source> = Box::new(FailSource { name: "bad" });
+        let sources = vec![bad];
+        let mut guards = vec![SourceGuard::new(3, 3)];
+        let client = reqwest::Client::new();
+        for tick in 0..3 {
+            let raws = fetch_all(&sources, &mut guards, &client, tick).await;
+            assert!(raws.is_empty());
+        }
+        assert!(
+            !guards[0].should_fetch(3),
+            "persistently failing source must suspend"
+        );
+    }
+
     struct StubSource {
         name: &'static str,
         nodes: Vec<RawNode>,
@@ -2134,6 +2245,37 @@ mod tests {
         FreePoolWorker::merge_once(&router, &metrics, &reg, false);
         assert_eq!(router.snapshot_all().len(), 1);
         assert!(metrics.render().contains("free_pool_nodes_total 1"));
+    }
+
+    #[tokio::test]
+    async fn semaphore_caps_concurrent_verify() {
+        // REVIEW-R2 Q1：spawn 内许可必须持有跨过 await（`pool.rs:92` 形态）；
+        // 丢弃写法（`if acquire_owned().await.is_err()` 临时值）即时释放，并发无上限。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let live = Arc::new(AtomicUsize::new(0));
+        let high = Arc::new(AtomicUsize::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let (s, l, h) = (sem.clone(), live.clone(), high.clone());
+            set.spawn(async move {
+                // 许可持有跨过 await（丢弃写法即时释放，高水位==任务数，见本单测红灯记录）。
+                let Ok(_permit) = s.acquire_owned().await else {
+                    return;
+                };
+                let n = l.fetch_add(1, Ordering::SeqCst) + 1;
+                h.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                l.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while set.join_next().await.is_some() {}
+        assert!(
+            high.load(Ordering::SeqCst) <= 2,
+            "concurrency escaped cap: high={}",
+            high.load(Ordering::SeqCst)
+        );
     }
 
     fn socks_raw(ip: &str, source: &str) -> RawNode {
