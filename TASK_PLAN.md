@@ -23,6 +23,7 @@
 - [x] **步骤 15**: Phase 5 韧性验证（Redis/CH/Mock断电演练）方案见`plan/2026年9月22日-Phase5-韧性验证实施计划.md`（P5-1~P5-4） ✅ 已完成（144 单测+4 真 live+四门绿+三演练全自愈+抓获P0真bug已修，证据见 EXEC_LOG 步骤 15 条+log/gw15*.out/err）
 - [x] **步骤 16**: DOC-R1 文档一致性修复（dashboard零漂移/OPERATION 1中2小）方案见`plan/2026年9月22日-DOC-R1文档一致性修复实施计划.md` ✅ 已完成（dashboard逐名验证零漂移+OPERATION三处修复，证据见 EXEC_LOG 步骤 16 条）
 - [x] **步骤 17**: 剩余事项执行计划（真Key灰度/ Linux验收/JA4复核/完工冻结）方案见`plan/2026年9月22日-剩余事项执行计划.md` ✅ 已完成（REM-1/REM-2 冻结等输入＋REM-3 JA4复核仍OUT＋REM-4 完工盘点；证据见 EXEC_LOG 步骤 17 条）
+- [x] **步骤 18**: FreeProxy 实测（小批量拉取免费节点代理测试：直探对照+网关两档+存量回归）方案见`plan/2026年9月23日-FreeProxy实测计划.md`（F1~F6） ✅ 已完成（直探 13候选0过+网关 ELITE0 pool0/ELITE1 pool1 elite+存量回归全绿+147单测，证据见 EXEC_LOG 步骤 18 条+log/gw16*+free_probe_report）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring

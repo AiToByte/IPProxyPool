@@ -512,3 +512,26 @@
   （R3-1 新增 Copy＋同类选择）；`snapshot_all` Arc 克隆／render 串构造为既有接受态；
   无可执行优化项，不虚构。bench 编译过。
 - **结论**：复审转 3 修全落库（本条随修复同提交）；其余皆 SAFE，有据可查。
+
+### [2026-09-23] 步骤 18 立项: FreeProxy 实测计划冻结（先落库再执行）
+- 计划操作：用户指令“拉取一些免费节点进行代理测试，先制订高质量实施方案，将方案落库后再实施”。基于现状勘察新建`plan/2026年9月23日-FreeProxy实测计划.md`（F1~F6，checkbox 可直接执行）；`TASK_PLAN.md` 步骤 18 置进行中；本文件 append-only 记立项。
+- 勘察结论：FreePool v2＋Phase2/3＋OPT-R3＋Phase4/5 全✅（144 单测）；默认源 Geonode＋free-proxy-list＋clarketm＋httpbin；本机实测 Geonode 200（total 2884）＋httpbin 200＋github/fpl 000——本轮唯一可用公网源为 Geonode；Docker 未运行＋:8080 无监听，实测前需先起依赖。
+- 方案要点：零代码变更预期（直探对照＋网关试验＋本地保底三轨）；小批量 limit=20＋短节拍 60s＋小容量 50＋ELITE 0/1 两档；合规红线六条（零信任/https-only/SSRF/隔离/有界/可回滚）；pool=0/全灭皆为有效结论（免费存活率约束）。
+- 预期验证方式：F1 四门＋F2 拉取计数＋F3 直探报告＋F4 tick/指标/M<=N＋F5 六用例＋XLEN/CH涨＋F6 回滚默认。
+- 范围：不新增依赖/模块/单测；不测敏感流量；不限真 Key/Linux/JA4/配库（延续冻结）。
+
+### [2026-09-23] 步骤 18 已完成: FreeProxy 实测（小批量拉取＋两档网关＋存量回归）
+- **实际操作**：F1（`docker compose up -d`：PONG/Ok＋`cargo build` 24.5s＋三 mocks 11648/33956/12988 200）/F2（Geonode limit=20：total 2885/count 20→http/https 候选 13，`log/free_sample.json`）/F3（`log/probe_free.py` 直探：基线 117.53.45.94，13 候选 0 过——12 tcp_fail＋1 full_fail(canary) 110.92.72.204:8080 16.4s，`log/free_probe_report.md`）/F4（ELITE=0 PID 11724：tick1/2 pool=0，yield api0 40/tcp 38/full 2＋四组/by_proto 全行＋无 panic；ELITE=1 PID 30496：tick1/2 pool=1，yield 40/tcp 38/full 1/pass 1 elite＋`by_proto{http}=1`）/F5（六用例 200/403＋nohost 400＋metrics 200；XLEN 9855→9871/CH 3417→3433＋16 链路活；20 流量后 free 行 6→6 未涨系权重 100:10＋LinUCB 偏付费，属正常）/F6（回滚默认 PID 36788 200＋四门全绿）。
+- **验证结果**：
+  - [门1-格式] ✅ `cargo fmt --check` clean（网关目录）。
+  - [门2-静态] ✅ `clippy --all-targets -D warnings` 零告警。
+  - [门3-测试] ✅ `cargo test` 147 通过/0 失败/4 ignored（基线 144，+3 为复审 FLAG 修，以实测为准）；`-- --ignored` 4 真过（先验 PONG/Ok，无 SKIP）。
+  - [门4-性能] ✅ `bench --no-run` 编译过（bandit 未动，release 断言随 147 全过）。
+  - [回归] ✅ 存量语义不变；`[FreePool] tick`＋指标＋`staggered start` 对齐；CH 旧 free-gh0 行对照正常。
+  - 综合判定：✅ FreeProxy 实测全绿收官（零代码变更；公网免费质量约束下 pool0/直探0过皆为有效结论，ELITE=1 pool1 为源站轮转中的真实 Elite 捕获）。
+- **遇到的问题与解决**：
+  - `Get-CimInstance ... CommandLine like "*pingora*"` 误杀执行壳（自身命令行含模式）致回滚命令零回显＋:8080 落到 traefik 404→改 `Get-Process -Name pingora-proxy-gateway` 精确杀＋单开启动验证。教训：杀进程一律按 Name 精确，不用 CommandLine 模糊。
+  - 每 bash 调用为独立 PowerShell，`$env:FREE_*` 不跨调用→ELITE=1 首启 env 丢失致未启动→改单命令内全量 env＋启动＋验证一气呵成。教训：env 覆盖必须与启动同命令。
+  - ELITE=1 pool1＞ELITE=0 pool0（M<=N 跨轮不成立）→系 Geonode lastChecked 实时轮转（不同快照），非门失效；门语义由 `snapshot(require_elite)` 单测锁定，以本条为准，不重跑刷数。
+  - 20 流量 free 行未涨→权重＋LinUCB 偏付费为设计内（100:10），FullCheck pass（pool=1/elite=1）即质检通过证据，不强求流量命中。
+- **下一步建议**：FreeProxy 实测冻结（默认关闭，线上开需 `FREE_ENABLED=1`）；生产建议 `FREE_REQUIRE_ELITE=1`（Transparent 高占比）；GW-R2 剩余仍待用户输入：三家真 Key＋Linux 节点。教训：免费线结论必须带基线＋计数＋明细三件套，否则无法区分“源站挂”与“门限严”。
