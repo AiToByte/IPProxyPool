@@ -26,6 +26,7 @@
 - [x] **步骤 18**: FreeProxy 实测（小批量拉取免费节点代理测试：直探对照+网关两档+存量回归）方案见`plan/2026年9月23日-FreeProxy实测计划.md`（F1~F6） ✅ 已完成（直探 13候选0过+网关 ELITE0 pool0/ELITE1 pool1 elite+存量回归全绿+147单测，证据见 EXEC_LOG 步骤 18 条+log/gw16*+free_probe_report）
 - [x] **步骤 19**: FreeProxy大样本复测（生产默认limit=100单快照：并发直探+网关4tick稳定性）方案见`plan/2026年9月23日-FreeProxy大样本复测计划.md`（F1~F6） ✅ 已完成（直探57候选0过+网关Elite socks5偶发1+间隔无漂移+回归精确对账，证据见 EXEC_LOG 步骤 19 条+log/gw19*+free_big_report）
 - [x] **步骤 20**: REVIEW-R2 全局复审修复优化（三路审计→2×P0+6×P1+P2批）方案见`plan/2026年9月23日-REVIEW-R2修复优化实施计划.md`（Q1~Q10） ✅ 已完成（156 单测+4 live+release bandit<200ns+curl回归XLEN/CH精确+10，证据见 EXEC_LOG 步骤 20 条+log/gw20.out/err）
+- [x] **步骤 21**: DOC-S1 文档套件（README+LICENSE+架构/技术/组件/手册双语+CONTRIBUTING）方案见`plan/2026年9月23日-DOC-S1文档套件实施计划.md`（D1~D7＋V） ✅ 已完成（7 新文件双语+MIT/aitobyte+交叉核对零MISS，证据见 EXEC_LOG 步骤 21 条）
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring
