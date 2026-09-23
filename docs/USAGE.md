@@ -74,6 +74,7 @@ Java：`HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/ip")).header("H
 - **Q: 浏览器能直接用网关吗？** A: 不能直连（absolute-URI 400），经适配器 `:18080` 可用 HTTP；HTTPS 受限见上表。
 - **Q: 程序零改码接入？** A: 设 `HTTP_PROXY=http://127.0.0.1:18080`（仅 HTTP 生效；库若发 CONNECT 则 501）。
 - **Q: 如何固定出口？** A: `X-Session-Id` 粘滞（同值同节点）；`X-Proxy-Tier` 限定档；免费出口本就轮转，勿假设固定。
+- **Q: 自检/验证结果与预期不符（尤其 200/403 错位）？** A: 先查 shell 代理 env（`$env:http_proxy`）：若经 Clash 且 `no_proxy` 未豁免本机，实测其按 `Host` 头路由代理请求——你的请求可能根本没到网关（如直达 mock 拿到 `mock-a-us` 200，或经 VPN 拿到 VPN 出口）。修法：`no_proxy` 加 `localhost,127.0.0.1` 或清代理 env 后重跑；`curl -v` 首行会明示是否用了代理。
 
 ## English
 
@@ -145,3 +146,4 @@ Java: `HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/ip")).header("Ho
 - **Q: Can browsers use the gateway directly?** A: No (absolute-URI 400); via adaptor `:18080` HTTP works; HTTPS limits above.
 - **Q: Zero-code app onboarding?** A: Set `HTTP_PROXY=http://127.0.0.1:18080` (HTTP only; CONNECT from libs gets 501).
 - **Q: Pin the exit?** A: `X-Session-Id` sticky (same value, same node); `X-Proxy-Tier` constrains tier; free exits rotate by nature, never assume fixed.
+- **Q: Self-test/verification disagrees with expectations (esp. swapped 200/403)?** A: Check shell proxy env first (`$env:http_proxy`): via Clash without localhost exemption, measured behavior routes proxied requests by `Host` header — your request may never reach the gateway (e.g. hitting mocks directly for a `mock-a-us` 200, or exiting via VPN). Fix: add `localhost,127.0.0.1` to `no_proxy` or clear proxy env and re-run; `curl -v` states proxy use on its first lines.

@@ -590,6 +590,19 @@
 - **用户 13.x 结论**：网关桥机制上不可能输出 VPN 出口；13.x 不在历史快照、无 CH 行；判定为用户本地链路（shell 代理 env/浏览器/Clash 规则）所致，已给出复现定位法（三路对照＋查其 shell `echo $env:http_proxy`＋Clash 模式）。回溯 Elite 标签修正为“vs 当时基线（含 VPN 期）”，活性/canary 结论不受影响。
 - **下一步建议**：VPN-IMMUNE 冻结待提交；后续：匿名度基线改直连后观察 Elite 率变化（预期 Transparent 占比上升，属口径修正非退化）。教训：凡涉出口 IP 的结论，必须三路对照（直连/显式代理/经网关）同时取数。
 
+### [2026-09-23] 用户 403→200 之谜破案（网关无罪，Clash 按 Host 头路由）
+- **现象**：用户 shell 中 SDK 自检 `badkey` 得 200（干净环境复现为 403），`gw/metrics` 502，`adaptor` 200；更早一条经网关命令返回 VPN 出口 13.213.72.105。
+- **根因（实锤链）**：用户 shell 有 `http_proxy=127.0.0.1:7890` 且 `no_proxy` 为残缺 URL（无豁免）→本机回声探针证明：经代理请求 Clash 按 `Host` 头路由（Host 指哪打哪，absolute-URI 目标被忽略）：SDK 三请求全直达 mock-A `:8888`（`mock-a-us`、无鉴权→200×3）；curl 经 Clash 到已掉线网关→502；adaptor（显式 `-x` 覆盖 env）直连→200 正常。
+- **13.x 归属**：同机制下 `Host: httpbin.org` 的请求被按头路由到公网经 VPN 出去，故 origin＝当时 VPN 出口；网关桥机制上不可能输出 VPN 出口（reqwest 源码级）＋无 CH 行＋13.x 不在快照，三方印证。结论：网关代码无 bug，不做代码变更；USAGE 中英 FAQ各加一条代理 env 排查。
+- **用户侧修复**：`no_proxy` 加 `localhost,127.0.0.1` 或清代理 env 后重跑自检（预期 403 通过）。教训：验证前先查 `$env:http_proxy`＋`curl -v` 首行，这是比复现更便宜的定位手段。
+- **闭环（2026-09-23）**：用户修 `no_proxy` 后重跑，自检 `plain=200 sticky=200 badkey=403` 全过（网关 PID:15660）。定案：根因＝用户代理 env 劫持本地流量＋Clash 按 Host 头路由，网关代码零问题、零变更结案。
+
+### [2026-09-23] 测试基线落盘（用户指令：将测试落盘＋给后续指令）
+- **交付**：`tools/ipp_free_test.ps1`（D/V 基线→等池→定向→ verdict →CH corroborate 全自动；修 `-match` 数组陷阱 1＋BOM 1）＋`docs/FREE_BASELINE.md`（D/V 参考值＋6 个已验证免费出口＋5 条干扰排除法）。
+- **实测**：脚本首跑 CLEAN（D=27.x／V=3.38.x／G=31.220.40.59 200＋CH 落库）；用户亲手 171.x 200＋CH 落库 corroborate。
+- **附带抓获**：双网关同存分流（Pingora 端口复用；启动前必须 `Get-Process` 确认单实例，已清理）；`.ps1` 中文无 BOM 解析失败（已全量 BOM 化，见 V1 排查）；脚本 `-match` 数组陷阱（curl 多行输出先拼单串，已修）。
+- **基线结论**：VPN 出口轮转（13.x→54.x→3.38.x），V 永不可复用旧值；D 长期 27.x；免费出口 6 个皆≠同期 D/V。
+
 ### [2026-09-23] 步骤 22 已完成: USE-便捷落地（U1~U4 全✅）
 - **实际操作**：U3（`tools/ipp.ps1` start/stop/status，幂等＋精确杀；修双行输出与 `[void]` 吞输出两瑕疵）/U1（`tools/ipp_forward.py` stdlib：absolute-URI→origin-form＋Host＋白名单头，CONNECT/chunked 诚实 501，>10MB 413；`curl -x` 经适配器 200 包体 mock-b-jp，直连网关 400，tier 透传 503 语义对）/U2（`tools/ipp_sdk.py` stdlib：拆分/粘滞/tier-proto/503 重试＋自检三断言全过）/U4（`docs/USAGE.md` 双语四形态＋Node/.NET/Go/Java 片段＋限制表＋FAQ；系统代理只给命令未执行）。
 - **验证结果**：终验一遍全绿（adaptor 200＋gw 200＋SDK 自检＋status 九行）；CONNECT 的 curl 000 系 curl 对非 200 CONNECT 报连接失败特性，原始 socket 已验 501，两边如实记录。

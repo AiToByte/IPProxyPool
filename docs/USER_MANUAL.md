@@ -49,6 +49,7 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 | 免费水位/verify/geo | 第 5 面板 | 水位突降查 `free_pool_source_suspended` 与源站 |
 | Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长查消费组 lag |
 | 落库 | `SELECT count() FROM proxy.proxy_telemetry_log` | 不动看 `[ChSink]` 日志 |
+| 首配 Grafana | `deploy/grafana/dashboard.json` 经 `/api/dashboards/db` 导入＋配 Prometheus 数据源 `http://prometheus:9090`（uid `prometheus`，落 named volume 后持久） | 面板无数据先查数据源连通 |
 
 ### 5. 故障速查
 
@@ -110,6 +111,7 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 | Free level/verify/geo | 5th panel | level drop → `free_pool_source_suspended` and sources |
 | Stream backlog | `XLEN stream:proxy:telemetry` | keeps growing → consumer lag |
 | Landing | `SELECT count() FROM proxy.proxy_telemetry_log` | frozen → `[ChSink]` logs |
+| First-time Grafana | import `deploy/grafana/dashboard.json` via `/api/dashboards/db` + Prometheus datasource `http://prometheus:9090` (uid `prometheus`, persisted in named volume) | no data → check datasource health first |
 
 ### 5. Quick troubleshooting
 
