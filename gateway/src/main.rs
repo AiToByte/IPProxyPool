@@ -311,7 +311,8 @@ async fn main() {
                     free_config.clone(),
                 )
                 .with_geo(free_geo.clone());
-                async move { w.run(reqwest::Client::new()).await }
+                // VPN-IMMUNE：共享 Client 禁系统代理（`free_pool::shared_client`）。
+                async move { w.run(free_pool::shared_client()).await }
             })
             .await;
         });

@@ -86,7 +86,8 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 ## 6. 故障速查
 
 - 网关 503 全域：池被 quarantine 摘空（查 CB 日志 + Redis key）或 mocks 挂了；
-- 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（网关层不强制，租户侧规约：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
+ - 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（网关层不强制，租户侧规约：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
+ - VPN 免疫（H1/H2 加固后）：网关全链路直连（共享 Client 禁系统代理；桥/复检/探针显式代理本就免疫），结果与操作员本机 VPN 状态无关；`curl.exe` 从不走系统代理，可作真直连基线；匿名度分级是“出口 vs 直连基线”比较；
 - 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - SOCKS 桥零信任延续：socks 节点同样禁敏感流量（与免费线同规）；握手/CONNECT 只连验证与请求目标，不做扫描；relay 只在 E2E 脚本出现，不进生产；
 - GeoLite2 配库（P3）：MaxMind 账号取 license→下 GeoLite2-City.mmdb→挂载进容器/宿主→`GEOIP_MMDB_PATH` 指向→重启网关（热加载不做）；无库默认 Disabled，免费线行为不变（`geoip_lookups_total{result="disabled"}` 可见）；

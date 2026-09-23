@@ -1071,6 +1071,18 @@ pub async fn fetch_all(
     raws
 }
 
+/// VPN-IMMUNE：共享出站 Client（抓取＋基线）：显式禁用系统代理。
+/// reqwest 默认跟随 OS 系统代理（Windows 注册表 Clash `127.0.0.1:7890`），
+/// 操作员开 VPN 即污染基线/抓取；`no_proxy()` 后行为与操作员 VPN 状态无关。
+/// 显式代理客户端（桥/复检/探针）本就免疫（`proxy()` 置 auto_sys_proxy=false，
+/// reqwest 0.12.28 `async_impl/client.rs:1414-1418` 实锤）。
+pub fn shared_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("shared client builds")
+}
+
 /// Worker 配置（main 从 env 组装；默认值见计划 §2 Env 总表）。
 #[derive(Debug, Clone)]
 pub struct FreePoolConfig {
@@ -2126,6 +2138,13 @@ mod tests {
         assert_eq!(e.health.exit_ip.as_deref(), Some("9.9.9.9"));
         assert_eq!(e.node.exit_ip.as_deref(), Some("9.9.9.9"));
         assert_eq!(reg.snapshot(now, false)[0].weight, w0);
+    }
+
+    #[test]
+    fn shared_client_builds_without_system_proxy() {
+        // VPN-IMMUNE：构造不断言行为（env 行为单测会污染并行测试，计划显式不出）；
+        // 行为由 H4 live 三路对照覆盖（基线＝直连出口）。
+        let _ = shared_client();
     }
 
     #[test]

@@ -59,7 +59,9 @@ def main():
     src = sys.argv[1] if len(sys.argv) > 1 else "log/free_big_sample.json"
     d = json.load(open(src, encoding="utf-8"))
     try:
-        base = json.loads(urllib.request.urlopen(BASE + "/ip", timeout=5).read().decode("utf-8", "ignore")).get("origin", "")
+        # VPN-IMMUNE：同 probe_free.py（空 ProxyHandler 禁系统代理，真直连基线）。
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        base = json.loads(direct.open(BASE + "/ip", timeout=5).read().decode("utf-8", "ignore")).get("origin", "")
     except Exception as e:
         base = ""
         print(f"baseline unreachable ({str(e)[:80]})")

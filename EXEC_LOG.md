@@ -577,3 +577,32 @@
 - **实际操作**：D2（MIT 全文＋aitobyte）/D7（plan-first/TDD/四门/禁区）/D5（19 模块表：行数/单测数实测，合计 160＝156＋4＋依赖/基建表）/D3（分层图＋五阶段＋双轨/免费/SOCKS/画像/韧性）/D4（算法＋阈值＋租户＋并发＋31 键 env 表＋门禁）/D6（5 步启动＋验证＋巡检＋排障＋FAQ；修 USER_MANUAL 杂散行 1＋计划笔误 1）/D1（README 双语＋7 内链＋5 步＋路线图）。
 - **验证结果**：§4 脚本指标 16＋env 31 零 MISS；8 文件全存在＋内链全解析；docker/redis/二进制俱在；网关第 5 次 Windows 有序退出后重拉 PID:18088 200（已知现象，生产 Linux 不受限）。
 - **下一步建议**：DOC-S1 冻结待提交；开源前需补：真 Key 样例禁入仓复查＋Linux 验收后性能白皮书＋徽章/CI（本轮显式不出）。
+
+### [2026-09-23] 步骤 22 立项: USE-便捷落地计划冻结（先落库再执行）
+- 计划操作：用户要 curl 之外的用法（Windows 便捷＋浏览器/系统代理＋程序赋能）与高质量落地。已核实：网关在线 200 且 absolute-URI 直连复现 400（R2-9 结论成立）→浏览器/标准代理必须经适配器翻译；CONNECT 网关不支持。新建`plan/2026年9月23日-USE-便捷落地实施计划.md`（U1~U4＋V）；`TASK_PLAN.md` 步骤 22 置进行中；本文件 append-only 记立项。
+- 方案要点：前置适配器（absolute-URI→origin-form＋Host，CONNECT/chunked 诚实 501）＋Python SDK（stdlib，自检）＋ipp.ps1（幂等启停）＋USAGE 双语；系统代理只给命令不执行；零网关代码变更。
+- 范围：新建 tools/×3＋docs/USAGE.md；不出 CONNECT 隧道/自动切系统代理/浏览器插件。
+
+### [2026-09-23] 步骤 23 已完成: VPN-IMMUNE 加固（H1~H4 全✅）
+- **机制实锤**：reqwest 0.12.28 `proxy()` 置 `auto_sys_proxy=false`（`async_impl/client.rs:1414-1418`）→桥/复检/探针显式代理永不走 Clash；Windows 系统代理 ON（127.0.0.1:7890），env 无代理；`Client::new()` 默认跟随系统（生产唯一入口 `main.rs:314`）。
+- **双面验证**：urllib 默认 opener 基线 13.213.72.105＝显式 Clash 出口（正）；`ProxyHandler({})` 基线 27.18.3.145＝curl 直连（反）；curl.exe 永不走注册表。
+- **实际操作**：H1（`shared_client()`＋改调＋冒烟单测，157 全绿）/H2（两探针基线直连，py_compile 过）/H3（OPERATION＋USAGE 中英注记）/H4（FREE 网关 pool 2~3＋elite 4；D=27.x／V=13.x 双稳定；G 出口 104.x(200)/122.x/43.x（皆≠D/V）＋第三方 Squid 错误页＋CH 行；回滚默认 200）。
+- **用户 13.x 结论**：网关桥机制上不可能输出 VPN 出口；13.x 不在历史快照、无 CH 行；判定为用户本地链路（shell 代理 env/浏览器/Clash 规则）所致，已给出复现定位法（三路对照＋查其 shell `echo $env:http_proxy`＋Clash 模式）。回溯 Elite 标签修正为“vs 当时基线（含 VPN 期）”，活性/canary 结论不受影响。
+- **下一步建议**：VPN-IMMUNE 冻结待提交；后续：匿名度基线改直连后观察 Elite 率变化（预期 Transparent 占比上升，属口径修正非退化）。教训：凡涉出口 IP 的结论，必须三路对照（直连/显式代理/经网关）同时取数。
+
+### [2026-09-23] 步骤 22 已完成: USE-便捷落地（U1~U4 全✅）
+- **实际操作**：U3（`tools/ipp.ps1` start/stop/status，幂等＋精确杀；修双行输出与 `[void]` 吞输出两瑕疵）/U1（`tools/ipp_forward.py` stdlib：absolute-URI→origin-form＋Host＋白名单头，CONNECT/chunked 诚实 501，>10MB 413；`curl -x` 经适配器 200 包体 mock-b-jp，直连网关 400，tier 透传 503 语义对）/U2（`tools/ipp_sdk.py` stdlib：拆分/粘滞/tier-proto/503 重试＋自检三断言全过）/U4（`docs/USAGE.md` 双语四形态＋Node/.NET/Go/Java 片段＋限制表＋FAQ；系统代理只给命令未执行）。
+- **验证结果**：终验一遍全绿（adaptor 200＋gw 200＋SDK 自检＋status 九行）；CONNECT 的 curl 000 系 curl 对非 200 CONNECT 报连接失败特性，原始 socket 已验 501，两边如实记录。
+- **下一步建议**：USE 落库待提交；后续可选：HTTPS-CONNECT 隧道立项、浏览器 PAC 模板、SDK 多语言包。教训：PowerShell `[void]()` 会吞函数内全部输出流，打印交由调用点。
+
+### [2026-09-23] 步骤 23 立项: VPN-IMMUNE 加固计划冻结（先落库再执行）
+- 起因：用户质疑免费代理流量实为本地 Clash VPN（其命令返回 13.213.72.105，经显式 Clash 复测确为当前 VPN 出口）。
+- 已证实：reqwest 0.12.28 显式代理禁用系统代理（`async_impl/client.rs:1414-1418`，桥/复检/探针免疫）；Windows 系统代理 ON（127.0.0.1:7890），env 无代理；13.x 不在历史快照、无 CH 行（回溯无结论）；生产 `Client::new()` 唯一入口 `main.rs:314`。
+- 影响面：无配置 Client（抓取＋基线）与 urllib 默认基线跟随系统代理→匿名度分级是“vs VPN 出口”比较（活性/canary 不受影响）；curl.exe 永不走系统代理。
+- 方案：H1 共享 Client `no_proxy()`＋H2 探针基线直连＋H3 文档注记＋H4 三路对照复测；单测不出 env 行为（并行污染）；不碰用户 Clash。新建`plan/2026年9月23日-VPN-IMMUNE加固实施计划.md`（H1~H4）；`TASK_PLAN.md` 步骤 23 置进行中；本文件 append-only 记立项。
+
+### [2026-09-23] 用户实操演示：经免费IP完成一次高质量代理（成功，三重证据）
+- **过程**：用户要求亲手走一次免费代理。环境（Docker/PONG/Ok＋mocks 200，网关按预期掉线后重拉）→ Geonode 新鲜快照 limit=100（total 2906）→ 并发直探 53 候选 0 过（49 tcp＋4 full）→ FREE 网关（60s 节拍）tick2 pool=1（pass 1 elite；首网关中途 Windows 有序退出 1 次，事件丢失 completeness 教训）→ 轮询 `free_pool_nodes_total` 命中后立即定向。
+- **成功证据链（13:43，网关 PID:40092 存活）**：`X-Proxy-Tier: free＋X-Proxy-Proto: socks5＋Host: httpbin.org` → 200 `origin 104.245.245.218`；网关 metrics `2xx=1`＋34 字节计量（请求确经网关）；同期直连对照 `origin 27.18.3.145`（我方出口，两者不同即免费节点出口实锤）；CH 落库 `free-api0|104.245.245.218|200|free|34`。
+- **纠错记录**：中途两次 `origin 27.18.3.145` 的 200 系直连（curl 目标误写公网地址绕过网关，metrics 2xx=0＋CH 无行实锤），已向用户澄清；教训：经网关流量必须以网关地址为 curl 目标＋Host 头指定上游。
+- **收尾**：已回滚默认网关 200（PID:288）。免费线结论重申：Elite 偶发，pool 常态 0，生产开线保持 `FREE_ENABLED=1＋REQUIRE_ELITE=1` 建议。

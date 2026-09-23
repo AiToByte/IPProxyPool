@@ -42,7 +42,10 @@ def main():
     src = sys.argv[1] if len(sys.argv) > 1 else "log/free_sample.json"
     d = json.load(open(src, encoding="utf-8"))
     try:
-        base = json.loads(urllib.request.urlopen(BASE + "/ip", timeout=5).read().decode("utf-8", "ignore")).get("origin", "")
+        # VPN-IMMUNE：空 ProxyHandler 即禁用系统代理（urllib 默认跟随 Windows 注册表代理），
+        # 基线必须走真直连，否则匿名度分级是“vs VPN 出口”比较（via_proxy 显式 handler 本就免疫）。
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        base = json.loads(direct.open(BASE + "/ip", timeout=5).read().decode("utf-8", "ignore")).get("origin", "")
     except Exception as e:
         base = ""
         print(f"baseline unreachable ({str(e)[:80]}), anon may be Unknown-first")
