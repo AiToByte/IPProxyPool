@@ -52,6 +52,10 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
       - grafana-data:/var/lib/grafana
+      # Grafana provisioning-as-code: datasource + dashboard auto-load on boot
+      # (named volume keeps runtime edits; fresh volume gets full observability).
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana:/etc/grafana/dashboards:ro
 
   # OPT-2 环境门示例（网关为宿主二进制直跑，不在 compose 内；如容器化网关，
   # 在 gateway 服务加 `environment: REQUIRE_API_KEY: "1"` 即开启无头 403）。

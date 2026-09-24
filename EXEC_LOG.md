@@ -601,6 +601,10 @@
 - **交付**：`tools/ipp_free_test.ps1`（D/V 基线→等池→定向→ verdict →CH corroborate 全自动；修 `-match` 数组陷阱 1＋BOM 1）＋`docs/FREE_BASELINE.md`（D/V 参考值＋6 个已验证免费出口＋5 条干扰排除法）。
 - **实测**：脚本首跑 CLEAN（D=27.x／V=3.38.x／G=31.220.40.59 200＋CH 落库）；用户亲手 171.x 200＋CH 落库 corroborate。
 - **附带抓获**：双网关同存分流（Pingora 端口复用；启动前必须 `Get-Process` 确认单实例，已清理）；`.ps1` 中文无 BOM 解析失败（已全量 BOM 化，见 V1 排查）；脚本 `-match` 数组陷阱（curl 多行输出先拼单串，已修）。
+
+### [2026-09-24] 继续执行：Docker 复活＋Grafana provisioning＋基线干旱记录
+- **实际操作**：Docker Desktop 退出（npipe 丢失）→重拉 backend→`compose up -d` 四容器 Up＋PONG；新增 `deploy/grafana/provisioning/{datasources,dashboards}`＋compose 双目录挂载（文件挂载与目录挂载冲突致容器起不来，改全目录挂载解决）；`--force-recreate grafana` 后 provisioning 日志成功＋面板/数据源 API 对齐（uid `prometheus`）；`ipp.ps1 start -Mocks` 全栈 200/403；自动化基线重跑：D=27.x 稳定／V 又转 `103.136.147.175`（第 4 个值）／5+ tick pool 全 0 干旱，脚本诚实 FAIL；回滚默认网关 200。
+- **结论**：新鲜 volume 开箱即有完整可观测；干旱期属源站轮转低谷（FREE_BASELINE 已记）。教训：容器级挂载优先目录挂载；V 值见一次记一次，永不复用。
 - **基线结论**：VPN 出口轮转（13.x→54.x→3.38.x），V 永不可复用旧值；D 长期 27.x；免费出口 6 个皆≠同期 D/V。
 
 ### [2026-09-23] 步骤 22 已完成: USE-便捷落地（U1~U4 全✅）

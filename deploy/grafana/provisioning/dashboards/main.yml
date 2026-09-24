@@ -1,0 +1,15 @@
+# Grafana provisioning: auto-load deploy/grafana/dashboard.json on first boot.
+# (Previously manual import via /api/dashboards/db; now code. Named volume keeps runtime edits.)
+apiVersion: 1
+providers:
+  - name: ipproxypool
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      # NOTE: dashboard.json lives in deploy/grafana/ (single source); the whole
+      # dir is mounted here, provider picks *.json and ignores provisioning/*.yml.
+      path: /etc/grafana/dashboards
