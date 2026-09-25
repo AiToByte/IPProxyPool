@@ -20,6 +20,31 @@ $ErrorActionPreference = "Continue"
 $PY = "D:\DevSoft\Conda\Miniconda3\python.exe"
 $GW = ".\gateway\target\debug\pingora-proxy-gateway.exe"
 
+# OPT-R4 C5/C6：加载仓库根 .env（若存在）导出凭据；已有进程 env 优先（CI/显式
+# 导出胜过 .env）；缺失则沿用开发缺省（与 compose :-fallback 一致）。
+function Import-DotEnv($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $t = $line.Trim()
+        if ($t -eq "" -or $t.StartsWith("#")) { continue }
+        $kv = $t -split "=", 2
+        if ($kv.Count -eq 2) {
+            $name = $kv[0].Trim()
+            if ($name -ne "" -and ($null -eq (Get-Item -Path ("env:" + $name) -ErrorAction SilentlyContinue))) {
+                Set-Item -Path ("env:" + $name) -Value $kv[1].Trim()
+            }
+        }
+    }
+}
+$Here = $PSScriptRoot
+if (-not $Here) { $Here = Split-Path -Parent $MyInvocation.MyCommand.Path }
+Import-DotEnv (Join-Path (Split-Path -Parent $Here) ".env")
+if (-not $env:REDIS_PASSWORD) { $env:REDIS_PASSWORD = "123456" }
+if (-not $env:REDIS_URL) { $env:REDIS_URL = "redis://:$($env:REDIS_PASSWORD)@127.0.0.1:6379/" }
+if (-not $env:CLICKHOUSE_USER) { $env:CLICKHOUSE_USER = "proxy" }
+if (-not $env:CLICKHOUSE_PASSWORD) { $env:CLICKHOUSE_PASSWORD = "123456" }
+if (-not $env:CLICKHOUSE_DB) { $env:CLICKHOUSE_DB = "proxy" }
+
 function Test-Port($Url) {
     try {
         return curl.exe --max-time 5 -s -o NUL -w "%{http_code}" $Url
@@ -40,8 +65,8 @@ function Start-Detached {
 
 if ($Action -eq "status") {
     docker ps --format "{{.Names}} {{.Status}}" | Select-String "ipproxy"
-    docker exec ipproxy-redis redis-cli ping
-    curl.exe --max-time 10 -s "http://127.0.0.1:8123/ping" --user "proxy:123456"
+    docker exec ipproxy-redis redis-cli -a "$env:REDIS_PASSWORD" ping 2>$null
+    curl.exe --max-time 10 -s "http://127.0.0.1:8123/ping" --user "$($env:CLICKHOUSE_USER):$($env:CLICKHOUSE_PASSWORD)"
     Write-Output ""
     Show-Port "http://127.0.0.1:8888/" "mockA"
     Show-Port "http://127.0.0.1:8889/" "mockB"
@@ -53,16 +78,18 @@ if ($Action -eq "status") {
 
 if ($Action -eq "stop") {
     Get-Process -Name "pingora-proxy-gateway" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process -Name "python" -ErrorAction SilentlyContinue | Where-Object {
-        (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $_.Id)).CommandLine -like "*mock_upstream.py*"
-    } | Stop-Process -Force
+    # OPT-R4 C4：单次 CIM 查询全部 python.exe，按 mock 脚本命令行精确匹配再杀
+    # （旧写法逐进程 WMI 且易被误读为全杀；本机其他 Python 任务不受影响）。
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*mock_upstream.py*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Write-Output "stopped (gateway+mocks)"
     exit 0
 }
 
-# start
+# start （网关子进程自动继承本脚本 env：REDIS_URL/CLICKHOUSE_* 已在顶部备好）
 docker compose up -d
-docker exec ipproxy-redis redis-cli ping
+docker exec ipproxy-redis redis-cli -a "$env:REDIS_PASSWORD" ping 2>$null
 # V1-verdict fix: fixed sleeps lose the readiness race on cold start;
 # poll until 200 (or timeout) instead.
 function Wait-Port($Url, $Name, $Tries = 12) {

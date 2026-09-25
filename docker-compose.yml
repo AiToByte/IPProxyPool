@@ -4,13 +4,16 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ipproxy-redis
+    # OPT-R4 C1：宿主/daemon 重启后自愈。C6：只绑回环（杀局域网直达）＋密码
+    # （杀未授权写池/遥测；密码经 .env，见 .env.example；默认值为开发缺省）。
+    restart: unless-stopped
     ports:
-      - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-123456}"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-123456}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -18,16 +21,17 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24-alpine
     container_name: ipproxy-clickhouse
+    restart: unless-stopped
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
       - "127.0.0.1:9010:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./deploy/clickhouse:/docker-entrypoint-initdb.d:ro
     environment:
-      CLICKHOUSE_USER: proxy
-      CLICKHOUSE_PASSWORD: "123456"
-      CLICKHOUSE_DB: proxy
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proxy}
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-123456}"
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-proxy}
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
@@ -37,21 +41,25 @@ services:
   prometheus:
     image: prom/prometheus:v2.53.0
     container_name: ipproxy-prometheus
+    restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       # C3 告警规则（rules 原生能力，无需额外 feature flag）。
       - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      # OPT-R4 C9：Alertmanager 接线（文件已备；取消注释＋重载 prom 即投递）。
+      # - ./deploy/alertmanager.yml:/etc/prometheus/alertmanager.yml:ro
 
   grafana:
     image: grafana/grafana:11.1.0
     container_name: ipproxy-grafana
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-change-me-in-prod}
     volumes:
       - grafana-data:/var/lib/grafana
       # Grafana provisioning-as-code: datasource + dashboard auto-load on boot
@@ -74,11 +82,11 @@ services:
       - "9091:9091"
     environment:
       REQUIRE_API_KEY: "0"
-      REDIS_URL: "redis://redis:6379/"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-123456}@redis:6379/"
       CLICKHOUSE_URL: "http://clickhouse:8123"
-      CLICKHOUSE_USER: "proxy"
-      CLICKHOUSE_PASSWORD: "123456"
-      CLICKHOUSE_DB: "proxy"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proxy}
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-123456}"
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-proxy}
       # 容器内必须绑 0.0.0.0（默认 GATEWAY_ADDR 已是；METRICS 默认 127.0.0.1 需覆写）。
       GATEWAY_ADDR: "0.0.0.0:8916"
       METRICS_ADDR: "0.0.0.0:9091"
@@ -128,6 +136,24 @@ services:
   #     # P4 库更新产物挂载（deploy/geoip_update.py --out-dir ./data 写入宿主 ./data，网关只读挂载）：
   #     # volumes:
   #     #   - ./data:/data:ro
+
+  # OPT-R4 C11：redis_exporter（profile-gated opt-in；镜像需联网拉取，
+  # 本机 Hub 不通故默认不带；跑起后 prom 自动有 redis_stream_length 序列，
+  # TelemetryStreamLagGrowing 规则自动生效）。
+  # 用法：docker compose --profile observability up -d redis-exporter
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    profiles: ["observability"]
+    container_name: ipproxy-redis-exporter
+    ports:
+      - "127.0.0.1:9121:9121"
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-123456}"
+      CHECK_SINGLE_KEYS: "stream:proxy:telemetry"
+    depends_on:
+      redis:
+        condition: service_healthy
 
 volumes:
   redis-data:

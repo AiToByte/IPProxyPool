@@ -12,6 +12,8 @@
 use crate::router::RouterEngine;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,12 +83,64 @@ pub(crate) fn field_text(fields: &HashMap<String, redis::Value>, key: &str) -> O
     }
 }
 
+/// A6（S）：远端同步失败计数（SETEX 持久化／PUBLISH 扇出各一）。
+/// 说明：计数暂为同进程本地值＋warn 日志（失败可观测，零新增生产依赖）；
+/// 桥接进 MetricsRegistry 待后续项（届时加回注入入口，共享同一个 `Arc` 即可）。
+#[derive(Default)]
+pub struct RemoteSyncStats {
+    persist_failures: AtomicU64,
+    publish_failures: AtomicU64,
+}
+
+impl RemoteSyncStats {
+    pub fn note_persist_failure(&self) {
+        self.persist_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_publish_failure(&self) {
+        self.publish_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn persist_failures(&self) -> u64 {
+        self.persist_failures.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn publish_failures(&self) -> u64 {
+        self.publish_failures.load(Ordering::Relaxed)
+    }
+}
+
+/// 隔离键格式（抽取为纯函数以便单测锁定线上格式）。
+pub(crate) fn quarantine_redis_key(domain: &str, out_ip: &str) -> String {
+    format!("quarantine:{domain}:{out_ip}")
+}
+
+/// 扇出报文格式（抽取为纯函数以便单测锁定线上格式）。
+pub(crate) fn quarantine_delta_message(domain: &str, out_ip: &str, ttl_secs: u64) -> String {
+    format!("QUARANTINE|{domain}|{out_ip}|{ttl_secs}")
+}
+
+/// 单次重试：首次失败即时再试一次，两次都失败才返回 Err（调用方记数＋warn）。
+async fn run_with_single_retry<F, Fut>(mut op: F) -> redis::RedisResult<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = redis::RedisResult<()>>,
+{
+    match op().await {
+        Ok(()) => Ok(()),
+        Err(_) => op().await,
+    }
+}
+
 pub struct PassiveCircuitBreaker {
     redis_conn: ConnectionManager,
     stream_key: String,
     consumer_group: String,
     consumer_name: String,
     router: Arc<RouterEngine>,
+    remote_stats: Arc<RemoteSyncStats>,
 }
 
 impl PassiveCircuitBreaker {
@@ -103,6 +157,7 @@ impl PassiveCircuitBreaker {
             consumer_group,
             consumer_name,
             router,
+            remote_stats: Arc::new(RemoteSyncStats::default()),
         }
     }
 
@@ -185,14 +240,40 @@ impl PassiveCircuitBreaker {
         // 1. Same-process memory isolation (fast path, <50ms).
         self.router.set_quarantine(domain, out_ip, ttl_secs);
 
-        // 2. Cross-instance persistence.
-        let mut conn = self.redis_conn.clone();
-        let key = format!("quarantine:{domain}:{out_ip}");
-        let _: () = conn.set_ex(&key, "BANNED", ttl_secs).await.unwrap_or(());
+        // 2. Cross-instance persistence（A6：失败单次重试，仍失败记数＋warn，
+        // 不再 unwrap_or(()) 静默；内存隔离已生效，重试耗尽仅丢跨实例同步）。
+        let key = quarantine_redis_key(domain, out_ip);
+        let base_conn = self.redis_conn.clone();
+        let op_key = key.clone();
+        let persist = run_with_single_retry(move || {
+            let mut conn = base_conn.clone();
+            let key = op_key.clone();
+            async move { conn.set_ex::<_, _, ()>(&key, "BANNED", ttl_secs).await }
+        })
+        .await;
+        if let Err(e) = persist {
+            self.remote_stats.note_persist_failure();
+            log::warn!(
+                "[CircuitBreaker] quarantine persist failed after 1 retry (memory isolation still applied): {key} ttl={ttl_secs}s err={e:?}"
+            );
+        }
 
-        // 3. Fan-out to every gateway instance.
-        let message = format!("QUARANTINE|{domain}|{out_ip}|{ttl_secs}");
-        let _: () = conn.publish(DELTA_CHANNEL, message).await.unwrap_or(());
+        // 3. Fan-out to every gateway instance（同上：重试一次＋记数＋warn）。
+        let message = quarantine_delta_message(domain, out_ip, ttl_secs);
+        let base_conn = self.redis_conn.clone();
+        let op_message = message.clone();
+        let fanout = run_with_single_retry(move || {
+            let mut conn = base_conn.clone();
+            let message = op_message.clone();
+            async move { conn.publish::<_, _, ()>(DELTA_CHANNEL, message).await }
+        })
+        .await;
+        if let Err(e) = fanout {
+            self.remote_stats.note_publish_failure();
+            log::warn!(
+                "[CircuitBreaker] quarantine fan-out failed after 1 retry (memory isolation still applied): {message} err={e:?}"
+            );
+        }
 
         log::warn!("[CircuitBreaker] Quarantined IP {out_ip} on domain {domain} for {ttl_secs}s");
     }
@@ -335,7 +416,10 @@ mod tests {
         use redis::AsyncCommands;
         let domain = "itest.example";
         let out_ip = "10.9.9.9";
-        let client = match redis::Client::open("redis://127.0.0.1:6379/") {
+        // OPT-R4 C6：live 测试读 REDIS_URL（带密 compose），缺省沿用无密本机。
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        let client = match redis::Client::open(url) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("SKIP live_quarantine: bad URL ({e:?})");
@@ -416,5 +500,81 @@ mod tests {
             .del(format!("quarantine:{domain}:{out_ip}"))
             .await
             .unwrap_or(());
+    }
+
+    /// A6（S）：远端同步失败必须可观测＋只重试一次（错误注入，无需 Redis）。
+    /// TDD 红→绿：先断言新 API 存在（缺实现时编译即红），再补最小实现。
+    #[test]
+    fn remote_stats_counts_failures() {
+        // 熔断远端吞错：SETEX/PUBLISH 失败要计数＋warn，不能 unwrap_or(()) 静默。
+        let stats = RemoteSyncStats::default();
+        assert_eq!(stats.persist_failures(), 0);
+        assert_eq!(stats.publish_failures(), 0);
+        stats.note_persist_failure();
+        stats.note_persist_failure();
+        stats.note_publish_failure();
+        assert_eq!(stats.persist_failures(), 2);
+        assert_eq!(stats.publish_failures(), 1);
+    }
+
+    #[test]
+    fn quarantine_key_and_delta_format_locked() {
+        // 键/报文格式锁定：重构重试逻辑时不得改动线上格式。
+        assert_eq!(
+            quarantine_redis_key("a.com", "10.0.0.9"),
+            "quarantine:a.com:10.0.0.9"
+        );
+        assert_eq!(
+            quarantine_delta_message("a.com", "10.0.0.9", 60),
+            "QUARANTINE|a.com|10.0.0.9|60"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_retry_runs_single_retry_on_failure() {
+        // 错误注入：闭包每次都失败 → 恰好尝试 2 次（首次＋单次重试），仍返回 Err。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let r = run_with_single_retry(move || {
+            let a = a.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err::<(), redis::RedisError>(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "injected persist failure",
+                )))
+            }
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_retry_succeeds_on_second_attempt() {
+        // 错误注入：首次失败、重试成功 → 返回 Ok，且只尝试 2 次。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let r = run_with_single_retry(move || {
+            let a = a.clone();
+            async move {
+                let n = a.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err::<(), redis::RedisError>(redis::RedisError::from((
+                        redis::ErrorKind::IoError,
+                        "injected transient failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

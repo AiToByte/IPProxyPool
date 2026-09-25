@@ -13,6 +13,8 @@ jobs:
       redis:
         image: redis:7-alpine
         ports: ["6379:6379"]
+        # OPT-R4 C6 注记：CI 用无密 service（测试走缺省 URL）；带密 compose
+        # 路径由本地 live 验证（export REDIS_URL，见 OPERATION）。
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s

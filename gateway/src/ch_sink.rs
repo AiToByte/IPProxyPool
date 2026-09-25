@@ -517,7 +517,10 @@ mod tests {
     #[ignore]
     async fn live_pump_once_lands_rows() {
         use redis::AsyncCommands;
-        let client = match redis::Client::open("redis://127.0.0.1:6379/") {
+        // OPT-R4 C6：live 测试读 REDIS_URL（带密 compose），缺省沿用无密本机。
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        let client = match redis::Client::open(url) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("SKIP live_pump: bad URL ({e:?})");
@@ -536,11 +539,13 @@ mod tests {
                 return;
             }
         };
+        // OPT-R4 C6：live 测试读 CLICKHOUSE_*（带密 compose），缺省沿用开发缺省。
         let analytics = Arc::new(AnalyticsEngine::new(
-            "http://127.0.0.1:8123",
-            "proxy",
-            "123456",
-            "proxy",
+            &std::env::var("CLICKHOUSE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8123".to_string()),
+            &std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "proxy".to_string()),
+            &std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "123456".to_string()),
+            &std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "proxy".to_string()),
         ));
         if analytics.ping().await.is_err() {
             eprintln!("SKIP live_pump: ClickHouse unreachable");

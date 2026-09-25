@@ -99,6 +99,45 @@ impl TelemetryPublisher {
     }
 }
 
+/// A2：把 batch 逐条序列化后装进 pipe，返回实际进 pipe 的条数 `queued`。
+///
+/// 序列化失败的事件直接跳过，由调用方按 `batch.len() - queued` 单独计数
+///（落库失败只按 `queued` 计，不再按整批累加）。
+/// `serialize` 参数供单测注入失败：线上 `serde_json` 对本 struct 几乎不失败，
+/// 不可注入则 `queued==0` 全失败分支与部分失败都不可测。
+fn encode_batch(
+    batch: &[TelemetryEvent],
+    stream_key: &str,
+    pipe: &mut redis::Pipeline,
+    serialize: impl Fn(&TelemetryEvent) -> Option<String>,
+) -> u64 {
+    let mut queued = 0u64;
+    for event in batch {
+        if let Some(json_data) = serialize(event) {
+            queued += 1;
+            // R2-9：XADD 必须用自动 ID `*`。R2-4 的显式 ID（`{ms}-{pid}-{seq}`
+            // 三段式）不是合法 Redis Stream ID（只允许数字型 `<ms>-<seq>`），
+            // 对真 Redis 全部落库失败（R2-9 curl 回归抓获；此前 live 全为
+            // Docker 宕机下的自跳过，见 EXEC_LOG 更正）。
+            // 幂等不靠 Stream ID：重试产生的新条目由 payload 内 `event_id`
+            // 经 sink 侧 `SeenIds` 窗去重（R2-5），CB 消费组按 payload 语义
+            // 处理，两边都不依赖 Stream ID 相等。
+            // R2-5：MAXLEN ~ 上限，消费组全挂时 Redis 不爆（老数据先丢）。
+            pipe.xadd_maxlen(
+                stream_key,
+                redis::streams::StreamMaxlen::Approx(STREAM_MAXLEN),
+                "*",
+                &[
+                    ("payload", json_data),
+                    ("domain", event.target_domain.clone()),
+                    ("status", event.status_code.to_string()),
+                ],
+            );
+        }
+    }
+    queued
+}
+
 /// Background batch worker: aggregates events and pipelines XADD to Redis.
 pub struct TelemetryWorker {
     receiver: mpsc::Receiver<TelemetryEvent>,
@@ -106,10 +145,12 @@ pub struct TelemetryWorker {
     stream_key: String,
     batch_size: usize,
     flush_interval: Duration,
-    /// OPT-4 丢弃计数：flush 重试一次仍失败时，整批计数累加于此。
+    /// OPT-4 丢弃计数：flush 重试一次仍失败时累加于此。
     /// 与 `MetricsRegistry` 持有同一个 `Arc`（main 装配），由 metrics 侧渲染，
     /// 网关 `logging` 无需经手——worker 直写，数据面零阻塞语义不变。
-    /// R2-4 口径冻结：只计落库失败（通道满另计 `channel_dropped`）。
+    /// A2 口径：落库失败按实际进 pipe 的 `queued` 计数；序列化失败
+    ///（`batch_len - queued`，含 `queued==0` 全失败分支）单独累加于此，
+    /// 不再按整批 `batch_len` 累加。通道满另计 `channel_dropped`。
     flush_dropped: Arc<AtomicU64>,
     /// R2-4 空 id 回填序号（正常只走 emit 配号；直调 worker 的单测/旧代码走这里）。
     fallback_seq: u64,
@@ -167,7 +208,7 @@ impl TelemetryWorker {
             return;
         }
 
-        // 先整批移出：重发/丢弃都按整批口径计数，避免移出后长度丢失。
+        // 先整批移出：重发/丢弃都按实际口径计数，避免移出后长度丢失。
         let mut batch: Vec<TelemetryEvent> = std::mem::take(buffer);
         // R2-4/R2-9：空 id 兜底回填（payload 级幂等键完整，sink 去重窗消费它）。
         for event in &mut batch {
@@ -178,36 +219,22 @@ impl TelemetryWorker {
         }
         let batch_len = batch.len() as u64;
         let mut pipe = redis::pipe();
-        // REVIEW-R2 Q9：serde 全失败极端下空 pipe 不 query（计数仍按整批丢失口径累加）。
-        let mut queued = 0u64;
-        for event in &batch {
-            if let Ok(json_data) = serde_json::to_string(&event) {
-                queued += 1;
-                // R2-9：XADD 必须用自动 ID `*`。R2-4 的显式 ID（`{ms}-{pid}-{seq}`
-                // 三段式）不是合法 Redis Stream ID（只允许数字型 `<ms>-<seq>`），
-                // 对真 Redis 全部落库失败（R2-9 curl 回归抓获；此前 live 全为
-                // Docker 宕机下的自跳过，见 EXEC_LOG 更正）。
-                // 幂等不靠 Stream ID：重试产生的新条目由 payload 内 `event_id`
-                // 经 sink 侧 `SeenIds` 窗去重（R2-5），CB 消费组按 payload 语义
-                // 处理，两边都不依赖 Stream ID 相等。
-                // R2-5：MAXLEN ~ 上限，消费组全挂时 Redis 不爆（老数据先丢）。
-                pipe.xadd_maxlen(
-                    &self.stream_key,
-                    redis::streams::StreamMaxlen::Approx(STREAM_MAXLEN),
-                    "*",
-                    &[
-                        ("payload", json_data),
-                        ("domain", event.target_domain.clone()),
-                        ("status", event.status_code.to_string()),
-                    ],
-                );
-            }
+        // A2：只统计实际进 pipe 的 queued；序列化失败单独计数，不按整批累加。
+        let queued = encode_batch(&batch, &self.stream_key, &mut pipe, |e| {
+            serde_json::to_string(e).ok()
+        });
+        let ser_failed = batch_len.saturating_sub(queued);
+        if ser_failed > 0 {
+            self.flush_dropped.fetch_add(ser_failed, Ordering::Relaxed);
         }
 
         // OPT-4：失败 → 睡 100ms 重发一次 → 仍失败则丢弃并计数（原来静默丢）。
         // R2-9：重试是同一 pipe 重放（自动 ID 下产生新条目，重复由 sink 侧
-        // payload `event_id` 去重窗对消）；计数按整批事件数累加，供 SLA 审计。
+        // payload `event_id` 去重窗对消）。
+        // A2：queued==0 说明整批序列化失败（buffer 已被 take，不能静默 return
+        // 漏计）：上面已单独计数，这里打 warn 后返回；空 pipe 不 query。
         if queued == 0 {
+            log::warn!("[TelemetryWorker] serialize failed, dropped {batch_len} events");
             return;
         }
         let mut conn = self.redis_conn.clone();
@@ -216,10 +243,10 @@ impl TelemetryWorker {
             tokio::time::sleep(TELEMETRY_FLUSH_RETRY_DELAY).await;
             let mut retry_conn = self.redis_conn.clone();
             if let Err(second) = pipe.query_async::<()>(&mut retry_conn).await {
-                self.flush_dropped.fetch_add(batch_len, Ordering::Relaxed);
-                log::error!(
-                    "[TelemetryWorker] retry failed, dropped {batch_len} events: {second:?}"
-                );
+                // A2：按实际进 pipe 的 queued 计数（原来按整批 batch_len，
+                // 含未进 pipe 的序列化失败，虚高），供 SLA 审计。
+                self.flush_dropped.fetch_add(queued, Ordering::Relaxed);
+                log::error!("[TelemetryWorker] retry failed, dropped {queued} events: {second:?}");
             }
         }
     }
@@ -301,6 +328,41 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 
+    #[test]
+    fn a2_flush_counts_queued_not_batch_len() {
+        // A2：5 条中 2 条序列化失败 → 实际进 pipe 只有 3 条；
+        // 落库失败只能按 queued=3 计数（原来按整批 5 累加，虚高）。
+        let mut batch = vec![sample(), sample(), sample(), sample(), sample()];
+        batch[1].client_ip = "ser-fail".to_string();
+        batch[3].client_ip = "ser-fail".to_string();
+        let mut pipe = redis::pipe();
+        let queued = encode_batch(&batch, "stream:test", &mut pipe, |e| {
+            if e.client_ip == "ser-fail" {
+                None
+            } else {
+                serde_json::to_string(e).ok()
+            }
+        });
+        let batch_len = batch.len() as u64;
+        assert_eq!(queued, 3);
+        assert_eq!(batch_len.saturating_sub(queued), 2);
+        assert_ne!(queued, batch_len);
+    }
+
+    #[test]
+    fn a2_zero_queued_counts_batch_instead_of_missing() {
+        // A2：整批序列化失败（queued==0）时丢数 = 整批 batch_len，
+        // 不能像原来那样直接 return 记 0（漏计）。
+        let batch = vec![sample(), sample()];
+        let mut pipe = redis::pipe();
+        let queued = encode_batch(&batch, "stream:test", &mut pipe, |_| None);
+        assert_eq!(queued, 0);
+        let batch_len = batch.len() as u64;
+        let ser_failed = batch_len.saturating_sub(queued);
+        assert_eq!(ser_failed, batch_len);
+        assert_ne!(ser_failed, 0);
+    }
+
     /// Live Redis integration: worker batch-flushes one event into a test
     /// stream. Skips (passes) when Redis is unreachable, e.g. Docker daemon
     /// down on Windows dev boxes. Run with `cargo test -- --ignored`.
@@ -308,7 +370,10 @@ mod tests {
     #[ignore]
     async fn live_flush_writes_stream() {
         use redis::AsyncCommands;
-        let client = match redis::Client::open("redis://127.0.0.1:6379/") {
+        // OPT-R4 C6：live 测试读 REDIS_URL（带密 compose），缺省沿用无密本机。
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        let client = match redis::Client::open(url) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("SKIP live_flush_writes_stream: bad URL ({e:?})");

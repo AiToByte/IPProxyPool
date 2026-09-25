@@ -259,7 +259,14 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_insert_and_sla_roundtrip() {
-        let engine = AnalyticsEngine::new("http://127.0.0.1:8123", "proxy", "123456", "proxy");
+        // OPT-R4 C6：live 测试读 CLICKHOUSE_*（带密 compose），缺省沿用开发缺省。
+        let engine = AnalyticsEngine::new(
+            &std::env::var("CLICKHOUSE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8123".to_string()),
+            &std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "proxy".to_string()),
+            &std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "123456".to_string()),
+            &std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "proxy".to_string()),
+        );
         if engine.ping().await.is_err() {
             eprintln!("SKIP live_insert: ClickHouse unreachable");
             return;

@@ -1,9 +1,8 @@
-# IPProxyPool Prometheus alert rules (Phase C3).
-# All LHS series are rendered by the gateway itself (gateway/src/metrics.rs);
-# no exporter needed. `up` is the built-in scrape-health series.
-# NOTE (honest gap): Redis Stream XLEN (consumer lag) has no series yet —
-# there is no redis_exporter in compose. The commented placeholder below
-# shows the intended rule; wire an exporter first, then uncomment.
+# IPProxyPool Prometheus alert rules (Phase C3, OPT-R4 C9/C11 tuned).
+# All LHS series are rendered by the gateway itself (gateway/src/metrics.rs),
+# except redis_stream_length (needs redis_exporter, compose profile
+# `observability`; rule stays inactive until the series exists).
+# `up` is the built-in scrape-health series.
 groups:
   - name: ipp-gateway
     interval: 30s
@@ -35,16 +34,16 @@ groups:
           describe: "免费源轮转低谷属正常；超 30 分钟请查源站存活与熔断 free_pool_source_suspended。"
 
       # 后台 worker 重启（supervisor 捕获 panic/意外返回后自愈）。
-      # Windows 本机调试偶发 tokio 退出抖动（见 EXEC），重启本身是自愈证据；
-      # 频繁重启（15 分钟窗内多次）才值得看。
+      # Windows 本机调试偶发 tokio 退出抖动（见 EXEC），单次重启是自愈证据；
+      # OPT-R4 C9：阈值收紧为 15 分钟窗内 >3 次（抖动不再噪，连续崩才报）。
       - alert: SupervisorRestarted
-        expr: increase(supervisor_restarts_total[15m]) > 0
+        expr: increase(supervisor_restarts_total[15m]) > 3
         for: 1m
         labels:
           severity: warning
         annotations:
-          summary: "后台 worker 发生重启 ({{ $labels.worker }})"
-          describe: "15 分钟窗内重启 {{ $value }} 次；单次多为 Windows 退出抖动自愈，连续多次请查对应 worker 日志。"
+          summary: "后台 worker 频繁重启 ({{ $labels.worker }})"
+          describe: "15 分钟窗内重启 {{ $value }} 次（>3）；先看对应 worker 日志，网关进程若连带退出查看护日志。"
 
       # 网关抓取失联（内置 up 序列，无需额外指标）。
       - alert: GatewayDown
@@ -56,11 +55,13 @@ groups:
           summary: "网关 /metrics 抓取失联超 2 分钟"
           describe: "先看网关进程与看护日志 log/ipp-watchdog.out，再查 :9091 本机直访。"
 
-      # ---- 待接线（需 redis_exporter，当前 compose 未含，故注释冻结） ----
-      # - alert: TelemetryStreamLagGrowing
-      #   expr: increase(redis_stream_length{key="telemetry"}[10m]) > 0
-      #   for: 10m
-      #   labels:
-      #     severity: warning
-      #   annotations:
-      #     summary: "遥测 Stream 积压持续增长"
+      # ---- OPT-R4 C11：已接线（redis_exporter profile-gated，见 compose）。
+      # key 名以网关 telemetry stream 为准（`stream:proxy:telemetry`，见 telemetry.rs）。
+      # exporter 未跑时序列缺失，规则静默（inactive），跑起即自动生效。
+      - alert: TelemetryStreamLagGrowing
+        expr: increase(redis_stream_length{key="stream:proxy:telemetry"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "遥测 Stream 积压持续增长"

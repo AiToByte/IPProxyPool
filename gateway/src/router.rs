@@ -15,6 +15,16 @@ use std::time::{Duration, Instant};
 /// 会话粘性有效期（秒）：超时后会话绑定失效，可被清理。
 const SESSION_TTL_SECS: u64 = 600;
 
+/// OPT-R4 A7：会话 id 长度上限（字节）。超长 session 当无 session 处理
+/// （只走无状态选路，不查表不落表），防随机长 key 在两次 sweep 间打爆 DashMap；
+/// 按字节数判定（不做切片截断，多字节字符不断裂，永不 panic）。
+const SESSION_ID_MAX_BYTES: usize = 64;
+
+/// OPT-R4 A7：会话表水位上限（条目数）。满水位后新 key 拒绝粘滞只走无状态
+/// （不新增条目但仍返回无状态选中节点）；已存 key 仍可粘滞复用。
+/// 并发下 len 检查与 insert 非原子，水位为软上限（允许轻微超限），只防无限膨胀。
+const SESSION_MAX_ENTRIES: usize = 8192;
+
 /// 隔离 TTL 上限（秒，24h）：`set_quarantine` 与 PubSub 解析共用。
 /// 复审结论：`Instant + Duration` 会溢出 panic——u64::MAX 级输入（毒报文/非法 env）
 /// 必须钳制；上限远超业务 TTL（60/600s），钳制无行为影响。
@@ -59,6 +69,23 @@ pub struct RouterEngine {
 /// NEXT-B6：因子表键（provider 精确＋country 小写；与匹配侧 `eq_ignore_ascii_case` 同语义）。
 fn scale_key(vendor: &str, country: &str) -> (String, String) {
     (vendor.to_string(), country.to_ascii_lowercase())
+}
+
+/// OPT-R4 A7：会话粘滞准入（超长/超量 session → 当无 session 处理）。
+/// - 超长：`session_id.len()`（字节）> 64 即拒绝（不查表不落表，只走无状态）；
+/// - 超量：表满水位且 key 尚未在表内即拒绝（已存 key 仍可粘滞复用）；
+/// - 永不 panic（只做长度/存在性判断，不做字符串切片截断）。
+fn session_sticky_allowed(
+    store: &DashMap<String, (Arc<ProxyNode>, Instant)>,
+    session_id: &str,
+) -> bool {
+    if session_id.len() > SESSION_ID_MAX_BYTES {
+        return false;
+    }
+    if store.len() >= SESSION_MAX_ENTRIES && !store.contains_key(session_id) {
+        return false;
+    }
+    true
 }
 
 impl RouterEngine {
@@ -126,6 +153,10 @@ impl RouterEngine {
         // 隔离：到期时刻 <= now 即过期。
         self.quarantine_map.retain(|_, expiry| *expiry > now);
         let quarantines_removed = quarantines_before - self.quarantine_map.len();
+
+        // OPT-R4 B11：TTL 淘汰顺带清理僵尸因子（池内已无对应 vendor×country
+        // 即删键；缺省 1.0 语义不变，恢复靠下轮 merge 健康快照，不靠残留 0 因子）。
+        self.prune_free_scales();
 
         (sessions_removed, quarantines_removed)
     }
@@ -230,38 +261,42 @@ impl RouterEngine {
         spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
 
         // 1. Sticky session fast path (skip quarantined/derated/excluded bindings).
+        // OPT-R4 A7：超长 session 当无 session 处理（不查表，直接走无状态新鲜选择，
+        // 不哈希巨型 key，永不 panic）。
         if let Some(ref session_id) = spec.session_id {
-            if let Some(entry) = self.session_store.get(session_id) {
-                let (node, created_at) = entry.value();
-                // R2-1：粘滞命中后必须复核“当前池”权重，derate 到 0 的会话要迁移，
-                // 不能沿用绑定时刻克隆的老权重。
-                // P2：同时复核 proto——绑 socks 节点的会话发默认请求必须迁走
-                // （否则 socks 节点漏进 HttpPeer 必失败；反之亦然）。
-                let want_proto = spec.proto.unwrap_or(crate::model::EgressProto::Http);
-                let still_live = self
-                    .pools
-                    .load()
-                    .iter()
-                    .find(|n| n.addr == node.addr)
-                    .is_some_and(|n| n.weight > 0 && n.proto == want_proto);
-                let excluded_hit = excluded.iter().any(|e| e == &node.addr);
-                // REVIEW-R2 Q9：`elapsed()` 时钟回拨即 panic（数据面不可炸），与
-                // `sweep_expired_at` 同口径改 saturating（回拨按 0 处理，会话多活一轮）。
-                // NEXT-A5：粘滞命中复核 country/tier 约束（spec.tier 入口已归一，
-                // 与 matches 同语义；换约束即迁移，不再粘错节点）。
-                let country_ok = spec
-                    .country
-                    .as_deref()
-                    .is_none_or(|c| node.country.eq_ignore_ascii_case(c));
-                let tier_ok = spec.tier.as_deref().is_none_or(|t| node.tier == *t);
-                if !excluded_hit
-                    && now.saturating_duration_since(*created_at).as_secs() < SESSION_TTL_SECS
-                    && still_live
-                    && country_ok
-                    && tier_ok
-                    && !self.is_node_quarantined(node, &spec.target_domain, now)
-                {
-                    return Some(Arc::clone(node));
+            if session_id.len() <= SESSION_ID_MAX_BYTES {
+                if let Some(entry) = self.session_store.get(session_id) {
+                    let (node, created_at) = entry.value();
+                    // R2-1：粘滞命中后必须复核“当前池”权重，derate 到 0 的会话要迁移，
+                    // 不能沿用绑定时刻克隆的老权重。
+                    // P2：同时复核 proto——绑 socks 节点的会话发默认请求必须迁走
+                    // （否则 socks 节点漏进 HttpPeer 必失败；反之亦然）。
+                    let want_proto = spec.proto.unwrap_or(crate::model::EgressProto::Http);
+                    let still_live = self
+                        .pools
+                        .load()
+                        .iter()
+                        .find(|n| n.addr == node.addr)
+                        .is_some_and(|n| n.weight > 0 && n.proto == want_proto);
+                    let excluded_hit = excluded.iter().any(|e| e == &node.addr);
+                    // REVIEW-R2 Q9：`elapsed()` 时钟回拨即 panic（数据面不可炸），与
+                    // `sweep_expired_at` 同口径改 saturating（回拨按 0 处理，会话多活一轮）。
+                    // NEXT-A5：粘滞命中复核 country/tier 约束（spec.tier 入口已归一，
+                    // 与 matches 同语义；换约束即迁移，不再粘错节点）。
+                    let country_ok = spec
+                        .country
+                        .as_deref()
+                        .is_none_or(|c| node.country.eq_ignore_ascii_case(c));
+                    let tier_ok = spec.tier.as_deref().is_none_or(|t| node.tier == *t);
+                    if !excluded_hit
+                        && now.saturating_duration_since(*created_at).as_secs() < SESSION_TTL_SECS
+                        && still_live
+                        && country_ok
+                        && tier_ok
+                        && !self.is_node_quarantined(node, &spec.target_domain, now)
+                    {
+                        return Some(Arc::clone(node));
+                    }
                 }
             }
         }
@@ -280,9 +315,12 @@ impl RouterEngine {
         let selected = pick_weighted(&candidates, &mut rng);
 
         // 4. Bind new session.
+        // OPT-R4 A7：落表前过准入（超长/满水位新 key 不落表，只用无状态选中节点）。
         if let (Some(ref session_id), Some(ref node)) = (&spec.session_id, &selected) {
-            self.session_store
-                .insert(session_id.clone(), (Arc::clone(node), now));
+            if session_sticky_allowed(&self.session_store, session_id) {
+                self.session_store
+                    .insert(session_id.clone(), (Arc::clone(node), now));
+            }
         }
 
         selected
@@ -308,6 +346,8 @@ impl RouterEngine {
             .collect();
         next.extend(nodes.into_iter().map(Arc::new));
         self.pools.store(Arc::new(next));
+        // OPT-R4 B11：merge（含空快照）后顺带清理僵尸因子。
+        self.prune_free_scales();
     }
 
     /// 供应商套利调权（0=摘除熔断，100=恢复满权）。
@@ -331,12 +371,29 @@ impl RouterEngine {
         self.pools.store(Arc::new(next));
     }
 
+    /// OPT-R4 B11：清理僵尸因子——池内已无对应 vendor×country 节点即删键。
+    /// 缺省回到 1.0；节点恢复靠下轮 merge 健康快照重插，不靠残留 0 因子。
+    fn prune_free_scales(&self) {
+        let live: std::collections::HashSet<(String, String)> = self
+            .pools
+            .load()
+            .iter()
+            .map(|n| scale_key(&n.provider, &n.country))
+            .collect();
+        self.free_scale.retain(|k, _| live.contains(k));
+    }
+
     /// P3 免费独立套利：按 vendor×country 等比缩放权重（`factor` 来自 `free_pool_action`）。
     /// 写时复制同 `adjust_vendor_weight`；`factor<=0` 即摘除（matches 滤 0），
     /// 复检 upsert 按 health 重置权重即恢复；`factor>1` 不用（free 永不自动抬权，调用方保证）。
     pub fn scale_vendor_weights(&self, vendor: &str, country: &str, factor: f64) {
         // NEXT-B6：因子同步记表（含 factor<=0 显式摘除，合并后依然生效）。
-        self.free_scale.insert(scale_key(vendor, country), factor);
+        // OPT-R4 B11：显式 1.0 等价缺省——删键不残留（表随 scale 插入永不清理即僵尸）。
+        if factor == 1.0 {
+            self.free_scale.remove(&scale_key(vendor, country));
+        } else {
+            self.free_scale.insert(scale_key(vendor, country), factor);
+        }
         let guard = self.pools.load();
         let next: Vec<Arc<ProxyNode>> = guard
             .iter()
@@ -1148,5 +1205,115 @@ mod tests {
         };
         let moved = r.select_node(&open_sess).expect("migrate");
         assert_eq!(moved.provider, "mock-a");
+    }
+
+    #[test]
+    fn opt_r4_a7_overlong_session_is_stateless() {
+        // OPT-R4 A7：超长 session（>64B）当无 session 处理：仍可选路（无状态），
+        // 但不得写入 session_store（防随机长 key 打爆 DashMap），不得 panic。
+        let r = RouterEngine::new(vec![fixtures()[0].clone()]);
+        let long_id = "x".repeat(200);
+        let spec = RoutingSpec {
+            country: None,
+            session_id: Some(long_id),
+            tier: None,
+            target_domain: "example.com".to_string(),
+            proto: None,
+        };
+        assert!(r.select_node(&spec).is_some());
+        assert_eq!(r.session_store.len(), 0);
+        // 非 ASCII 超长同样不得 panic，且走无状态。
+        let uni_id = "🦀".repeat(100);
+        let uni_spec = RoutingSpec {
+            session_id: Some(uni_id),
+            ..spec.clone()
+        };
+        assert!(r.select_node(&uni_spec).is_some());
+        assert_eq!(r.session_store.len(), 0);
+    }
+
+    #[test]
+    fn opt_r4_a7_session_table_capped_new_sessions_stateless() {
+        // OPT-R4 A7：会话表水位上限——满水位后新 key 拒绝粘滞只走无状态
+        // （不新增条目但仍返回节点）；已存 key 仍可粘滞。不得 panic。
+        const CAP: usize = 8192;
+        let r = RouterEngine::new(vec![fixtures()[0].clone()]);
+        for i in 0..CAP {
+            r.session_store.insert(
+                format!("pre-{i}"),
+                (Arc::clone(&r.snapshot_all()[0]), Instant::now()),
+            );
+        }
+        assert_eq!(r.session_store.len(), CAP);
+        let fresh = RoutingSpec {
+            country: None,
+            session_id: Some("fresh-new-session".to_string()),
+            tier: None,
+            target_domain: "example.com".to_string(),
+            proto: None,
+        };
+        assert!(r.select_node(&fresh).is_some());
+        assert_eq!(r.session_store.len(), CAP, "满水位新会话不得新增条目");
+        // 已存 key 仍粘滞（条目数不变）。
+        let old = RoutingSpec {
+            session_id: Some("pre-0".to_string()),
+            ..fresh.clone()
+        };
+        assert!(r.select_node(&old).is_some());
+        assert_eq!(r.session_store.len(), CAP);
+    }
+
+    #[test]
+    fn opt_r4_b11_scale_pruned_when_vendor_vanishes() {
+        // OPT-R4 B11：因子僵尸——节点 TTL 淘汰/merge 空快照后对应键必须清理，
+        // 缺省回到 1.0；新节点恢复不受旧 0 因子牵连。
+        let n = ProxyNode::new(
+            "10.0.0.9".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        let r = RouterEngine::new(vec![n]);
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.0);
+        assert_eq!(r.free_factor("free-gh0", "ZZ"), 0.0);
+        // 模拟 TTL 淘汰后 merge 空快照：该前缀节点清空。
+        r.replace_vendor_nodes("free-", vec![]);
+        assert_eq!(r.free_factor("free-gh0", "ZZ"), 1.0);
+        assert!(r.free_scale.is_empty(), "僵尸因子必须清理");
+        // 恢复：同 vendor×country 新节点不再被旧 0 因子摘除。
+        let fresh = ProxyNode::new(
+            "10.0.0.10".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        r.replace_vendor_nodes("free-", vec![fresh]);
+        let w = r
+            .snapshot_all()
+            .iter()
+            .find(|x| x.ip == "10.0.0.10")
+            .map(|x| x.weight)
+            .unwrap();
+        assert_eq!(w, 10);
+    }
+
+    #[test]
+    fn opt_r4_b11_explicit_one_clears_factor() {
+        // OPT-R4 B11：恢复走显式 1.0——scale(1.0) 与缺省同语义，
+        // 不得在表内残留条目（表随 scale 插入永不清理即红）。
+        let r = RouterEngine::new(vec![fixtures()[0].clone()]);
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.5);
+        assert_eq!(r.free_factor("free-gh0", "ZZ"), 0.5);
+        r.scale_vendor_weights("free-gh0", "ZZ", 1.0);
+        assert_eq!(r.free_factor("free-gh0", "ZZ"), 1.0);
+        assert!(r.free_scale.is_empty(), "显式 1.0 应等价缺省，不得残留");
     }
 }

@@ -107,6 +107,14 @@ fn split_env_list(key: &str, default: &str) -> Vec<String> {
         .collect()
 }
 
+/// A3：主探针信号量关闭时的跳过结果（对齐 pool.rs:92 口径：`acquire_owned`
+/// 失败按失败计，不执行探测；调用方记 `Dead` 走既有 warn 日志，不裸奔全并发）。
+fn skipped_probe_result() -> prober::ProbeResult {
+    prober::ProbeResult::Dead {
+        error: "probe semaphore closed, skipped".to_string(),
+    }
+}
+
 /// R2-8 后台 supervisor：worker 退出（panic 由 `JoinHandle` 捕获/意外返回）
 /// 即计数进 metrics + 指数 backoff（1s 起，封顶 60s）重启。本轮包 CB/sink/
 /// arbitrage 三个常驻消费组（telemetry/prober/sweep/prewarmer 维持现状）。
@@ -282,6 +290,12 @@ async fn main() {
             fetch_interval: env_secs("FREE_FETCH_INTERVAL_SECS", 600),
             ttl: clamp_free_ttl(env_secs("FREE_TTL_SECS", 1800)),
             verify_timeout: env_secs("FREE_VERIFY_TIMEOUT_SECS", 3),
+            // OPT-R4 B3：单源抓取超时＋intake 上限因子（干旱/洪峰运维可调）。
+            fetch_timeout: env_secs("FREE_FETCH_TIMEOUT_SECS", 15),
+            intake_factor: env_str("FREE_INTAKE_FACTOR", "2")
+                .parse::<usize>()
+                .unwrap_or(2)
+                .max(1),
             max_latency_ms: env_str("FREE_MAX_LATENCY_MS", "3000")
                 .parse::<u64>()
                 .unwrap_or(3000),
@@ -434,7 +448,19 @@ async fn main() {
                 let prober = prober.clone();
                 let sem = semaphore.clone();
                 set.spawn(async move {
-                    let _permit = sem.acquire_owned().await;
+                    // A3：对齐 pool.rs:92 ——信号量关闭（acquire Err）直接跳过本次探测，
+                    // 记 Dead（既有 warn 口径），不执行 probe_node（关闭后不再全并发裸奔）。
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            log::debug!(
+                                "[Prober] semaphore closed, skipped probe for {}:{}",
+                                node.ip,
+                                node.port
+                            );
+                            return (node, skipped_probe_result());
+                        }
+                    };
                     let result = prober.probe_node(&node).await;
                     (node, result)
                 });
@@ -656,5 +682,29 @@ mod tests {
             split_env_list("R2T_FREE_URLS_MISSING_XYZ", "https://dflt.example/"),
             vec!["https://dflt.example/"]
         );
+    }
+
+    #[test]
+    fn probe_skipped_result_is_dead_without_probing() {
+        // A3：信号量关闭时的跳过结果必须为 Dead（含可辨文案），构造过程不触网络。
+        match skipped_probe_result() {
+            prober::ProbeResult::Dead { error } => {
+                assert!(
+                    error.contains("semaphore closed"),
+                    "unexpected error: {error}"
+                );
+            }
+            other => panic!("skipped probe must be Dead, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_semaphore_closed_acquire_fails() {
+        // A3 走查锚点：Semaphore::close 后 acquire_owned 必 Err（守卫的触发条件真实
+        // 存在；原 `let _permit = sem.acquire_owned().await;` 把该 Err 吞掉，关闭后
+        // 仍全并发执行 probe_node，与 pool.rs:92 口径不一致）。
+        let sem = Arc::new(Semaphore::new(1));
+        sem.close();
+        assert!(sem.acquire_owned().await.is_err());
     }
 }

@@ -5,8 +5,22 @@ global:
 rule_files:
   - /etc/prometheus/rules.yml
 
+# OPT-R4 C9：Alertmanager 接线（deploy/alertmanager.yml 已备；取消注释＋
+# compose 挂载文件＋`docker compose up -d prometheus` 重载即投递）。
+# alertmanagers:
+#   - static_configs:
+#       - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: "pingora-gateway"
     static_configs:
+      # OPT-R4 C2：host.docker.internal 仅 Docker Desktop 有效；Linux 生产
+      # 把下行改 gateway:9091（容器网关 profile）或宿主 IP:9091（宿主二进制）。
       - targets: ["host.docker.internal:9091"]
     metrics_path: /metrics
+
+  # OPT-R4 C11：redis-exporter（compose profile observability；未跑时
+  # target 为 down（无配套告警，只看 /targets），跑起即有序列）。
+  - job_name: "redis-exporter"
+    static_configs:
+      - targets: ["ipproxy-redis-exporter:9121"]

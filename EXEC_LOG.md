@@ -667,3 +667,28 @@
 - **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 169 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（PONG/Ok，无 SKIP）／bench 编译过／`--release bandit` 12 过（<200ns 断言）。
 - **回归**：plain 200/sticky 200/badkey 403/nohost 400/metrics 200＋SDK 自检＋适配器 mock-b-jp；XLEN 常 0（sink 紧跟，健康）＋CH 3670→3683（+13，与本轮请求数精确对账）；free 两档沿用 Phase B live 证据（pool 7 全 Elite；默认网关 FREE 未开，如实记录不重跑）；Grafana 数据源＋`IPProxyPool GW-R1 Gateway` 面板＋prom 实时序列（2xx/4xx）有数。
 - **落库**：本计划 §状态表 C✅D✅V✅（C6 诚实部分）＋本文件三条目＋TASK 24✅；禁未授权 commit（本次未提交；在途网关 PID:21732 在线）。
+
+### [2026-09-25] 步骤 26 立项: OPT-R4 优化方案冻结（先落库再执行）
+- 计划操作：用户指令“先提交，再准备进一步迭代优化”。已提交 77b49d9（步骤 24＋25，32 文件 ＋1425－160；body.txt 系 curl 残留，未入仓）；派三路并行深读（数据面/免费效果/产品运维缺口）得 36 条→用户选定全做。新建`plan/2026年9月25日-OPT-R4优化方案.md`（A 数据面正确性 11 项→B 免费线效果 12 项→C 运维安全 13 项＋门禁落库）；`TASK_PLAN.md` 步骤 26 置待执行；本文件 append-only 记立项。
+- 验收线：Rust 项 TDD 红→绿；C13（D3 拍板执行）拍板前零执行；B12 新源先离线验证；C6 容器 RUN 沿用有网环境验证结论；本文件 append-only。
+
+### [2026-09-25] 步骤 26-A 完成：数据面正确性（A1~A11，201 绿）
+- **过程**：派 10 路并行实现，6 路触发 provider 限流失败、1 路中途取消，树上残留红测（各文件 TDD 红半截＋router 括号失衡编译挂）；转单人串行收尾。
+- **实际操作**：A1（tenant CAS 循环＋Barrier 8 线程×200 轮真并发测试）/A2（encode_batch 抽取＋queued/ser_failed 分计＋零分支 warn）/A3（semaphore 守卫＋skipped_probe_result＋走查锚点）/A4（saturating_add CAS＋单次 60s 截断）/A5（should_skip_bridge_node 清脏）/A6（RemoteSyncStats 本地计数＋warn＋单次重试；metrics 桥接缺装配点，with_remote_stats 等删留最小，诚实记录）/A7（64B＋8192 水位准入＋落表门）/A8（PREWARM_WAVE_SIZE=100 分波＋wave_count 纯函数）/A9（整轮 deadline＝单跳＋8s＋剩余预算 timeout）/A10（JoinSet＋5s 单路超时＋失败 hold；旧 audit_free_once 无调用方，删除）/A11（17 白名单＋x- 扩展＋HeaderName/Value 校验）。
+- **纠错记录**：router 失衡（A7 包裹多一层少一闭合，补闭合）＋落表点漏门（step4 直插巨 key，补 session_sticky_allowed）/B11 缺方法（补 prune_free_scales＋scale 显式 1.0 删键＋replace/sweep 双接线）/clippy 死代码 4 处（audit_free_once 删/with_remote_stats 删/getters＋wave_count 转 cfg(test)）。
+- **验证结果**：191→201 通过＋0 失败＋4 ignored（本轮 +32，含 agent 遗留测试全收编验证）。
+
+### [2026-09-25] 步骤 26-B 完成：免费线效果（B1~B12）
+- **实际操作**：B1（is_routable_ip＋三源 parse 门＋debug 计数）/B2（披露值须含基线 IP，Via 无害头救回 Elite；旧矩阵测试同步新语义）/B3（fetch_timeout＋intake_factor 入 config＋main 接 FREE_FETCH_TIMEOUT_SECS/FREE_INTAKE_FACTOR＋intake_cap_limit 纯函数）/B4（去重键 ip:port+proto＋首见获胜测试）/B5（fail_marks 指纹窗＋初筛 retain＋8192 粗上限）/B6（Client 附 last_used＋512/10min 淘汰＋2× 整清兜底）/B7（baseline_bases 去重保序＋fallback 轮询；沿用既有 FULL_CHECK_URLS，无新 env）/B8（cap_intake 改加权确定截断：Elite 历史＋源序＋稳定排序；shuffle 删除）/B9（metrics 四序列＋render＋run_once 三处打点：capped/baseline/evicted/fetch）/B10（首页 conditional_get＋全 304 回 not_modified＋失败页容忍）/B11 见 26-A（router 侧）/B12（monosans http 393 行＋socks5 444 行经 VPN 路径实测 200＋行形态对，入 DEFAULT_GITHUB_URL＋fixture 测试；TheSpeedX 同实测 200＋2714 行但停更＋体量淹没 intake，记落选）。
+- **纠错记录**：B8 测试期望初写反源序（Elite 内仍按源序，已修正 gh0 先）；cap_intake borrowck（order 表改 owned key）；upsert_full 改 usize 回传（既存调用点语句级兼容零改）；fetch_all 加参（3 测试点同步）；E0502/E0425 逐个清零。
+- **验证结果**：free_pool 54 通过（含新增 13）；全量 201 绿。
+
+### [2026-09-25] 步骤 26-C 完成：运维安全（C1~C13，C13 零执行）
+- **实际操作**：C1（compose restart unless-stopped×4＋config 验证）/C2（prometheus.yml Linux 注释）/C3（USER_MANUAL provisioning 优先＋中英免费线 D1 同步；156 旧数查无，不改）/C4（stop 改单次 CIM＋mock 精确杀；诱饵 python 实测存活）/C5（.env.example＋compose ${} 化；.env 已忽略）/C6（redis requirepass＋127.0.0.1 绑定；测试 URL 改 env-or；ipp.ps1 .env 加载＋带密探活＋子进程 env 继承；CH/Grafana 只绑回环不动密码）/C7（install_watchdog.ps1 注册/卸载/状态；status 实测；install 需管理员未执行，符合模板口径）/C8（CI 加 PSScriptAnalyzer＋compileall＋rules/alertmanager yaml＋dashboard json＋compose config＋8916 正向断言；live.yml 加注 CI 无密语义）/C9（supervisor 改 >3/15m＋alertmanager.yml 骨架＋compose 挂载注释）/C10（看护 Write-Log 50MB 自转）/C11（exporter profile 服务＋prom job＋XLEN 规则解注并修正 key 为 stream:proxy:telemetry）/C12（backup.ps1：RDB＋FREEZE＋双卷 tar；CH File 备份需白名单实锤改 FREEZE；卷名必须全名实锤；操作手册 OPERATION 同步）/C13 零执行。
+- **纠错记录（根因级）**：全仓 LF 无 BOM＋中文 .ps1 在本机 PS5.1 下非确定性误解析——变量赋值恒空（$GwExe/$bk/Get-Variable 查无）、phantom UnexpectedToken（行号错位）、首行输出丢失；对照实验证明：同文件 CRLF 重写即好、同内容 Temp 小文件即好、ipp.ps1（BOM＋LF）恒好。修复：全仓 .ps1 补 BOM（最小 diff）；看护/backup 保留内联字面量形态（经数十次 live 验证，不回退）；BOM 后看护 enter 标记恢复打印，看护 kill→重拉复验通过（单 PID＋mock 包体）。
+- **验证结果**：compose config OK＋四容器重建 PONG；备份全量四件套落地（rdb＋freeze＋双 tar）；看护重拉带 env（无 NOAUTH）；stop 精确性（诱饵存活）；rules 5 条 health ok（XLEN 无数据静默）。
+
+### [2026-09-25] 步骤 26-V 完成：最终门禁＋回归＋落库
+- **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 201 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（带密 REDIS_URL＋CLICKHOUSE_PASSWORD，无 SKIP）／bench 编译过／`--release bandit` 12 过。
+- **回归**：plain 200/sticky 200/badkey 403/nohost 400/metrics 200＋D1 四断言（403/403/503/200）＋SDK 自检＋适配器 mock-b-jp；XLEN 10136→10149（+13；流内保留，消费组 lag=0）＋CH 3698→3711（+13 精确对账）；Grafana 数据源＋面板＋prom 实时序列有数；SupervisorRestarted firing 系本轮 kill 演练 churn（测试制造，非生产信号）。
+- **落库**：本计划 §状态表 A✅B✅C✅V✅＋本文件四条目＋TASK 26✅；禁未授权 commit（本次未提交；在途网关在线）。

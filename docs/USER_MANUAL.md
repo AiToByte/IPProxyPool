@@ -49,14 +49,14 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 | 免费水位/verify/geo | 第 5 面板 | 水位突降查 `free_pool_source_suspended` 与源站 |
 | Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长查消费组 lag |
 | 落库 | `SELECT count() FROM proxy.proxy_telemetry_log` | 不动看 `[ChSink]` 日志 |
-| 首配 Grafana | `deploy/grafana/dashboard.json` 经 `/api/dashboards/db` 导入＋配 Prometheus 数据源 `http://prometheus:9090`（uid `prometheus`，落 named volume 后持久） | 面板无数据先查数据源连通 |
+| 首配 Grafana | provisioning 自动加载（数据源＋面板随 compose 自带，零手动）；手动回退才走 `/api/dashboards/db` 导入 `deploy/grafana/` 下 json＋配 Prometheus 数据源 `http://prometheus:9090`（uid `prometheus`） | 面板无数据先查数据源连通 |
 
 ### 5. 故障速查
 
 - 全域 503：池被隔离摘空或 mocks 挂了；
 - 403 全拦截：Key 未注册（默认 `default_key` 已注册）；
 - 402：租户欠费，充值后恢复；
-- 免费线零信任：禁认证/cookie/支付/银行流量；生产建议 `FREE_ENABLED=1＋FREE_REQUIRE_ELITE=1`；
+- 免费线零信任：禁认证/cookie/支付/银行流量（D1 起网关强制 403）；生产建议 `FREE_ENABLED=1＋FREE_REQUIRE_ELITE=1`；
 - Windows 传 JSON 给 redis-cli 丢引号：用 `log/redis_inject.py`。
 
 ### 6. FAQ
@@ -111,14 +111,14 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 | Free level/verify/geo | 5th panel | level drop → `free_pool_source_suspended` and sources |
 | Stream backlog | `XLEN stream:proxy:telemetry` | keeps growing → consumer lag |
 | Landing | `SELECT count() FROM proxy.proxy_telemetry_log` | frozen → `[ChSink]` logs |
-| First-time Grafana | import `deploy/grafana/dashboard.json` via `/api/dashboards/db` + Prometheus datasource `http://prometheus:9090` (uid `prometheus`, persisted in named volume) | no data → check datasource health first |
+| First-time Grafana | auto-loaded by provisioning (datasource + panels ship with compose, zero manual steps); manual fallback only: import jsons under `deploy/grafana/` via `/api/dashboards/db` + Prometheus datasource `http://prometheus:9090` (uid `prometheus`) | no data → check datasource health first |
 
 ### 5. Quick troubleshooting
 
 - Global 503: pool quarantined empty or mocks down;
 - All 403: key unregistered (`default_key` is pre-registered);
 - 402: tenant out of balance, top up to recover;
-- Free zero-trust: no auth/cookie/payment/banking traffic; production advice `FREE_ENABLED=1 + FREE_REQUIRE_ELITE=1`;
+- Free zero-trust: no auth/cookie/payment/banking traffic (gateway-enforced 403 since D1); production advice `FREE_ENABLED=1 + FREE_REQUIRE_ELITE=1`;
 - Windows redis-cli drops JSON quotes: use `log/redis_inject.py`.
 
 ### 6. FAQ

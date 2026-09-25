@@ -31,6 +31,8 @@
 - [x] **步骤 23**: VPN-IMMUNE 加固（共享Client禁用系统代理+探针基线直连+三路对照）方案见`plan/2026年9月23日-VPN-IMMUNE加固实施计划.md`（H1~H4） ✅ 已完成（157 单测+机制实锤双面验证+三路对照G≠V，证据见 EXEC_LOG 步骤 23 条+log/gw23*.out/err）
 - [x] **步骤 24**: NEXT全迭代（B免费效果/A数据面/C运维产品化/D安全收紧，20项）方案见`plan/2026年9月24日-NEXT全迭代实施计划.md` ✅ 已完成（169 单测＋live 4＋bandit 12＋四门绿＋回归全绿；C6 容器 RUN 环境阻断诚实部分，D3 零执行；证据见 EXEC_LOG 步骤 24-C/D/V 条）
 - [x] **步骤 25**: PORT-8916迁移（网关默认端口避开cvat traefik争用）方案见`plan/2026年9月24日-PORT-8916迁移实施计划.md` ✅ 已完成（168 单测＋四门绿＋:8916 全回归＋traefik 未动；证据见 EXEC_LOG 步骤 25 条）
+- [x] **步骤 26**: OPT-R4 优化（A 数据面正确性/B 免费线效果/C 运维安全，36 项）方案见`plan/2026年9月25日-OPT-R4优化方案.md` ✅ 已完成（201 单测＋live 4＋bandit 12＋四门绿＋回归全绿；证据见 EXEC_LOG 步骤 26-A/B/C/V 条）
+
 
 ## 关键决策与约束
 - Docker一键起依赖；三家全Mock首轮，真Key后补灰度；LinUCB完整d=4 alpha0.4起；指纹基础版不碰utls/boring

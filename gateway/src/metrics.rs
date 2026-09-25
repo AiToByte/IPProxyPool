@@ -73,6 +73,28 @@ pub struct MetricsRegistry {
     geo_lookups: DashMap<String, AtomicU64>,
     /// P3 exit-国家分歧计数（`geoip_mismatch_total` 渲染；只收实锤分歧，见 `exit_matches_source`）。
     geo_mismatch: AtomicU64,
+    /// OPT-R4 B9：进检截断丢弃累计（`free_pool_intake_capped_total` 渲染；cap_intake 截掉量）。
+    free_intake_capped: AtomicU64,
+    /// OPT-R4 B9：基线不可达降级轮次（`free_pool_baseline_fail_total` 渲染；baseline None 即记）。
+    free_baseline_fail: AtomicU64,
+    /// OPT-R4 B9：容量淘汰累计（`free_pool_evicted_total` 渲染；evict_if_over_capacity 淘汰量）。
+    free_evicted: AtomicU64,
+    /// OPT-R4 B9：按源抓取耗时和（`free_pool_source_fetch_ms_sum{source}` 渲染；饱和累加）。
+    free_fetch_ms_sum: DashMap<String, AtomicU64>,
+    /// OPT-R4 B9：按源抓取次数（`free_pool_source_fetch_ms_count{source}` 渲染；与 sum 配对算均值）。
+    free_fetch_count: DashMap<String, AtomicU64>,
+}
+
+/// OPT-R4 A4：u64 饱和累加（CAS 循环；长稳运行 sum 不回绕，Prometheus sum 曲线不倒退）。
+fn saturating_add(target: &AtomicU64, delta: u64) {
+    let mut cur = target.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_add(delta);
+        match target.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 impl MetricsRegistry {
@@ -117,6 +139,11 @@ impl MetricsRegistry {
             free_nodes_by_proto: DashMap::new(),
             geo_lookups: DashMap::new(),
             geo_mismatch: AtomicU64::new(0),
+            free_intake_capped: AtomicU64::new(0),
+            free_baseline_fail: AtomicU64::new(0),
+            free_evicted: AtomicU64::new(0),
+            free_fetch_ms_sum: DashMap::new(),
+            free_fetch_count: DashMap::new(),
         }
     }
 
@@ -225,6 +252,37 @@ impl MetricsRegistry {
     pub fn note_geo_mismatch(&self) {
         self.geo_mismatch.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// OPT-R4 B9：进检截断丢弃累加（调用方：free_pool intake cap 分支，按截掉量记 n）。
+    pub fn note_free_intake_capped(&self, n: u64) {
+        self.free_intake_capped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// OPT-R4 B9：基线不可达记一笔（调用方：free_pool baseline None 降级分支）。
+    pub fn note_free_baseline_fail(&self) {
+        self.free_baseline_fail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// OPT-R4 B9：容量淘汰累加（调用方：evict_if_over_capacity，按淘汰量记 n）。
+    pub fn note_free_evicted(&self, n: u64) {
+        self.free_evicted.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// OPT-R4 B9：按源抓取耗时记一笔（调用方：fetch_all 每源 fetch 返回后记；
+    /// 超时/失败轮也建议记，用于分母完整；和值饱和累加，count+1）。
+    pub fn note_free_source_fetch(&self, source: &str, duration: Duration) {
+        // 单次截断 60s：与 observe 同口径，避免单轮超时污染均值。
+        let ms = duration.as_millis().min(60_000) as u64;
+        self.free_fetch_count
+            .entry(source.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        let sum = self
+            .free_fetch_ms_sum
+            .entry(source.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        saturating_add(sum.value(), ms);
+    }
     /// Record one finished proxied response (called from `logging`).
     ///
     /// R2-6 写侧单原子：只给首个 `le >= value` 的桶 +1（每次 `observe` 恰一次
@@ -267,14 +325,16 @@ impl MetricsRegistry {
             }
         }
         self.bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        let ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        // OPT-R4 A4：单次截断 60_000ms（单轮毛刺不污染 sum）＋和值饱和累加
+        //（CAS 循环，长稳运行不回绕，Prometheus sum 曲线不倒退）。
+        let ms = duration.as_millis().min(60_000) as u64;
         if let Some(i) = DURATION_BUCKETS_MS.iter().position(|bound| ms <= *bound) {
             self.duration_buckets[i].fetch_add(1, Ordering::Relaxed);
         } else {
             // 超最大桶：只进 `_count`/`_sum`（`+Inf` 行），各 `le` 桶不动。
         }
         self.duration_count.fetch_add(1, Ordering::Relaxed);
-        self.duration_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        saturating_add(&self.duration_sum_ms, ms);
     }
 
     /// Render Prometheus text exposition (cumulative buckets).
@@ -506,6 +566,55 @@ impl MetricsRegistry {
             "geoip_mismatch_total {}\n",
             self.geo_mismatch.load(Ordering::Relaxed)
         ));
+        // OPT-R4 B9：免费漏斗四指标（常驻 0 行，PromQL 分母完整；按源耗时 sum+count 配对）。
+        out.push_str(
+            "# HELP free_pool_intake_capped_total FreePool intake nodes dropped by cap.\n",
+        );
+        out.push_str("# TYPE free_pool_intake_capped_total counter\n");
+        out.push_str(&format!(
+            "free_pool_intake_capped_total {}\n",
+            self.free_intake_capped.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP free_pool_baseline_fail_total FreePool ticks degraded on baseline unreachable.\n");
+        out.push_str("# TYPE free_pool_baseline_fail_total counter\n");
+        out.push_str(&format!(
+            "free_pool_baseline_fail_total {}\n",
+            self.free_baseline_fail.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP free_pool_evicted_total FreePool nodes evicted over capacity.\n");
+        out.push_str("# TYPE free_pool_evicted_total counter\n");
+        out.push_str(&format!(
+            "free_pool_evicted_total {}\n",
+            self.free_evicted.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP free_pool_source_fetch_ms_sum FreePool per-source fetch latency sum in ms.\n",
+        );
+        out.push_str("# TYPE free_pool_source_fetch_ms_sum counter\n");
+        let mut fetch_sums: Vec<(String, u64)> = self
+            .free_fetch_ms_sum
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        fetch_sums.sort();
+        for (s, n) in fetch_sums {
+            out.push_str(&format!(
+                "free_pool_source_fetch_ms_sum{{source=\"{s}\"}} {n}\n"
+            ));
+        }
+        out.push_str("# HELP free_pool_source_fetch_ms_count FreePool per-source fetch rounds.\n");
+        out.push_str("# TYPE free_pool_source_fetch_ms_count counter\n");
+        let mut fetch_counts: Vec<(String, u64)> = self
+            .free_fetch_count
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        fetch_counts.sort();
+        for (s, n) in fetch_counts {
+            out.push_str(&format!(
+                "free_pool_source_fetch_ms_count{{source=\"{s}\"}} {n}\n"
+            ));
+        }
         out
     }
 }
@@ -757,6 +866,45 @@ mod tests {
         assert!(r.contains("geoip_lookups_total{result=\"disabled\"} 1"));
         assert!(r.contains("geoip_lookups_total{result=\"hit\"} 1"));
         assert!(r.contains("geoip_mismatch_total 1"));
+    }
+
+    #[test]
+    fn duration_sum_saturates_no_wrap() {
+        // OPT-R4 A4：duration_sum_ms 饱和累加，长稳运行不回绕（Prom sum 曲线不倒退）。
+        let m = MetricsRegistry::new();
+        m.duration_sum_ms.store(u64::MAX - 10, Ordering::Relaxed);
+        m.observe(200, None, 0, Duration::from_millis(5000));
+        assert_eq!(m.duration_sum_ms.load(Ordering::Relaxed), u64::MAX);
+        m.observe(200, None, 0, Duration::from_millis(5000));
+        assert_eq!(m.duration_sum_ms.load(Ordering::Relaxed), u64::MAX);
+        assert!(m
+            .render()
+            .contains(&format!("gateway_processing_duration_ms_sum {}", u64::MAX)));
+    }
+
+    #[test]
+    fn duration_single_observe_truncated() {
+        // OPT-R4 A4：单次 observe 截断 60_000ms，避免单次超大 Duration 污染 sum。
+        let m = MetricsRegistry::new();
+        m.observe(200, None, 0, Duration::from_secs(3600));
+        assert_eq!(m.duration_sum_ms.load(Ordering::Relaxed), 60_000);
+    }
+
+    #[test]
+    fn free_funnel_b9_rendered() {
+        // OPT-R4 B9：免费漏斗四指标（intake_capped/baseline_fail/evicted/按源 fetch 耗时）。
+        let m = MetricsRegistry::new();
+        m.note_free_intake_capped(7);
+        m.note_free_baseline_fail();
+        m.note_free_evicted(3);
+        m.note_free_source_fetch("api0", Duration::from_millis(120));
+        m.note_free_source_fetch("api0", Duration::from_millis(80));
+        let r = m.render();
+        assert!(r.contains("free_pool_intake_capped_total 7"));
+        assert!(r.contains("free_pool_baseline_fail_total 1"));
+        assert!(r.contains("free_pool_evicted_total 3"));
+        assert!(r.contains("free_pool_source_fetch_ms_sum{source=\"api0\"} 200"));
+        assert!(r.contains("free_pool_source_fetch_ms_count{source=\"api0\"} 2"));
     }
 
     #[tokio::test]

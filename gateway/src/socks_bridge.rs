@@ -25,6 +25,68 @@ pub(crate) fn is_hop_header(name: &str) -> bool {
     HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
+/// A11：桥出站允许透传的下游头白名单（小写比较；逐跳头另由 `is_hop_header` 拦截，不在此列）。
+pub(crate) const BRIDGE_FORWARD_HEADERS: [&str; 17] = [
+    "host",
+    "user-agent",
+    "accept",
+    "accept-language",
+    "accept-encoding",
+    "content-type",
+    "content-length",
+    "referer",
+    "origin",
+    "cookie",
+    "authorization",
+    "range",
+    "if-modified-since",
+    "if-none-match",
+    "cache-control",
+    "pragma",
+    "x-requested-with",
+];
+
+/// A11：头名是否允许出站（白名单＋`x-` 业务扩展；`x-proxy-*` 网关控制头永不透传）。
+pub(crate) fn is_allowed_bridge_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("x-proxy-") {
+        return false;
+    }
+    if BRIDGE_FORWARD_HEADERS.contains(&lower.as_str()) {
+        return true;
+    }
+    // 业务自定义头放行 `x-` 前缀（已过逐跳过滤＋HeaderName/Value 校验）。
+    lower.starts_with("x-")
+}
+
+/// A11：出站头清洗（逐跳过滤＋白名单＋HeaderName/HeaderValue 校验；非法跳过记 debug）。
+///
+/// - 桥内无 metrics 句柄，按任务口径走 `debug!` 日志（调用方失败另有 bridge_errors 计数）；
+/// - 返回可安全进 reqwest 的子集（调用方直接透传，不再二次校验）。
+pub(crate) fn sanitize_bridge_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        if is_hop_header(k) {
+            log::debug!("[SocksBridge] skip hop header {k}");
+            continue;
+        }
+        if !is_allowed_bridge_header(k) {
+            log::debug!("[SocksBridge] skip non-allowlisted header {k}");
+            continue;
+        }
+        if k.parse::<http::HeaderName>().is_err() {
+            log::debug!("[SocksBridge] skip illegal header name {k:?}");
+            continue;
+        }
+        if v.parse::<http::HeaderValue>().is_err() {
+            log::debug!("[SocksBridge] skip illegal header value for {k}");
+            continue;
+        }
+        out.push((k.clone(), v.clone()));
+    }
+    out
+}
+
 /// 桥入参（网关 filter 把下游请求翻译成此形态；body 由 `read_request_body` 来）。
 pub struct BridgeRequest {
     pub method: String,
@@ -84,6 +146,11 @@ impl SocksBridge {
         }
     }
 
+    /// A9：单跳出站 timeout（整轮总预算＝此值＋8s 松弛，见 gateway `socks_overall_budget`）。
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     fn client_for(&self, node: &ProxyNode) -> Option<reqwest::Client> {
         if let Some(mut hit) = self.clients.get_mut(&node.addr) {
             hit.last_used = Instant::now();
@@ -117,11 +184,17 @@ impl SocksBridge {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("socks bridge: bad method {}: {e}", req.method))?;
         let mut out = client.request(method, &req.url);
-        for (k, v) in &req.headers {
-            if is_hop_header(k) {
+        // A11：下游头经白名单＋HeaderName/Value 校验后透传（非法跳过记 debug，防 reqwest 侧 panic／投毒上游）。
+        for (k, v) in &sanitize_bridge_headers(&req.headers) {
+            // 已校验合法，此处解析必成功；防御性兜底：万一失败则跳过（不 panic）。
+            let (Ok(name), Ok(val)) = (
+                k.parse::<http::HeaderName>(),
+                v.parse::<http::HeaderValue>(),
+            ) else {
+                log::debug!("[SocksBridge] skip unverified header {k}");
                 continue;
-            }
-            out = out.header(k.as_str(), v.as_str());
+            };
+            out = out.header(name, val);
         }
         if let Some(b) = req.body {
             out = out.body(b);
@@ -187,6 +260,32 @@ mod tests {
             10,
         )
         .with_proto(EgressProto::Socks5)
+    }
+
+    #[test]
+    fn bridge_header_sanitize_drops_illegal_and_non_allowlisted() {
+        // A11：非法头名/值不得进 reqwest（防 panic/投毒上游）；网关控制头与逐跳头不得透传。
+        let input = vec![
+            ("host".to_string(), "example.com".to_string()),
+            ("x-custom".to_string(), "yes".to_string()),
+            ("connection".to_string(), "close".to_string()),
+            ("X-Proxy-Proto".to_string(), "socks5".to_string()),
+            ("bad header".to_string(), "v".to_string()),
+            ("x-ok".to_string(), "bad\nvalue".to_string()),
+            ("via".to_string(), "1.1 proxy".to_string()),
+        ];
+        let out = sanitize_bridge_headers(&input);
+        assert!(out.iter().any(|(k, v)| k == "host" && v == "example.com"));
+        assert!(out.iter().any(|(k, v)| k == "x-custom" && v == "yes"));
+        assert!(!out
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("connection")));
+        assert!(!out
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("X-Proxy-Proto")));
+        assert!(!out.iter().any(|(k, _)| k == "bad header"));
+        assert!(!out.iter().any(|(k, _)| k == "x-ok"));
+        assert!(!out.iter().any(|(k, _)| k.eq_ignore_ascii_case("via")));
     }
 
     #[test]

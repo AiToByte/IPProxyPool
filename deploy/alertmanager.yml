@@ -1,0 +1,18 @@
+# IPProxyPool Alertmanager skeleton (OPT-R4 C9).
+# 现状：空接收器占位（告警先在 Prometheus UI/API 可见；生产需填 webhook/
+# 邮箱后，在 prometheus.yml 取消 alertmanagers 段注释并重载）。
+# 验证：python yaml 解析（CI）；全量联调待 Alertmanager 落地后补 firing 演练。
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: "empty"
+
+receivers:
+  - name: "empty"
+
+inhibit_rules: []

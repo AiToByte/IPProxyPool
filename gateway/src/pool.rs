@@ -44,6 +44,17 @@ pub struct ConnectionPrewarmer {
 /// R2-7 默认建链并发上限（与百节点池同量级；单轮齐探至多 100 并发建链）。
 pub const PREWARM_MAX_CONCURRENT: usize = 100;
 
+/// A8 单波任务上限：`warm_once` 按此分块串行波次，单波存活任务恒 ≤ 100
+///（FREE_MAX 2000 候选即 20 波；每波 1s 建链超时，最坏 ~20s 仍在 30s 滴答内）。
+pub const PREWARM_WAVE_SIZE: usize = 100;
+
+/// A8 分块纯函数：`total` 候选按每波 `wave` 个分波（上取整）；`wave == 0` 按 1 处理，不 panic。
+/// 仅单测使用（生产分块内联在 warm_once）。
+#[cfg(test)]
+pub(crate) fn wave_count(total: usize, wave: usize) -> usize {
+    total.div_ceil(wave.max(1))
+}
+
 impl ConnectionPrewarmer {
     pub fn new(router: Arc<RouterEngine>) -> Self {
         Self::with_max_concurrent(router, PREWARM_MAX_CONCURRENT)
@@ -64,11 +75,12 @@ impl ConnectionPrewarmer {
         self
     }
 
-    /// OPT-6 单轮预热：真 TCP 预建链（R2-7 信号量限流）。
+    /// OPT-6 单轮预热：真 TCP 预建链（R2-7 信号量限流＋A8 分块波次）。
     ///
     /// - 建链环：http 节点 `TcpStream::connect(addr)`；socks 节点只做
     ///   `greet_only`（P2：证明端口说 SOCKS，不对外 CONNECT，礼貌性）。
-    ///   并发 spawn（信号量封顶），统计 `connected/failed`（失败只 debug，不抛错）；
+    ///   分块串行波次（单波任务 ≤ `PREWARM_WAVE_SIZE`，波内并发 spawn＋信号量封顶），
+    ///   统计 `connected/failed`（失败只 debug，不抛错）；
     /// - 候选集：默认 spec（http）＋显式 socks5/socks4 spec 三路并取
     ///   （P2：默认隔离下 socks 对 `RoutingSpec::default()` 不可见，不并取即漏探）；
     /// - 永不 panic：空池返回零统计；单节点超时/拒连只记 `failed`。
@@ -81,39 +93,45 @@ impl ConnectionPrewarmer {
             };
             candidates.extend(self.router.get_healthy_candidates(&spec));
         }
-        // 真探测（并发 + 信号量封顶，1s 超时）：只探“节点可达/说协议”，不发应用层字节。
+        // 真探测（分块串行波次＋信号量封顶，1s 超时）：只探“节点可达/说协议”，不发应用层字节。
+        // A8：替代“按候选裸 spawn”（FREE_MAX 2000 即 2000 存活任务）的任务海啸；
+        // 单波存活任务 ≤ PREWARM_WAVE_SIZE，信号量仍限波内建链并发（FD 有界）；
+        // 计数口径不变（nodes/tickets==候选数，failed==nodes-connected）。
         let nodes = candidates.len();
-        let mut handles = Vec::with_capacity(nodes);
-        for node in candidates {
-            let sem = self.semaphore.clone();
-            handles.push(tokio::spawn(async move {
-                // 许可在建链期间持有：并发建链数恒 ≤ 上限（FD 有界）。
-                // 拿不到许可（信号量关闭，理论不可达）按失败计，不 panic。
-                let _permit = match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                };
-                match node.proto {
-                    EgressProto::Http => tokio::time::timeout(
-                        PREWARM_TCP_TIMEOUT,
-                        tokio::net::TcpStream::connect(node.addr.clone()),
-                    )
-                    .await
-                    .is_ok_and(|r| r.is_ok()),
-                    EgressProto::Socks5 | EgressProto::Socks4 => tokio::time::timeout(
-                        PREWARM_TCP_TIMEOUT,
-                        crate::socks_handshake::greet_only(&node.ip, node.port, node.proto),
-                    )
-                    .await
-                    .is_ok_and(|r| r.is_ok()),
-                }
-            }));
-        }
         let mut connected = 0usize;
-        for h in handles {
-            // Join 失败（任务 panic/取消）按 `failed` 计，不向上传播。
-            if let Ok(true) = h.await {
-                connected += 1;
+        for chunk in candidates.chunks(PREWARM_WAVE_SIZE) {
+            let mut handles = Vec::with_capacity(chunk.len());
+            for node in chunk {
+                let node = node.clone();
+                let sem = self.semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    // 许可在建链期间持有：并发建链数恒 ≤ 上限（FD 有界）。
+                    // 拿不到许可（信号量关闭，理论不可达）按失败计，不 panic。
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return false,
+                    };
+                    match node.proto {
+                        EgressProto::Http => tokio::time::timeout(
+                            PREWARM_TCP_TIMEOUT,
+                            tokio::net::TcpStream::connect(node.addr.clone()),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok()),
+                        EgressProto::Socks5 | EgressProto::Socks4 => tokio::time::timeout(
+                            PREWARM_TCP_TIMEOUT,
+                            crate::socks_handshake::greet_only(&node.ip, node.port, node.proto),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok()),
+                    }
+                }));
+            }
+            for h in handles {
+                // Join 失败（任务 panic/取消）按 `failed` 计，不向上传播。
+                if let Ok(true) = h.await {
+                    connected += 1;
+                }
             }
         }
         let failed = nodes.saturating_sub(connected);
@@ -253,6 +271,21 @@ mod tests {
         assert_eq!(s.connected, 1, "loopback listener must connect");
         assert_eq!(s.failed, 0);
         drop(listener);
+    }
+
+    #[test]
+    fn prewarm_wave_count_covers_large_pool() {
+        // A8：spawn 任务 burst 难直测（任务数是运行时行为），故抽出分块纯函数测波次语义：
+        // 总候选按 wave 上取整分波，单波存活任务 ≤ wave（FREE_MAX 2000 即 20 波）。
+        assert_eq!(super::wave_count(0, 100), 0);
+        assert_eq!(super::wave_count(1, 100), 1);
+        assert_eq!(super::wave_count(100, 100), 1);
+        assert_eq!(super::wave_count(101, 100), 2);
+        assert_eq!(super::wave_count(150, 100), 2);
+        assert_eq!(super::wave_count(2000, 100), 20);
+        // wave==0 防御：按 1 处理，不 panic。
+        assert_eq!(super::wave_count(5, 0), 5);
+        assert_eq!(super::PREWARM_WAVE_SIZE, 100);
     }
 
     #[tokio::test]

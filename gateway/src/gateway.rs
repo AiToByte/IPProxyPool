@@ -204,6 +204,29 @@ fn bridge_url_for(uri: &http::Uri, host: Option<&str>) -> Option<String> {
     }
 }
 
+/// A5：SOCKS 桥防御分支判定＋清脏（`proto==Http` 即跳过换下一个）。
+///
+/// - `true`＝跳过本节点：调用方直接 `continue`，此处已把上轮 attempt 残留的
+///   `ctx.current_node` 置 None，否则 `logging` 会把上轮节点当本次做
+///   bandit／计量／遥测（错归因）；
+/// - `false`＝正常 socks 节点：不碰 `current_node`（调用方随后落本次节点）。
+pub(crate) fn should_skip_bridge_node(ctx: &mut ProxyContext, node: &ProxyNode) -> bool {
+    if node.proto == EgressProto::Http {
+        ctx.current_node = None;
+        return true;
+    }
+    false
+}
+
+/// A9：SOCKS 桥整轮总预算（单跳 timeout＋8s 松弛）。
+///
+/// - 防 `20s×(max_retries+1)` 最坏 80s 无总 deadline 拖死请求；
+/// - 首成功即返语义不变：预算只截尾，不改选路／重试顺序；
+/// - 单 attempt 也给足一次全量＋松弛，不因预算不足误杀首试。
+pub(crate) fn socks_overall_budget(_attempts: usize, per_attempt: Duration) -> Duration {
+    per_attempt.saturating_add(Duration::from_secs(8))
+}
+
 impl SmartProxyGateway {
     /// 无状态请求的 LinUCB 选路（无排除兼容入口；网关重试路径走 excluding 版）。
     #[allow(dead_code)]
@@ -328,7 +351,14 @@ impl SmartProxyGateway {
             self.bandit_engine
                 .extract_context(&ctx.routing_spec.target_domain)
         });
+        // A9：整轮总 deadline（单跳 timeout＋8s 松弛；防 20s×N 最坏 80s 拖死请求）。
+        let deadline = std::time::Instant::now() + socks_overall_budget(attempts, bridge.timeout());
         for _ in 0..attempts {
+            // A9：总预算耗尽即停，不再起新跳（剩余预算递减语义的落地）。
+            if std::time::Instant::now() >= deadline {
+                log::warn!("[SocksBridge] overall budget exhausted, stop retrying");
+                break;
+            }
             let Some(node) = self.pick_socks_candidate(
                 &ctx.routing_spec,
                 &ctx.failed_addrs,
@@ -337,8 +367,10 @@ impl SmartProxyGateway {
             ) else {
                 break;
             };
-            if node.proto == EgressProto::Http {
-                continue; // 防御分支：正常走不到（router 已按 spec.proto 过滤）。
+            // A5：Http 防御分支经 helper（跳过前清上轮残留，防 logging 错归因；
+            // 正常走不到，router 已按 spec.proto 过滤）。
+            if should_skip_bridge_node(ctx, &node) {
+                continue;
             }
             ctx.current_node = Some(Arc::clone(&node));
             ctx.transferred_bytes = 0; // OPT-3：只计最后 attempt
@@ -348,15 +380,25 @@ impl SmartProxyGateway {
                 headers: headers.clone(),
                 body: body.clone(),
             };
-            match bridge.fetch(&node, breq).await {
-                Ok(resp) => {
+            // A9：单跳受剩余总预算约束（总预算见循环前 deadline；超时按失败计，
+            // 首成功即返语义不变）。
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                log::warn!(
+                    "[SocksBridge] overall budget exhausted before {}",
+                    node.addr
+                );
+                break;
+            }
+            match tokio::time::timeout(remaining, bridge.fetch(&node, breq)).await {
+                Ok(Ok(resp)) => {
                     // REVIEW-R2 Q9：egress 已发生即记账（写下游失败仍计量出站成本；
                     // OPT-3 只计最后 attempt 口径不变，`?` 前先赋值）。
                     ctx.transferred_bytes = resp.body.len() as u64;
                     self.write_bridge_response(session, resp).await?;
                     return Ok(());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::warn!("[SocksBridge] via {} failed: {e}", node.addr);
                     // NEXT-A4：桥失败可观测（换节点重试语义不变）。
                     self.metrics.note_bridge_error();
@@ -364,6 +406,17 @@ impl SmartProxyGateway {
                     if ctx.retry_count < ctx.max_retries {
                         ctx.retry_count += 1;
                     }
+                }
+                Err(_) => {
+                    // A9：整轮总 deadline 命中（单跳 hanging 被剩余预算截断）；
+                    // 按失败计一笔后直接截尾，不再起新跳。
+                    log::warn!("[SocksBridge] via {} overall timeout", node.addr);
+                    self.metrics.note_bridge_error();
+                    record_failed_addr(ctx);
+                    if ctx.retry_count < ctx.max_retries {
+                        ctx.retry_count += 1;
+                    }
+                    break;
                 }
             }
         }
@@ -1066,6 +1119,63 @@ mod tests {
             Some("http://api.target.com/p?q=1")
         );
         assert_eq!(bridge_url_for(&origin, None), None);
+    }
+
+    #[test]
+    fn socks_http_skip_clears_stale_node() {
+        // A5：Http 防御分支 continue 前必须清掉上轮 attempt 残留，否则 logging
+        // 会把上轮节点当本次做 bandit/计量/遥测（错归因）。
+        use crate::model::EgressProto;
+        let mut ctx = ProxyContext {
+            current_node: Some(Arc::new(test_node("10.0.0.9", 8080))),
+            ..ProxyContext::default()
+        };
+        let http_node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        );
+        assert!(http_node.proto == EgressProto::Http);
+        assert!(should_skip_bridge_node(&mut ctx, &http_node));
+        assert!(
+            ctx.current_node.is_none(),
+            "Http 跳过必须清 current_node，防上轮残留错归因"
+        );
+        // socks 节点不跳过、现任不被清。
+        let socks = ProxyNode::new(
+            "9.9.9.10".to_string(),
+            1080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-socks".to_string(),
+            10,
+        )
+        .with_proto(EgressProto::Socks5);
+        ctx.current_node = Some(Arc::new(test_node("10.0.0.8", 8080)));
+        assert!(!should_skip_bridge_node(&mut ctx, &socks));
+        assert!(ctx.current_node.is_some());
+    }
+
+    #[test]
+    fn socks_overall_budget_caps_worst_case() {
+        // A9：20s×4 最坏 80s 必须有总 deadline；首成功即返语义下总预算应远小于累加。
+        let per = Duration::from_secs(20);
+        let budget = socks_overall_budget(4, per);
+        assert!(
+            budget < per * 4,
+            "总预算 {budget:?} 必须小于逐跳累加 {:?}",
+            per * 4
+        );
+        assert_eq!(budget, per + Duration::from_secs(8));
+        // 单 attempt 也给足一次全量＋松弛，不因预算不足误杀首试。
+        assert!(socks_overall_budget(1, per) >= per);
     }
 
     #[test]

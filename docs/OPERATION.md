@@ -106,4 +106,7 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
   `SELECT count() FROM proxy.proxy_telemetry_log` 应随流量涨；不动则看
   网关日志 `[ChSink]`（insert 失败会 hold 住 ack 等 CH 恢复）；
 - Windows 传 JSON 给 redis-cli 会丢引号：用 `log/redis_inject.py`（raw RESP）。
+- OPT-R4 C5/C6 凭据：复制 `.env.example` 为 `.env` 后改密码；`tools/ipp.ps1` 自动加载（CI/显式 env 优先）；compose 用 `${VAR:-缺省}` 引用。依赖端口只绑回环（6379/8123/9090/3000），局域网直达已封。
+- Live 测试（`cargo test -- --ignored`）需带密环境：`$env:REDIS_URL="redis://:xxx@127.0.0.1:6379/"`＋`$env:CLICKHOUSE_PASSWORD="xxx"`（与 .env 同值）；CI 用无密 service 走缺省。
+- OPT-R4 C12 备份恢复：`tools/backup.ps1` 产出 `backup/<stamp>/`（redis-dump.rdb＋ch-telemetry-backup＋grafana-data.tar）。恢复：停服（`ipp.ps1 stop`＋`compose stop`）→ `docker cp` 拷回（rdb→`ipproxy-redis:/data/dump.rdb`；CH 先 `RESTORE TABLE ... FROM File(...)` 到临时表验行数再换名；grafana tar 解回卷）→ 起服＋`SELECT count()` 对账。演练建议：季度一次，用副本表验恢复不碰生产表。
 - D2 局域网敞口声明：`GATEWAY_ADDR` 缺省 `0.0.0.0:8916`，所在局域网可直达网关（无身份即 403 仍需 `X-API-Key`，但裸 HTTP 无加密）。单机用 `GATEWAY_ADDR=127.0.0.1:8916` 收回环；多机用 WireGuard 组网后绑 WG 地址（如 `GATEWAY_ADDR=10.8.0.1:8916`），密钥走 WG，不改网关代码。破坏性收紧（REQUIRE_API_KEY 默认 1＋监听收 127.0.0.1）见 NEXT 计划 D3 提案，待拍板未执行。

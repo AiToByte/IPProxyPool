@@ -138,17 +138,32 @@ impl TenantManager {
     ///
     /// R2-3：允许一次扣成负数（当次流量不断流），欠费由下次 `authenticate` 拦截。
     pub fn release_and_meter(&self, tenant: &TenantAccount, bytes: u64, tier: &str) {
-        // REVIEW-R2 Q6：误调（槽已空）不得 wrap 到 MAX（永久熔断该租户并发）；
-        // 加回＋warn 可观测，正常单次释放行为不变。
-        if tenant.in_flight.load(Ordering::Relaxed) == 0 {
-            // 误调整单直接丢弃（首次释放已计量，重复计量即双重扣费）；只 warn 可观测。
-            log::warn!(
-                "[Tenant] release without slot tenant={} (double-release suspected, dropped)",
-                tenant.tenant_id
-            );
-            return;
+        // OPT-R4 A1：旧 `load==0` 检查与 `fetch_sub` 非原子，并发双释放可同时过检
+        // 把 in_flight 绕回 usize::MAX（永久熔断该租户并发）；改 CAS 循环原子扣槽
+        //（不用 `fetch_sub` 返回值判定：零槽先减后加会瞬时暴露 MAX，可被并发
+        // authenticate 观测到）。零槽误调直接丢弃＋warn。
+        // 可观测说明：MetricsRegistry 暂无租户级 double-release 计数器，不新增指标，
+        // 沿 REVIEW-R2 Q6 口径只打 warn 日志（正常单次释放行为不变）。
+        let mut cur = tenant.in_flight.load(Ordering::Relaxed);
+        loop {
+            if cur == 0 {
+                // 误调整单直接丢弃（首次释放已计量，重复计量即双重扣费）；只 warn 可观测。
+                log::warn!(
+                    "[Tenant] release without slot tenant={} (double-release suspected, dropped)",
+                    tenant.tenant_id
+                );
+                return;
+            }
+            match tenant.in_flight.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
         }
-        tenant.in_flight.fetch_sub(1, Ordering::Relaxed);
         tenant.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         let cost = (bytes as f64 / BYTES_PER_GB) * price_per_gb(tier);
         tenant.balance_usd.fetch_sub(cost, Ordering::Relaxed);
@@ -218,6 +233,41 @@ mod tests {
             0,
             "double release must not wrap in_flight"
         );
+    }
+
+    #[test]
+    fn concurrent_double_release_no_wraparound() {
+        // OPT-R4 A1：`load==0` 检查与 `fetch_sub` 非原子，并发双释放可同时过检
+        // 把 in_flight 绕回 usize::MAX（永久熔断该租户并发）。
+        // Barrier 对齐 8 线程同抢 1 个槽位：旧写法高概率回绕（红），CAS 修复后恒为 0（绿）。
+        // bytes=0 使计量无副作用，只验槽位有界。
+        let m = manager_with("k-a1-race", 10_000, 100);
+        let a = m.authenticate_and_throttle("k-a1-race").expect("auth");
+        assert_eq!(a.in_flight.load(Ordering::Relaxed), 1);
+        for _ in 0..200 {
+            a.in_flight.store(1, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mgr = &m;
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    let b = barrier.clone();
+                    let acc = a.clone();
+                    s.spawn(move || {
+                        b.wait();
+                        mgr.release_and_meter(&acc, 0, "datacenter");
+                    });
+                }
+            });
+            let v = a.in_flight.load(Ordering::Relaxed);
+            assert!(
+                v <= 1,
+                "concurrent double-release must not wrap in_flight, got {v}"
+            );
+            assert_eq!(v, 0, "8 releases on 1 slot must drain to 0, got {v}");
+        }
+        // 计量无副作用（bytes=0）：total_bytes 保持 0，balance 保持 100。
+        assert_eq!(a.total_bytes.load(Ordering::Relaxed), 0);
+        assert!((a.balance_usd.load(Ordering::Relaxed) - 100.0).abs() < 1e-9);
     }
 
     #[test]

@@ -111,6 +111,33 @@ async fn conditional_get(
 /// JSON API 源（默认 Geonode；URL env 可配，见 Task 12）。
 /// port 兼容字符串/数字双形态；缺 country 视为 None（后继标 ZZ）。
 /// R3-5 礼貌轮询：ETag/Last-Modified 缓存＋304（对齐 GitHubSource）。
+/// OPT-R4 B1：可公网回连 IP 判定——过滤 bogon/私网/回环/链路本地/组播/未指定。
+/// 只认 IPv4 点分四段（与三源 parse 口径一致；IPv6/主机名/畸形一律 false，
+/// 调用方跳过）。x.y.z.0 主机位零保持放行（代理端口可配，非 bogon）。
+pub fn is_routable_ip(ip: &str) -> bool {
+    let mut parts = ip.trim().split('.');
+    let mut octets = [0u8; 4];
+    for o in octets.iter_mut() {
+        match parts.next().and_then(|s| s.parse::<u8>().ok()) {
+            Some(v) => *o = v,
+            None => return false,
+        }
+    }
+    if parts.next().is_some() {
+        return false;
+    }
+    let [a, b, _, _] = octets;
+    if a == 0 || a == 127 || a >= 224 {
+        return false;
+    }
+    if a == 10 || (a == 172 && (16..32).contains(&b)) || (a == 192 && b == 168) {
+        return false;
+    }
+    if a == 169 && b == 254 {
+        return false;
+    }
+    true
+}
 pub struct ApiSource {
     pub name: &'static str,
     pub url: String,
@@ -177,9 +204,15 @@ impl ApiSource {
         };
         let arr = v.get("data").and_then(|d| d.as_array());
         let mut out = Vec::new();
+        let mut bogon = 0u32;
         for item in arr.into_iter().flatten() {
             let ip = item.get("ip").and_then(|s| s.as_str()).unwrap_or("");
             if ip.is_empty() {
+                continue;
+            }
+            // OPT-R4 B1：私网/bogon 不进候选（省 TCP 并发槽）。
+            if !is_routable_ip(ip) {
+                bogon += 1;
                 continue;
             }
             if !Self::anonymity_passes(item) {
@@ -216,6 +249,9 @@ impl ApiSource {
                 source: source.to_string(),
             });
         }
+        if bogon > 0 {
+            log::debug!("[FreePool] api {source} dropped {bogon} bogon ips pre-TCP");
+        }
         out
     }
 }
@@ -241,8 +277,27 @@ impl Source for ApiSource {
 impl ApiSource {
     /// NEXT-B2：多页并发抓取（plain-GET；ETag 只适用于单页礼貌轮询，多页礼貌靠
     /// 上限 5 页＋外层 15s 超时）。单页失败容忍（其余页照常合并）；全失败才 Err。
+    /// OPT-R4 B10：首页走 conditional_get（复用源级 etag/last_modified；304 即
+    /// 本页无变更，不计失败；etag 按源共享的近似语义见注释）。
     async fn fetch_pages(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
-        let futs: Vec<_> = (1..=self.pages)
+        // 首页条件 GET（与单页路径共享 etag 存储：Geonode ETag 按查询全局，
+        // 页间复用近似成立；不匹配时服务端回 200 全量，正确性安全）。
+        let first =
+            conditional_get(client, &self.page_url(1), &self.etag, &self.last_modified).await;
+        let mut nodes = Vec::new();
+        let mut ok_pages = 0u32;
+        let mut not_modified_pages = 0u32;
+        match first {
+            Ok(Some(body)) => {
+                ok_pages += 1;
+                nodes.extend(Self::parse(self.name, &body));
+            }
+            Ok(None) => {
+                not_modified_pages += 1;
+            }
+            Err(e) => log::warn!("[FreePool] api page 1 fetch failed: {e}"),
+        }
+        let futs: Vec<_> = (2..=self.pages)
             .map(|p| {
                 let url = self.page_url(p);
                 async move {
@@ -252,8 +307,6 @@ impl ApiSource {
             })
             .collect();
         let results = futures::future::join_all(futs).await;
-        let mut nodes = Vec::new();
-        let mut ok_pages = 0u32;
         for (p, r) in results {
             match r {
                 Ok(resp) => match resp.text().await {
@@ -267,6 +320,10 @@ impl ApiSource {
             }
         }
         if ok_pages == 0 {
+            if not_modified_pages > 0 {
+                // 全页 304：源未变更（SourceGuard 豁免，不计熔断）。
+                return Ok(FetchOutcome::not_modified());
+            }
             return Err(format!("all {} api pages failed", self.pages));
         }
         Ok(FetchOutcome::nodes(nodes))
@@ -299,6 +356,7 @@ impl HtmlSource {
     pub fn extract(source: &str, html: &str, default_proto: FreeProto) -> Vec<RawNode> {
         let bytes = html.as_bytes();
         let mut out = Vec::new();
+        let mut bogon = 0u32;
         let mut i = 0;
         while i < bytes.len() {
             if !bytes[i].is_ascii_digit() {
@@ -312,6 +370,12 @@ impl HtmlSource {
                 continue;
             }
             if let Some((ip, port, consumed)) = Self::match_ip_port(&bytes[i..]) {
+                // OPT-R4 B1：HTML 嗅探到的私网/bogon 同样不进候选。
+                if !is_routable_ip(&ip) {
+                    bogon += 1;
+                    i += consumed;
+                    continue;
+                }
                 // 行级协议嗅探：向前 200B 窗口找 socks 标记。
                 let from = i.saturating_sub(200);
                 let window = String::from_utf8_lossy(&bytes[from..i]).to_ascii_lowercase();
@@ -333,6 +397,9 @@ impl HtmlSource {
             } else {
                 i += 1;
             }
+        }
+        if bogon > 0 {
+            log::debug!("[FreePool] html {source} dropped {bogon} bogon ips pre-TCP");
         }
         out
     }
@@ -457,6 +524,7 @@ impl GitHubSource {
     /// 拒绝全零地址（openproxylist 首行 `0.0.0.0:80` 实锤）。
     pub fn parse_with(source: &str, body: &str, default_proto: FreeProto) -> Vec<RawNode> {
         let mut out = Vec::new();
+        let mut bogon = 0u32;
         for line in body.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -488,6 +556,11 @@ impl GitHubSource {
             {
                 continue;
             }
+            // OPT-R4 B1：私网/bogon 不进候选（全零已在上分支丢弃，此处补 RFC1918 等）。
+            if !is_routable_ip(ip) {
+                bogon += 1;
+                continue;
+            }
             out.push(RawNode {
                 ip: ip.to_string(),
                 port,
@@ -495,6 +568,9 @@ impl GitHubSource {
                 country: None,
                 source: source.to_string(),
             });
+        }
+        if bogon > 0 {
+            log::debug!("[FreePool] raw {source} dropped {bogon} bogon ips pre-TCP");
         }
         out
     }
@@ -687,9 +763,12 @@ pub fn classify_anonymity(
     if exit.trim() == baseline_ip.trim() {
         return AnonLevel::Transparent;
     }
-    let disclosed = echoed_headers
-        .keys()
-        .any(|k| DISCLOSURE_HEADERS.contains(&k.to_ascii_lowercase().as_str()));
+    // OPT-R4 B2：披露头必须值含基线 IP 才算暴露——仅键名（如无害 Via）不验值
+    // 会误杀 Elite。基线为空时 `contains("")` 恒真，退化为旧键名口径（保守）。
+    let base = baseline_ip.trim();
+    let disclosed = echoed_headers.iter().any(|(k, v)| {
+        DISCLOSURE_HEADERS.contains(&k.to_ascii_lowercase().as_str()) && v.contains(base)
+    });
     if disclosed {
         AnonLevel::Anonymous
     } else {
@@ -716,8 +795,16 @@ pub struct FullChecker {
     bases: Vec<String>,
     timeout: Duration,
     /// NEXT-B4：per-代理 Client 缓存（逐节点重建浪费连接池；沿 prober OPT-5）。
-    clients: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, reqwest::Client>>>,
+    /// OPT-R4 B6：附 last_used，超 512 项时淘汰 10min 未用（防常开免费线内存泄漏；
+    /// 淘汰后按需重建，正确性安全，只付重建成本）。
+    clients: std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, (reqwest::Client, Instant)>>,
+    >,
 }
+
+/// OPT-R4 B6：Client 缓存上限＋空闲 TTL（与 `client_for` 内联淘汰配套）。
+const CHECKER_CLIENT_CAP: usize = 512;
+const CHECKER_CLIENT_IDLE: Duration = Duration::from_secs(600);
 
 impl FullChecker {
     pub fn new(base_url: String, timeout: Duration) -> Self {
@@ -740,7 +827,9 @@ impl FullChecker {
     }
 
     fn client_for(&self, proxy_url: &str) -> Option<reqwest::Client> {
-        if let Some(c) = self.clients.lock().get(proxy_url) {
+        let mut map = self.clients.lock();
+        if let Some((c, last)) = map.get_mut(proxy_url) {
+            *last = Instant::now();
             return Some(c.clone());
         }
         let proxy = reqwest::Proxy::all(proxy_url).ok()?;
@@ -749,9 +838,17 @@ impl FullChecker {
             .timeout(self.timeout)
             .build()
             .ok()?;
-        self.clients
-            .lock()
-            .insert(proxy_url.to_string(), client.clone());
+        map.insert(proxy_url.to_string(), (client.clone(), Instant::now()));
+        // OPT-R4 B6：超限淘汰 10min 未用（仍超则整清重建，正确性安全）。
+        if map.len() > CHECKER_CLIENT_CAP {
+            let cutoff = Instant::now()
+                .checked_sub(CHECKER_CLIENT_IDLE)
+                .unwrap_or(Instant::now());
+            map.retain(|_, (_, t)| *t > cutoff);
+            if map.len() > CHECKER_CLIENT_CAP * 2 {
+                map.clear();
+            }
+        }
         Some(client)
     }
 
@@ -952,7 +1049,13 @@ pub struct Registry {
     ttl: Duration,
     max_nodes: usize,
     entries: HashMap<String, Entry>,
+    /// OPT-R4 B5：未进池 addr 的失败指纹窗（addr→最近失败时刻；死 IP 在窗口内
+    /// 跳过 TCP 初筛，防 9000 级 raw 洪峰重复建链；粗容量上限，满即清零重计）。
+    fail_marks: HashMap<String, Instant>,
 }
+
+/// OPT-R4 B5：失败指纹粗容量（防 HashMap 无限膨胀；满清零后重计，正确性安全）。
+const FAIL_MARKS_CAP: usize = 8192;
 
 impl Registry {
     /// 默认容量构造（稳定 API：单测＋未来调用方；线上 Worker 走 `with_capacity`）。
@@ -963,6 +1066,7 @@ impl Registry {
             ttl,
             max_nodes: 2000,
             entries: HashMap::new(),
+            fail_marks: HashMap::new(),
         }
     }
 
@@ -971,6 +1075,7 @@ impl Registry {
             ttl,
             max_nodes,
             entries: HashMap::new(),
+            fail_marks: HashMap::new(),
         }
     }
 
@@ -978,6 +1083,7 @@ impl Registry {
     /// P2：全协议进池（Http/Https 走经典转发，Socks4/5 走翻译桥；出站形态存 `node.proto`，
     /// 选路隔离见 `RouterEngine::matches`）。
     /// v1 `upsert(raw, latency, now)` 语义由本函数替代（TCP-only 降级时 anon=Unknown/lat=tcp）。
+    /// OPT-R4 B9：返回本轮连带淘汰条数（调用方记 `free_pool_evicted_total`）。
     pub fn upsert_full(
         &mut self,
         raw: &RawNode,
@@ -985,7 +1091,7 @@ impl Registry {
         anon: AnonLevel,
         exit_ip: Option<String>,
         now: Instant,
-    ) {
+    ) -> usize {
         let addr = format!("{}:{}", raw.ip, raw.port);
         if let Some(e) = self.entries.get_mut(&addr) {
             e.expires_at = now + self.ttl;
@@ -1002,7 +1108,7 @@ impl Registry {
                 e.health.score(),
                 e.node.weight
             );
-            return;
+            return 0;
         }
         let mut health = Health::fresh();
         health.note_success(fwd_latency_ms);
@@ -1030,7 +1136,7 @@ impl Registry {
                 expires_at: now + self.ttl,
             },
         );
-        self.evict_if_over_capacity();
+        self.evict_if_over_capacity()
     }
 
     /// REVIEW-R2 Q3：基线缺失降级续命——只续 TTL，不碰 anon/exit_ip/权重/EWMA。
@@ -1042,11 +1148,23 @@ impl Registry {
     }
 
     /// 复检失败（TCP/Full 任一）：EWMA 记失败＋backoff，TTL 内保留（自动恢复）。
+    /// OPT-R4 B5：未进池 addr 同样留失败指纹（窗口内跳过初筛，省重复 TCP 建链）。
     pub fn note_verify_failed(&mut self, addr: &str, now: Instant) {
         if let Some(e) = self.entries.get_mut(addr) {
             e.health.note_failure(now);
             e.node.weight = e.health.weight();
         }
+        if self.fail_marks.len() >= FAIL_MARKS_CAP {
+            self.fail_marks.clear();
+        }
+        self.fail_marks.insert(addr.to_string(), now);
+    }
+
+    /// OPT-R4 B5：addr 在窗口内失败过即跳过本轮初筛（调用方：TCP spawn 前 retain）。
+    pub fn failed_recently(&self, addr: &str, now: Instant, window: Duration) -> bool {
+        self.fail_marks
+            .get(addr)
+            .is_some_and(|t| now.saturating_duration_since(*t) < window)
     }
 
     /// 复检：通过由 `upsert_full` 续期；失败记 backoff（TTL 内保留，而非删除）。
@@ -1067,8 +1185,10 @@ impl Registry {
     /// REVIEW-R2 Q7：`now` 外提（每轮重取无意义）；排名依据与权重同基的
     /// `composite()`（原 `score()` 与 `weight()` 脱钩）；平局按 addr 终裁
     /// （HashMap 迭代随机，不得决定受害者）；分数非负故 `to_bits` 保序。
-    fn evict_if_over_capacity(&mut self) {
+    /// OPT-R4 B9：返回本轮淘汰条数（调用方记 `free_pool_evicted_total`）。
+    fn evict_if_over_capacity(&mut self) -> usize {
         let now = Instant::now();
+        let mut removed = 0usize;
         while self.entries.len() > self.max_nodes {
             let victim = self
                 .entries
@@ -1084,10 +1204,12 @@ impl Registry {
             match victim {
                 Some(k) => {
                     self.entries.remove(&k);
+                    removed += 1;
                 }
                 None => break,
             }
         }
+        removed
     }
 
     /// 可进池快照：未过期＋非 backoff＋匿名度门。
@@ -1161,27 +1283,38 @@ impl SourceGuard {
     }
 }
 
-/// 并发抓取全源（`join_all` 按源序并发＋per-source 15s 超时；输出与输入同序，
+/// 并发抓取全源（`join_all` 按源序并发＋per-source 超时；输出与输入同序，
 /// 保证去重“首见获胜”确定性：调用方保证 `sources` 配置序＝优先级序）。
 /// 暂停源跳过（其 guard 不计数，保持旧集）；超时/失败 hold 旧集（registry 不动）。
+/// OPT-R4 B3：超时由调用方按 `FREE_FETCH_TIMEOUT_SECS` 传入（默认 15s）。
+/// OPT-R4 B9：每源每轮耗时必记（含超时/失败轮，分母完整，供均值口径）。
 pub async fn fetch_all(
     sources: &[Box<dyn Source>],
     guards: &mut [SourceGuard],
     client: &reqwest::Client,
     tick: u64,
+    fetch_timeout: Duration,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Vec<RawNode> {
     let futs: Vec<_> = sources
         .iter()
         .enumerate()
         .filter(|(i, _)| guards[*i].should_fetch(tick))
-        .map(|(i, s)| async move {
-            let r = tokio::time::timeout(Duration::from_secs(15), s.fetch(client)).await;
-            (i, r)
+        .map(|(i, s)| {
+            let nm = s.name();
+            async move {
+                let start = Instant::now();
+                let r = tokio::time::timeout(fetch_timeout, s.fetch(client)).await;
+                (i, nm, start.elapsed(), r)
+            }
         })
         .collect();
     let results = futures::future::join_all(futs).await; // 输出与输入同序
     let mut raws = Vec::new();
-    for (i, r) in results {
+    for (i, nm, elapsed, r) in results {
+        if let Some(m) = metrics {
+            m.note_free_source_fetch(nm, elapsed);
+        }
         match r {
             Ok(Ok(outcome)) => {
                 guards[i].note_outcome(&outcome, tick);
@@ -1197,25 +1330,54 @@ pub async fn fetch_all(
             }
             Err(_) => {
                 guards[i].note_outcome(&FetchOutcome::nodes(Vec::new()), tick);
-                log::warn!("[FreePool] source fetch timed out (15s, holding last good set)")
+                log::warn!(
+                    "[FreePool] source fetch timed out ({}s, holding last good set)",
+                    fetch_timeout.as_secs()
+                )
             }
         }
     }
     // 去重（首见获胜；源序＝配置序：api > html > github，调用方保证 sources 顺序）。
+    // OPT-R4 B4：去重键含协议（同址 http/socks5 互挤会丢 socks5 Elite）。
     let mut seen = HashSet::new();
-    raws.retain(|r| seen.insert(format!("{}:{}", r.ip, r.port)));
+    raws.retain(|r| seen.insert(format!("{}:{}:{:?}", r.ip, r.port, r.proto)));
     raws
 }
 
-/// NEXT-B7：进检 intake 上限（shuffle 后截断；调用方保证 cap>0）。
-/// openproxylist 单 tick 数千 raw 会拖尾整轮（50 并发×3s 超时≈540s），
-/// 上限取 `max_nodes×2`＋逐轮 shuffle 轮换覆盖；API 预筛后小集不受影响。
-fn cap_intake(mut raws: Vec<RawNode>, cap: usize, rng: &mut impl rand::Rng) -> Vec<RawNode> {
-    if raws.len() > cap {
-        use rand::seq::SliceRandom;
-        raws.shuffle(rng);
-        raws.truncate(cap);
+/// OPT-R4 B3：intake 上限公式（max_nodes×factor，保底 100；factor 由
+/// `FREE_INTAKE_FACTOR` 入，调用方保证 factor≥1，内部再 max(1) 兜底）。
+fn intake_cap_limit(max_nodes: usize, factor: usize) -> usize {
+    max_nodes.saturating_mul(factor.max(1)).max(100)
+}
+
+/// OPT-R4 B7：基线轮询表（主基址＋fallback 去重保序；https-only 由配置层保证）。
+fn baseline_bases(primary: &str, fallbacks: &[String]) -> Vec<String> {
+    let mut bases = vec![primary.to_string()];
+    for b in fallbacks {
+        if !bases.contains(b) {
+            bases.push(b.clone());
+        }
     }
+    bases
+}
+
+/// OPT-R4 B8：加权截断——Elite 历史优先，其次源序（fetch_all 已按
+/// api>html>github 拼接，首次出现序即优先级），同级内稳定排序保原始相对顺序.
+/// 确定性（无 shuffle）：落选者下轮重抓仍有机会；调用方保证 cap>0。
+fn cap_intake(mut raws: Vec<RawNode>, cap: usize, elite_addrs: &HashSet<String>) -> Vec<RawNode> {
+    if raws.len() <= cap {
+        return raws;
+    }
+    let mut order: HashMap<String, usize> = HashMap::new();
+    for r in &raws {
+        let n = order.len();
+        order.entry(r.source.clone()).or_insert(n);
+    }
+    raws.sort_by_key(|r| {
+        let elite = elite_addrs.contains(&format!("{}:{}", r.ip, r.port));
+        (!elite, *order.get(&r.source).unwrap_or(&usize::MAX))
+    });
+    raws.truncate(cap);
     raws
 }
 
@@ -1242,6 +1404,10 @@ pub struct FreePoolConfig {
     pub fetch_interval: Duration,
     pub ttl: Duration,
     pub verify_timeout: Duration,
+    /// OPT-R4 B3：单源抓取超时（默认 15s；干旱可压小、洪峰可放大，无需改代码）。
+    pub fetch_timeout: Duration,
+    /// OPT-R4 B3：intake 上限因子（cap＝max_nodes×factor，默认 2；洪峰可压小）。
+    pub intake_factor: usize,
     pub max_latency_ms: u64,
     pub max_concurrent: usize,
     pub full_concurrent: usize,
@@ -1262,7 +1428,11 @@ pub const DEFAULT_HTML_URL: &str = "https://free-proxy-list.net/";
 /// NEXT-B3：raw 行列表默认三源（逗号分隔，`split_env_list` 切分）。
 /// clarketm 在部分网络不可达（hold 旧集＋熔断，不阻塞他源）；
 /// openproxylist http/socks5 双文件 2026-09-24 实测 200（行内无标记，按 URL 嗅探协议）。
-pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt";
+/// OPT-R4 B12：第 4 源 monosans（在维护，日更；http＋socks5 双文件，2026-09-25
+/// 经 VPN 路径实测 200：http 393 行／socks5 444 行，`ip:port` 行形态复用 parse_with）。
+/// 落选：TheSpeedX/SOCKS-List（同日实测 200＋2714 行格式对，但仓库已停更、
+/// 体量会淹没 intake cap，记备份不接）。
+pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt";
 pub const DEFAULT_FULL_CHECK_BASE: &str = "https://httpbin.org";
 
 /// FullCheck 任务装配 helper（许可拿不到按失败计，沿 R2-7 `?`-in-bool 教训）。
@@ -1451,13 +1621,46 @@ impl FreePoolWorker {
         let tick = self.tick;
         // 1-2. 组装＋并发抓取（失败 hold 旧集）＋ suspend 指标同步。
         let sources = self.build_sources();
-        let mut raws = fetch_all(&sources, &mut self.guards, client, tick).await;
-        // NEXT-B7：进检 intake 上限（yield 已按抓取计数，此处只裁质检量）。
-        let intake_cap = self.config.max_nodes.saturating_mul(2).max(100);
+        let mut raws = fetch_all(
+            &sources,
+            &mut self.guards,
+            client,
+            tick,
+            self.config.fetch_timeout,
+            Some(self.metrics.as_ref()),
+        )
+        .await;
+        // OPT-R4 B3/B8：intake 上限＝max_nodes×factor（默认 2；洪峰可压小运维可调）。
+        // 加权截断（Elite 历史优先＋源序；调用方保证 cap>0）。
+        let intake_cap = intake_cap_limit(self.config.max_nodes, self.config.intake_factor);
         if raws.len() > intake_cap {
             let before = raws.len();
-            raws = cap_intake(raws, intake_cap, &mut rand::thread_rng());
-            log::info!("[FreePool] intake capped {before}->{intake_cap} (shuffle rotation)");
+            let elite: HashSet<String> = self
+                .registry
+                .entries
+                .iter()
+                .filter(|(_, e)| e.health.anon == AnonLevel::Elite)
+                .map(|(k, _)| k.clone())
+                .collect();
+            raws = cap_intake(raws, intake_cap, &elite);
+            self.metrics
+                .note_free_intake_capped((before - intake_cap) as u64);
+            log::info!("[FreePool] intake capped {before}->{intake_cap} (elite-weighted)");
+        }
+        // OPT-R4 B5：失败指纹窗内 addr 跳过本轮 TCP 初筛（省重复建链；窗口＝2×抓取间隔）。
+        {
+            let now = Instant::now();
+            let window = self.config.fetch_interval.saturating_mul(2);
+            let before = raws.len();
+            raws.retain(|r| {
+                !self
+                    .registry
+                    .failed_recently(&format!("{}:{}", r.ip, r.port), now, window)
+            });
+            let skipped = before - raws.len();
+            if skipped > 0 {
+                log::debug!("[FreePool] pre-TCP skipped {skipped} recently-failed addrs");
+            }
         }
         for (i, s) in sources.iter().enumerate() {
             self.metrics
@@ -1473,26 +1676,37 @@ impl FreePoolWorker {
                 self.metrics.note_free_source_yield(s, n);
             }
         }
-        // 3. 直连基线：GET {base}/ip → origin（5s 超时；失败→None＝降级 TCP-only）。
+        // 3. 直连基线：轮询基址表取首个成功 origin（5s 单基址超时；全失败→None＝降级 TCP-only）。
+        // OPT-R4 B7：主基址＋full_check_bases fallback（首基址抖动不再整轮降级）。
         // 基线获取失败不计节点失败（源站侧问题，非节点问题）。
         let baseline: Option<String> = {
-            let r = tokio::time::timeout(
-                Duration::from_secs(5),
-                client
-                    .get(format!("{}/ip", self.config.full_check_base))
-                    .send(),
-            )
-            .await;
-            match r {
-                Ok(Ok(resp)) => resp.json::<serde_json::Value>().await.ok().and_then(|v| {
-                    v.get("origin")
-                        .and_then(|o| o.as_str())
-                        .map(|s| s.to_string())
-                }),
-                _ => None,
+            let bases = baseline_bases(&self.config.full_check_base, &self.config.full_check_bases);
+            let mut found = None;
+            for base in &bases {
+                let r = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.get(format!("{base}/ip")).send(),
+                )
+                .await;
+                match r {
+                    Ok(Ok(resp)) => {
+                        found = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                            v.get("origin")
+                                .and_then(|o| o.as_str())
+                                .map(|s| s.to_string())
+                        });
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
             }
+            found
         };
         if baseline.is_none() {
+            // OPT-R4 B9：基线全灭记一笔（降级轮可观测）。
+            self.metrics.note_free_baseline_fail();
             log::warn!("[FreePool] baseline unreachable, degrading to TCP-only this tick");
         }
         // 4a. 初筛（信号量 max_concurrent）：Http/Https 走 TCP 建链，
@@ -1529,6 +1743,8 @@ impl FreePoolWorker {
         .with_fallback_bases(self.config.full_check_bases.clone());
         let now = Instant::now();
         let mut fset = tokio::task::JoinSet::new();
+        // OPT-R4 B9：本轮容量淘汰累计（upsert 连带）。
+        let mut evicted_total: u64 = 0;
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((raw, Some(_))) => {
@@ -1560,13 +1776,14 @@ impl FreePoolWorker {
         while let Some(joined) = fset.join_next().await {
             match joined {
                 Ok((raw, Some(res))) => {
-                    self.registry.upsert_full(
+                    // OPT-R4 B9：连带淘汰量累积（循环后一次记入 evicted）。
+                    evicted_total += self.registry.upsert_full(
                         &raw,
                         res.fwd_latency_ms,
                         res.anon,
                         res.exit_ip.clone(),
                         now,
-                    );
+                    ) as u64;
                     self.metrics.note_free_verify("pass");
                     self.metrics.note_free_anonymity(match res.anon {
                         AnonLevel::Elite => "elite",
@@ -1597,6 +1814,9 @@ impl FreePoolWorker {
                 }
                 Err(e) => log::warn!("[FreePool] full task join failed: {e:?}"),
             }
+        }
+        if evicted_total > 0 {
+            self.metrics.note_free_evicted(evicted_total);
         }
         // 5. 合并（过期/backoff 条目自然掉出快照）＋ tick 日志。
         Self::merge_once(
@@ -1742,6 +1962,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn b10_first_page_uses_etag_second_fetch_304() {
+        // OPT-R4 B10：首页走 conditional_get——首轮存 ETag，次轮首页 304，
+        // 首页无产出但不计失败，次页照常合并（整体非 not_modified）。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            // 首轮 page1＋page2；次轮 page1（带 If-None-Match）＋page2。
+            for _ in 0..4 {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let page = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split("page=")
+                    .nth(1)
+                    .unwrap_or("?")
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>();
+                let has_etag = req.to_ascii_lowercase().contains("if-none-match");
+                let resp = if page == "1" && has_etag {
+                    "HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = if page == "2" {
+                        r#"{"data":[{"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
+                    } else {
+                        r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#
+                    };
+                    format!(
+                        "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let src =
+            ApiSource::new("api", format!("http://127.0.0.1:{port}/list?limit=1")).with_pages(2);
+        let first = src.fetch(&client).await.expect("first fetch");
+        assert!(!first.not_modified);
+        assert_eq!(first.nodes.len(), 2);
+        let second = src.fetch(&client).await.expect("second fetch");
+        // 首页 304 无产出，次页照常：整体 Ok 且非 not_modified，只剩次页节点。
+        assert!(!second.not_modified);
+        assert_eq!(second.nodes.len(), 1);
+        assert_eq!(second.nodes[0].ip, "198.51.100.9");
+    }
+
     #[test]
     fn api_source_parses_geonode_shape() {
         let body = r#"{"data":[
@@ -1801,6 +2077,27 @@ mod tests {
         // 行内标记优先于默认值。
         let mixed = GitHubSource::parse_with("opl", "9.9.9.9:1080 socks4\n", FreeProto::Socks5);
         assert_eq!(mixed[0].proto, FreeProto::Socks4);
+    }
+
+    #[test]
+    fn b12_monosans_fixture_parses() {
+        // OPT-R4 B12：monosans 实测首行形态（`ip:port` 无标记，靠默认协议）。
+        let http = GitHubSource::parse_with(
+            "mono",
+            "45.151.102.248:10808\n5.129.254.5:8888\n",
+            FreeProto::Http,
+        );
+        assert_eq!(http.len(), 2);
+        assert_eq!(http[0].ip, "45.151.102.248");
+        assert_eq!(http[0].port, 10808);
+        assert!(http.iter().all(|n| n.proto == FreeProto::Http));
+        let socks = GitHubSource::parse_with(
+            "mono",
+            "213.33.186.254:1080\n185.47.55.110:1080\n",
+            FreeProto::Socks5,
+        );
+        assert_eq!(socks.len(), 2);
+        assert!(socks.iter().all(|n| n.proto == FreeProto::Socks5));
     }
 
     #[tokio::test]
@@ -2052,8 +2349,15 @@ mod tests {
         );
         let mut disclosed = HashMap::new();
         disclosed.insert("via".to_string(), "1.0 proxy".to_string());
+        // OPT-R4 B2：无害 Via（值不含基线）不再误杀 Elite（旧口径判 Anonymous）。
         assert_eq!(
             classify_anonymity("1.1.1.1", Some("9.9.9.9"), &disclosed),
+            AnonLevel::Elite
+        );
+        let mut leaked = HashMap::new();
+        leaked.insert("via".to_string(), "1.0 1.1.1.1".to_string());
+        assert_eq!(
+            classify_anonymity("1.1.1.1", Some("9.9.9.9"), &leaked),
             AnonLevel::Anonymous
         );
         let mut upper = HashMap::new();
@@ -2067,6 +2371,60 @@ mod tests {
             classify_anonymity("1.1.1.1", None, &empty),
             AnonLevel::Unknown
         );
+    }
+
+    #[test]
+    fn b1_bogon_ips_never_routable() {
+        // OPT-R4 B1：私网/回环/链路本地/组播/未指定/畸形一律不可公网回连。
+        for bad in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.10.20",
+            "224.0.0.1",
+            "240.0.0.1",
+            "",
+            "not-an-ip",
+            "1.2.3",
+            "1.2.3.4.5",
+            "1.2.3.999",
+            "::1",
+            "example.com",
+        ] {
+            assert!(!is_routable_ip(bad), "{bad} must not routable");
+        }
+        for good in ["8.8.8.8", "1.1.1.1", "203.0.113.7", " 9.9.9.9 "] {
+            assert!(is_routable_ip(good), "{good} must routable");
+        }
+        // 边界：172.15/172.32 不是私网；x.y.z.0 主机位零放行。
+        assert!(is_routable_ip("172.15.0.1"));
+        assert!(is_routable_ip("172.32.0.1"));
+        assert!(is_routable_ip("203.0.113.0"));
+    }
+
+    #[test]
+    fn b1_parsers_drop_bogon_pre_tcp() {
+        // OPT-R4 B1：三源 parse 均丢弃 bogon，不进候选。
+        let api_body = r#"{"data":[
+            {"ip":"8.8.8.8","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"10.0.0.1","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"192.168.1.1","port":3128,"protocols":["http"],"country":"US"}
+        ]}"#;
+        let nodes = ApiSource::parse("api-test", api_body);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].ip, "8.8.8.8");
+        let raw_body = "8.8.8.8:8080\n10.0.0.5:3128 socks5\n127.0.0.1:8888\n";
+        let raws = GitHubSource::parse_with("gh-test", raw_body, FreeProto::Http);
+        assert_eq!(raws.len(), 1);
+        assert_eq!(raws[0].ip, "8.8.8.8");
+        let html = "<td>8.8.4.4</td><td>8080</td><td>10.1.2.3</td><td>3128</td>";
+        let hrefs = HtmlSource::extract("html-test", html, FreeProto::Http);
+        assert!(hrefs.iter().all(|r| r.ip == "8.8.4.4"));
+        assert!(!hrefs.is_empty());
     }
 
     #[tokio::test]
@@ -2498,16 +2856,96 @@ mod tests {
 
     #[test]
     fn intake_cap_bounds_and_covers() {
-        // NEXT-B7：进检 intake 上限（max_nodes×2）：超限截断＋子集合法＋小池原样。
+        // OPT-R4 B8：加权截断（确定性）：超限按 Elite 历史＋源序取 TopN，小池原样。
         let mut big = Vec::new();
         for i in 0..500 {
             big.push(raw(&format!("10.1.{}.{}", i / 254, i % 254 + 1), "a"));
         }
-        let capped = cap_intake(big, 100, &mut rand::thread_rng());
+        let empty: HashSet<String> = HashSet::new();
+        let capped = cap_intake(big, 100, &empty);
         assert_eq!(capped.len(), 100);
         assert!(capped.iter().all(|r| r.source == "a"));
         let small = vec![raw("10.0.0.1", "a")];
-        assert_eq!(cap_intake(small, 100, &mut rand::thread_rng()).len(), 1);
+        assert_eq!(cap_intake(small, 100, &empty).len(), 1);
+    }
+
+    #[test]
+    fn b3_intake_cap_formula() {
+        // OPT-R4 B3：cap＝max_nodes×factor，保底 100；factor 0 兜底 1；乘法饱和。
+        assert_eq!(intake_cap_limit(2000, 2), 4000);
+        assert_eq!(intake_cap_limit(2000, 1), 2000);
+        assert_eq!(intake_cap_limit(2000, 0), 2000);
+        assert_eq!(intake_cap_limit(10, 2), 100);
+        assert_eq!(intake_cap_limit(usize::MAX, 2), usize::MAX);
+    }
+
+    #[test]
+    fn b7_baseline_bases_dedup_order() {
+        // OPT-R4 B7：主基址打头＋fallback 去重保序。
+        let v = baseline_bases(
+            "https://a",
+            &[
+                "https://b".to_string(),
+                "https://a".to_string(),
+                "https://c".to_string(),
+            ],
+        );
+        assert_eq!(v, vec!["https://a", "https://b", "https://c"]);
+        assert_eq!(baseline_bases("https://a", &[]), vec!["https://a"]);
+    }
+
+    #[test]
+    fn b5_fail_fingerprint_window() {
+        // OPT-R4 B5：未进池 addr 失败留指纹，窗口内跳过初筛，窗外过期。
+        let mut reg = Registry::with_capacity(Duration::from_secs(1800), 100);
+        let now = Instant::now();
+        assert!(!reg.failed_recently("1.2.3.4:8080", now, Duration::from_secs(60)));
+        reg.note_verify_failed("1.2.3.4:8080", now);
+        assert!(reg.failed_recently("1.2.3.4:8080", now, Duration::from_secs(60)));
+        let past = now.checked_sub(Duration::from_secs(3600)).unwrap_or(now);
+        let mut reg2 = Registry::with_capacity(Duration::from_secs(1800), 100);
+        reg2.note_verify_failed("5.6.7.8:8080", past);
+        assert!(!reg2.failed_recently("5.6.7.8:8080", now, Duration::from_secs(60)));
+        assert!(reg2.failed_recently("5.6.7.8:8080", now, Duration::from_secs(7200)));
+        assert!(!reg.failed_recently("9.9.9.9:1", now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn b6_checker_client_cache_reuses_and_bounds() {
+        // OPT-R4 B6：同代理复用不增长；1100 个不同代理后仍有界（2×cap 整清兜底）。
+        let c = FullChecker::new("https://example.com".to_string(), Duration::from_secs(3));
+        assert!(c.client_for("http://10.9.0.1:8080").is_some());
+        assert_eq!(c.client_count(), 1);
+        assert!(c.client_for("http://10.9.0.1:8080").is_some());
+        assert_eq!(c.client_count(), 1);
+        for i in 0..1100u32 {
+            let url = format!("http://10.10.{}.{}:8080", i / 254, i % 254 + 1);
+            assert!(c.client_for(&url).is_some());
+        }
+        assert!(c.client_count() <= CHECKER_CLIENT_CAP * 2);
+    }
+
+    #[test]
+    fn b8_weighted_truncation_prefers_elite_then_source_order() {
+        // OPT-R4 B8：Elite 历史优先；同级按源首次出现序（api>html>github）。
+        let mut raws = Vec::new();
+        for i in 0..10 {
+            raws.push(raw(&format!("10.7.0.{i}"), "gh0"));
+        }
+        for i in 0..10 {
+            raws.push(raw(&format!("10.8.0.{i}"), "api0"));
+        }
+        let elite: HashSet<String> = ["10.7.0.3:8080", "10.8.0.9:8080"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let capped = cap_intake(raws, 3, &elite);
+        assert_eq!(capped.len(), 3);
+        // Elite 历史优先（gh0 的 Elite 排 api0 的 Elite 之前：源序次之）：
+        // 再接最早源首个非 Elite（gh0 10.7.0.0，而非 api0）。
+        assert_eq!(capped[0].ip, "10.7.0.3");
+        assert_eq!(capped[1].ip, "10.8.0.9");
+        assert_eq!(capped[2].ip, "10.7.0.0");
     }
 
     struct FailSource {
@@ -2533,7 +2971,15 @@ mod tests {
         let mut guards = vec![SourceGuard::new(3, 3)];
         let client = reqwest::Client::new();
         for tick in 0..3 {
-            let raws = fetch_all(&sources, &mut guards, &client, tick).await;
+            let raws = fetch_all(
+                &sources,
+                &mut guards,
+                &client,
+                tick,
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
             assert!(raws.is_empty());
         }
         assert!(
@@ -2577,10 +3023,80 @@ mod tests {
         let sources = vec![slow, fast];
         let mut guards = vec![SourceGuard::new(3, 3), SourceGuard::new(3, 3)];
         let client = reqwest::Client::new();
-        let raws = fetch_all(&sources, &mut guards, &client, 0).await;
+        let raws = fetch_all(
+            &sources,
+            &mut guards,
+            &client,
+            0,
+            Duration::from_secs(15),
+            None,
+        )
+        .await;
         assert_eq!(raws.len(), 2);
         assert_eq!(raws[0].source, "slow");
         assert_eq!(raws[1].source, "fast");
+    }
+
+    #[tokio::test]
+    async fn b4_dedup_keeps_proto_variants() {
+        // OPT-R4 B4：同址不同协议不得互挤（旧 ip:port 键会丢 socks5 Elite）。
+        let http_node = raw("10.9.9.9", "api0");
+        let socks_node = RawNode {
+            port: 8080,
+            proto: FreeProto::Socks5,
+            ..raw("10.9.9.9", "gh0")
+        };
+        let a: Box<dyn Source> = Box::new(StubSource {
+            name: "api0",
+            nodes: vec![http_node],
+            delay_ms: 0,
+        });
+        let b: Box<dyn Source> = Box::new(StubSource {
+            name: "gh0",
+            nodes: vec![socks_node],
+            delay_ms: 0,
+        });
+        let sources = vec![a, b];
+        let mut guards = vec![SourceGuard::new(3, 3), SourceGuard::new(3, 3)];
+        let client = reqwest::Client::new();
+        let raws = fetch_all(
+            &sources,
+            &mut guards,
+            &client,
+            0,
+            Duration::from_secs(15),
+            None,
+        )
+        .await;
+        assert_eq!(raws.len(), 2);
+        assert!(raws.iter().any(|r| r.proto == FreeProto::Socks5));
+        assert!(raws.iter().any(|r| r.proto == FreeProto::Http));
+        // 真重复（同址同协议）仍去重，首见（api0）获胜。
+        let dup: Box<dyn Source> = Box::new(StubSource {
+            name: "gh1",
+            nodes: vec![raw("10.9.9.9", "gh1")],
+            delay_ms: 0,
+        });
+        let sources2: Vec<Box<dyn Source>> = vec![
+            Box::new(StubSource {
+                name: "api0",
+                nodes: vec![raw("10.9.9.9", "api0")],
+                delay_ms: 0,
+            }),
+            dup,
+        ];
+        let mut guards2 = vec![SourceGuard::new(3, 3), SourceGuard::new(3, 3)];
+        let raws2 = fetch_all(
+            &sources2,
+            &mut guards2,
+            &client,
+            1,
+            Duration::from_secs(15),
+            None,
+        )
+        .await;
+        assert_eq!(raws2.len(), 1);
+        assert_eq!(raws2[0].source, "api0");
     }
 
     #[tokio::test]
