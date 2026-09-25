@@ -698,3 +698,8 @@
 - **纠错记录**：首轮 cargo build 误 workdir（根无 Cargo.toml）→次轮锁文件（运行中 exe 锁死）→先停后编；散落 `\n`（PS 下应 `` `n ``）顺手修正两处；其余零纠错。
 - **验证结果**：fmt/clippy 零告警/test 201＋0＋4 ignored/live 4（带密）/release 全编过/bandit 12/bench 编译过；回归新语义：plain 200/nokey 403/badkey 403/sticky 200/nohost 400（Host 先行，不变）/metrics 200＋D1（403/403/503/200）＋SDK 四断言＋适配器带 Key 回 mock-b-jp；CH 3735→3745（+10）＋XLEN 流动＋无新鲜 NOAUTH；回退口径：`REQUIRE_API_KEY=0`＋`GATEWAY_ADDR=0.0.0.0:8916`（见 OPERATION D2 条）。
 - **落库**：OPT-R4 计划 C13✅＋TASK 27✅＋本条目；禁未授权 commit（本次未提交；在途网关在线）。
+
+### [2026-09-25] 步骤 28 立项: OPT-R5 优化方案冻结（先落库再执行）
+- 计划操作：用户指令“继续执行”→按既定节奏先提交（9529b1c：步骤 27 D3，17 文件）再备下一轮。派三路并行深读（稳定性/代理能力/运维余量）得 24 条→用户选定全做。新建`plan/2026年9月25日-OPT-R5优化方案.md`（S 稳定性根治 7 项→E 代理能力 7 项→O 运维收尾 10 项＋门禁落库）；`TASK_PLAN.md` 步骤 28 置待执行；本文件 append-only 记立项。
+- 关键输入：稳定性路钉死 Windows 退出双机制（`#[tokio::main]` 嵌套 drop-runtime panic＋pingora-core 0.6 Windows Graceful 300s 硬编码）；运维路抓获 D3 残留漂移 10 处；E7 CONNECT 隧道（L）独立分支可最后做。
+- 验收线：Rust 项 TDD 红→绿；新源/云端验证先验证再接线；破坏性默认变更本计划零条；本文件 append-only。
