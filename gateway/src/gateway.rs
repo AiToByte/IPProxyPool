@@ -38,8 +38,8 @@ pub struct SmartProxyGateway {
     /// GW-4 Prometheus counters/histogram.
     pub metrics: Arc<MetricsRegistry>,
     /// OPT-2 环境门：为 true 时，未携带 `X-API-Key` 头的请求直接 403 拦截，
-    /// 不进入租户查询（语义与坏 Key 一致：`tenant_account=None`，logging 不释放配额）。
-    /// 默认关闭（`REQUIRE_API_KEY=1` 开启），保持 GW-1~GW-4 存量 curl 行为不变。
+    /// 不进入租户查询（语义与坏 Key 一致：`tenant_account` 保持 None，logging 侧不释放配额——与坏 Key 语义一致）。
+    /// D3 起默认开启（`REQUIRE_API_KEY=0` 显式关闭）；本机开发带 `default_key` 头（SDK/脚本已默认带）。
     pub require_api_key: bool,
     /// P2 SOCKS 翻译桥（`None`＝未装配：socks 显式请求直接 503；main 装配 Some，见 P2-7）。
     pub bridge: Option<Arc<SocksBridge>>,

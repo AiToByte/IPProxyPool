@@ -11,7 +11,7 @@ IPProxyPool 是基于 Pingora 的企业级代理网关：智能选路（LinUCB�
 
 - 数据面：`:8916`（Pingora 五阶段：鉴权→选路→转发→计量→遥测），P99 dev 基线约 65ms（Windows debug 参考值，非生产承诺）。
 - 控制面：prober/prewarmer/sweep/arbitrage/free_pool 后台 ticker＋supervisor 托管。
-- 质量：156 单测＋4 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。
+- 质量：201 单测＋4 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。
 
 文档：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（架构）· [`docs/TECHNICAL.md`](docs/TECHNICAL.md)（技术）· [`docs/COMPONENTS.md`](docs/COMPONENTS.md)（组件）· [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)（用户手册）· [`docs/OPERATION.md`](docs/OPERATION.md)（运维）· [`CONTRIBUTING.md`](CONTRIBUTING.md)（贡献）。
 
@@ -19,10 +19,10 @@ IPProxyPool 是基于 Pingora 的企业级代理网关：智能选路（LinUCB�
 
 ```powershell
 docker compose up -d                                        # Redis/CH/Prom/Grafana
-docker exec ipproxy-redis redis-cli ping                    # PONG
+docker exec ipproxy-redis redis-cli -a 123456 ping            # PONG（开发缺省密码，见 .env.example）
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/   # 200
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/   # 200（D3 缺省开门，须带开发 Key）
 ```
 
 ### 核心配置摘要（全表见技术说明 §6）
@@ -30,8 +30,8 @@ curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/   
 | 场景 | 环境变量 |
 |------|----------|
 | 开免费线 | `FREE_ENABLED=1`（默认关；生产建议再加 `FREE_REQUIRE_ELITE=1`） |
-| 无头鉴权 | `REQUIRE_API_KEY=1`（无 `X-API-Key` 直接 403） |
-| 改监听 | `GATEWAY_ADDR`／`METRICS_ADDR` |
+| 无头鉴权 | D3 起默认开启（无 `X-API-Key` 直接 403；`REQUIRE_API_KEY=0` 显式关闭） |
+| 改监听 | `GATEWAY_ADDR`／`METRICS_ADDR`（D3 缺省 `127.0.0.1:8916` 回环；容器/局域网显式覆写） |
 | GeoIP 配库 | `GEOIP_MMDB_PATH`（无库 Disabled；执法 `GEOIP_ENFORCE_MISMATCH` 默认关） |
 
 ### 路线图
@@ -46,7 +46,7 @@ IPProxyPool is a Pingora-based enterprise proxy gateway: smart routing (LinUCB +
 
 - Data plane: `:8916` (Pingora five phases: auth → route → forward → meter → telemetry); P99 dev baseline ~65ms (Windows debug reference, not a production commitment).
 - Control plane: prober/prewarmer/sweep/arbitrage/free_pool background tickers, supervised.
-- Quality: 156 unit tests + 4 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage self-healing).
+- Quality: 201 unit tests + 4 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage self-healing).
 
 Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) · [`docs/OPERATION.md`](docs/OPERATION.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -54,10 +54,10 @@ Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](do
 
 ```powershell
 docker compose up -d                                        # Redis/CH/Prom/Grafana
-docker exec ipproxy-redis redis-cli ping                    # PONG
+docker exec ipproxy-redis redis-cli -a 123456 ping            # PONG (dev default password, see .env.example)
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/   # 200
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/   # 200 (D3 gate on by default, dev key required)
 ```
 
 ### Core config cheatsheet (full table: technical §6)
@@ -65,7 +65,7 @@ curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/   
 | Scenario | Env vars |
 |----------|----------|
 | Enable free line | `FREE_ENABLED=1` (off by default; production advice adds `FREE_REQUIRE_ELITE=1`) |
-| Headless auth | `REQUIRE_API_KEY=1` (headerless → 403) |
+| Headless auth | ON by default since D3 (headerless → 403; `REQUIRE_API_KEY=0` to disable) |
 | Listen addrs | `GATEWAY_ADDR` / `METRICS_ADDR` |
 | GeoIP DB | `GEOIP_MMDB_PATH` (Disabled without DB; enforcement `GEOIP_ENFORCE_MISMATCH` off) |
 

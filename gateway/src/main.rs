@@ -170,12 +170,14 @@ async fn main() {
         }
     };
 
-    // 2a. OPT-2 API Key 环境门：`REQUIRE_API_KEY=1` 即开，默认关闭。
-    // 开启后，未带 `X-API-Key` 头的请求在网关入口直接 403（见 gateway.rs），
-    // 关闭时沿用 GW-1~GW-4 行为（无头走 `default_key` 宽限额）。
-    let require_api_key = std::env::var("REQUIRE_API_KEY").as_deref() == Ok("1");
+    // 2a. OPT-2 API Key 环境门：D3 起默认开启（`REQUIRE_API_KEY=0` 显式关闭）。
+    // 开启后，未带 `X-API-Key` 头的请求在网关入口直接 403（见 gateway.rs）；
+    // 本机开发用默认 Key `default_key`（启动即注册宽限额，见 OPERATION/USAGE）。
+    let require_api_key = std::env::var("REQUIRE_API_KEY").as_deref() != Ok("0");
     if require_api_key {
-        log::info!("[OPT-2] REQUIRE_API_KEY=1, missing X-API-Key requests get 403");
+        log::info!(
+            "[OPT-2] API key gate ON (default since D3), missing X-API-Key requests get 403"
+        );
     }
 
     // 2. Initial mock egress pool (GW-4 arbitrage derates/restores via reload).
@@ -601,9 +603,10 @@ async fn main() {
             bridge: Some(socks_bridge.clone()),
         },
     );
-    // R2-8：网关监听地址 env 化（默认 0.0.0.0:8916；2026-09-24 由 8080 迁出，
-    // 起因：本机 cvat traefik 常驻 :8080 且 Windows 后绑定者赢，见 PORT-8916 计划）。
-    let gateway_addr = env_str("GATEWAY_ADDR", "0.0.0.0:8916");
+    // R2-8：网关监听地址 env 化（D3 起默认 127.0.0.1:8916 回环收紧；
+    // 2026-09-24 由 8080 迁出，起因见 PORT-8916 计划；局域网/容器场景显式覆写
+    // GATEWAY_ADDR=0.0.0.0:8916，见 OPERATION D2 节）。
+    let gateway_addr = env_str("GATEWAY_ADDR", "127.0.0.1:8916");
     proxy_service.add_tcp(&gateway_addr);
 
     log::info!(

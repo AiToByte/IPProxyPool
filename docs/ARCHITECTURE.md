@@ -37,7 +37,7 @@
 
 ### 2. 请求五阶段（数据面）
 
-1. `request_filter`：Host 校验（缺 Host 400）→ API Key 门（`REQUIRE_API_KEY=1` 时无头 403）→ 租户鉴权（坏 Key 403／欠费 402／超限 429）→ 解析 `RoutingSpec`（country/tier/session/proto）→ SOCKS 显式请求短路进翻译桥。
+1. `request_filter`：Host 校验（缺 Host 400）→ API Key 门（D3 起默认开启，无头 403；`REQUIRE_API_KEY=0` 关闭）→ 租户鉴权（坏 Key 403／欠费 402／超限 429）→ 解析 `RoutingSpec`（country/tier/session/proto）→ SOCKS 显式请求短路进翻译桥。
 2. `upstream_peer`：粘滞 fast path（复核权重/proto/隔离/TTL）→ 健康候选过滤 → LinUCB/加权选择 → 上游 auth 注入＋超时（1500/5000/3000ms）。
 3. `response_filter`：透传状态码，失败进重试（换节点＋失败集上限 16）。
 4. `response_body_filter`：字节计量（OPT-3：只计最后 attempt 出站字节）。
@@ -95,7 +95,7 @@ The gateway runs as a host binary (not in compose); dependencies start with `doc
 
 ### 2. Five request phases (data plane)
 
-1. `request_filter`: Host check (missing Host → 400) → API key gate (no header → 403 when `REQUIRE_API_KEY=1`) → tenant auth (bad key 403 / no balance 402 / over-limit 429) → parse `RoutingSpec` (country/tier/session/proto) → explicit SOCKS requests short-circuit into the translation bridge.
+1. `request_filter`: Host check (missing Host → 400) → API key gate (on by default since D3, no header → 403; `REQUIRE_API_KEY=0` disables) → tenant auth (bad key 403 / no balance 402 / over-limit 429) → parse `RoutingSpec` (country/tier/session/proto) → explicit SOCKS requests short-circuit into the translation bridge.
 2. `upstream_peer`: sticky fast path (re-check weight/proto/quarantine/TTL) → healthy-candidate filter → LinUCB/weighted pick → upstream auth injection + timeouts (1500/5000/3000ms).
 3. `response_filter`: pass through status; failures retry (node rotation + failed-set cap 16).
 4. `response_body_filter`: byte metering (OPT-3: only the last attempt's egress bytes).

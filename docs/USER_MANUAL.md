@@ -15,14 +15,14 @@
 
 ```powershell
 docker compose up -d
-docker exec ipproxy-redis redis-cli ping
-# 期待 PONG
+docker exec ipproxy-redis redis-cli -a 123456 ping
+# 期待 PONG（开发缺省密码，见 .env.example）
 curl.exe -s "http://127.0.0.1:8123/ping" --user "proxy:123456"
 # 期待 Ok.
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/
-# 期待 200
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
+# 期待 200（D3 缺省开门，须带开发 Key；无头 403）
 ```
 
 说明：后台进程必须经 `log/launch_detached.py`（DETACHED，不继承控制台）；日志一律落 `log/`；禁用 `Get-NetTCPConnection`（探活用 `curl --max-time`）。
@@ -30,12 +30,13 @@ curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/
 ### 3. 验证代理
 
 ```powershell
-# 普通（无状态，LinUCB/加权）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8916/
+# 普通（无状态，LinUCB/加权；D3 起须带开发 Key，否则 403）
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
 # 粘滞（同 session 两次命中同节点；头名与网关同名，误名会被静默忽略）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
-# 坏 Key（期待 403）、缺 Host（期待 400）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: default_key" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
+# 坏 Key（期待 403）、无头（期待 403）、缺 Host（期待 400）
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8916/
 curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8916/ -o NUL -w "%{http_code}\n"
 # 指标
 curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_pool_nodes_total"
@@ -54,7 +55,7 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 ### 5. 故障速查
 
 - 全域 503：池被隔离摘空或 mocks 挂了；
-- 403 全拦截：Key 未注册（默认 `default_key` 已注册）；
+- 403 全拦截：Key 未注册或无头（D3 缺省开门；默认 `default_key` 已注册，带头即放行）；
 - 402：租户欠费，充值后恢复；
 - 免费线零信任：禁认证/cookie/支付/银行流量（D1 起网关强制 403）；生产建议 `FREE_ENABLED=1＋FREE_REQUIRE_ELITE=1`；
 - Windows 传 JSON 给 redis-cli 丢引号：用 `log/redis_inject.py`。
@@ -77,14 +78,14 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 
 ```powershell
 docker compose up -d
-docker exec ipproxy-redis redis-cli ping
-# expect PONG
+docker exec ipproxy-redis redis-cli -a 123456 ping
+# expect PONG (dev default password, see .env.example)
 curl.exe -s "http://127.0.0.1:8123/ping" --user "proxy:123456"
 # expect Ok.
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/
-# expect 200
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
+# expect 200 (D3 gate on by default, dev key required; headerless 403)
 ```
 
 Notes: background processes must go through `log/launch_detached.py` (DETACHED, no console inheritance); all logs under `log/`; `Get-NetTCPConnection` is banned (probe with `curl --max-time`).
@@ -92,12 +93,13 @@ Notes: background processes must go through `log/launch_detached.py` (DETACHED, 
 ### 3. Verify proxying
 
 ```powershell
-# plain (stateless, LinUCB/weighted)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8916/
+# plain (stateless, LinUCB/weighted; D3 requires dev key, else 403)
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
 # sticky (same session hits same node twice; header names must match the gateway's)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
-# bad key (expect 403), missing Host (expect 400)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: default_key" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
+# bad key (expect 403), missing key (expect 403), missing Host (expect 400)
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8916/
 curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8916/ -o NUL -w "%{http_code}\n"
 # metrics
 curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_pool_nodes_total"
@@ -116,7 +118,7 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 ### 5. Quick troubleshooting
 
 - Global 503: pool quarantined empty or mocks down;
-- All 403: key unregistered (`default_key` is pre-registered);
+- All 403: key unregistered or missing (D3 gate on by default; `default_key` is pre-registered, send the header to pass);
 - 402: tenant out of balance, top up to recover;
 - Free zero-trust: no auth/cookie/payment/banking traffic (gateway-enforced 403 since D1); production advice `FREE_ENABLED=1 + FREE_REQUIRE_ELITE=1`;
 - Windows redis-cli drops JSON quotes: use `log/redis_inject.py`.

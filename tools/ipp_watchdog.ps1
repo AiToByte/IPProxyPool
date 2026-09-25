@@ -69,11 +69,12 @@ function Test-GatewayIdentity {
     # 写法注记：直列式（本机 PS5.1 无 BOM＋LF＋中文文件曾报 try/catch 版
     # UnexpectedToken，根因为缺 BOM 致误解析，见 EXEC；全仓 .ps1 已补 BOM，
     # 此处保持可解析的直列形态不再改回，语义等价）。
-    $code = Test-Port "http://127.0.0.1:8916/"
+    # D3：网关探针带开发 Key（无头 403 即判非我方，不会误杀；metrics 探针无门不动）。
+    $code = curl.exe --max-time 5 -s -o NUL -w "%{http_code}" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
     if ($code -ne "200") {
         return $code
     }
-    $body = curl.exe --max-time 5 -s http://127.0.0.1:8916/
+    $body = curl.exe --max-time 5 -s -H "X-Api-Key: default_key" http://127.0.0.1:8916/
     if ($body -like "*mock-*") {
         return "200"
     }

@@ -692,3 +692,9 @@
 - **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 201 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（带密 REDIS_URL＋CLICKHOUSE_PASSWORD，无 SKIP）／bench 编译过／`--release bandit` 12 过。
 - **回归**：plain 200/sticky 200/badkey 403/nohost 400/metrics 200＋D1 四断言（403/403/503/200）＋SDK 自检＋适配器 mock-b-jp；XLEN 10136→10149（+13；流内保留，消费组 lag=0）＋CH 3698→3711（+13 精确对账）；Grafana 数据源＋面板＋prom 实时序列有数；SupervisorRestarted firing 系本轮 kill 演练 churn（测试制造，非生产信号）。
 - **落库**：本计划 §状态表 A✅B✅C✅V✅＋本文件四条目＋TASK 26✅；禁未授权 commit（本次未提交；在途网关在线）。
+
+### [2026-09-25] 步骤 27 完成：D3 破坏性收紧执行（用户拍板）
+- **实际操作**：main 两默认值（REQUIRE_API_KEY `==1`→`!=0`＋GATEWAY_ADDR `0.0.0.0`→`127.0.0.1`，注释同步）/gateway.rs 注释/compose profile 服务 `REQUIRE_API_KEY 0→1`＋注释扶正/SDK 缺省 `api_key="default_key"`＋nokey 403 断言/ipp.ps1 网关探针全转 Test-GwPort＋nokey 探活行/watchdog 身份探针带 Key/free_test 加 Key 头/docs 全 sweep（README×2＋USER_MANUAL 中英各 5＋OPERATION§2/§6＋TECHNICAL 中英＋ARCHITECTURE 中英＋USAGE 中英示例/片段/限制表＋适配器透传注记）/CHANGELOG Changed 追加。
+- **纠错记录**：首轮 cargo build 误 workdir（根无 Cargo.toml）→次轮锁文件（运行中 exe 锁死）→先停后编；散落 `\n`（PS 下应 `` `n ``）顺手修正两处；其余零纠错。
+- **验证结果**：fmt/clippy 零告警/test 201＋0＋4 ignored/live 4（带密）/release 全编过/bandit 12/bench 编译过；回归新语义：plain 200/nokey 403/badkey 403/sticky 200/nohost 400（Host 先行，不变）/metrics 200＋D1（403/403/503/200）＋SDK 四断言＋适配器带 Key 回 mock-b-jp；CH 3735→3745（+10）＋XLEN 流动＋无新鲜 NOAUTH；回退口径：`REQUIRE_API_KEY=0`＋`GATEWAY_ADDR=0.0.0.0:8916`（见 OPERATION D2 条）。
+- **落库**：OPT-R4 计划 C13✅＋TASK 27✅＋本条目；禁未授权 commit（本次未提交；在途网关在线）。

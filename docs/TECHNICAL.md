@@ -49,10 +49,10 @@
 
 | Key | 默认 | 说明 |
 |-----|------|------|
-| `GATEWAY_ADDR`／`METRICS_ADDR` | `0.0.0.0:8916`／`127.0.0.1:9091` | 监听地址 |
+| `GATEWAY_ADDR`／`METRICS_ADDR` | `127.0.0.1:8916`／`127.0.0.1:9091`（D3 起回环收紧；容器/局域网显式覆写 `0.0.0.0`） | 监听地址 |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | 缺失即降级（遥测仅日志） |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | 缺失即 hold 权重 |
-| `REQUIRE_API_KEY` | `0` | `1` 时无头 403 |
+| `REQUIRE_API_KEY` | `1`（D3 起默认开门；`0` 显式关闭） | 无头 403（开发带 `default_key` 头） |
 | `PROBE/PREWARM/SWEEP/ARBITRAGE_INTERVAL_SECS` | `60/30/60/60` | 后台节拍（三 ticker 启动错峰 0~5s） |
 | `SOCKS_BRIDGE_TIMEOUT_SECS`／`SOCKS_MAX_BODY_BYTES` | `20`／`10485760` | 翻译桥 |
 | `GEOIP_MMDB_PATH`／`GEOIP_ENFORCE_MISMATCH` | 空／`0` | 无库 Disabled；执法默认关 |
@@ -115,10 +115,10 @@
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `GATEWAY_ADDR` / `METRICS_ADDR` | `0.0.0.0:8916` / `127.0.0.1:9091` | listen addresses |
+| `GATEWAY_ADDR` / `METRICS_ADDR` | `127.0.0.1:8916` / `127.0.0.1:9091` (loopback since D3; override `0.0.0.0` for containers/LAN) | listen addresses |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | degraded (log-only telemetry) when missing |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | hold weights when missing |
-| `REQUIRE_API_KEY` | `0` | `1` → headerless 403 |
+| `REQUIRE_API_KEY` | `1` (gate on by default since D3; `0` disables) | headerless 403 (send dev `default_key`) |
 | `PROBE/PREWARM/SWEEP/ARBITRAGE_INTERVAL_SECS` | `60/30/60/60` | background cadences (0–5s staggered start) |
 | `SOCKS_BRIDGE_TIMEOUT_SECS` / `SOCKS_MAX_BODY_BYTES` | `20` / `10485760` | translation bridge |
 | `GEOIP_MMDB_PATH` / `GEOIP_ENFORCE_MISMATCH` | empty / `0` | Disabled without DB; enforcement off |

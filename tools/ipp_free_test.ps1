@@ -39,8 +39,8 @@ while ((Get-Date) -lt $deadline) {
 }
 if (-not $proto) { Fail "pool empty after ${PoolWaitSecs}s (normal for free pool, retry later)" }
 
-# 3. fire via gateway (forced direct)
-$headers = @("X-Proxy-Tier: free", "Host: httpbin.org")
+# 3. fire via gateway (forced direct; D3: key gate on, send dev key)
+$headers = @("X-Api-Key: default_key", "X-Proxy-Tier: free", "Host: httpbin.org")
 if ($proto -eq "socks5") { $headers += "X-Proxy-Proto: socks5" }
 $hargs = @()
 foreach ($h in $headers) { $hargs += "-H"; $hargs += $h }

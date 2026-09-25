@@ -8,7 +8,9 @@ Usage:
     c = IPPClient("http://127.0.0.1:8916", session="job-42")
     status, body = c.get("http://httpbin.org/ip")
 Self-test:
-    python tools/ipp_sdk.py --self-test   # 普通200＋粘滞＋坏Key403
+    python tools/ipp_sdk.py --self-test   # 普通200＋粘滞＋坏Key403＋无头403
+D3 注记：网关默认开 API Key 门；SDK 缺省带开发 Key `default_key`
+（生产传真 Key；api_key=None 即无头，用于验证 403）。
 """
 import sys
 import time
@@ -18,7 +20,7 @@ from urllib.parse import urlsplit
 
 
 class IPPClient:
-    def __init__(self, gateway="http://127.0.0.1:8916", api_key=None,
+    def __init__(self, gateway="http://127.0.0.1:8916", api_key="default_key",
                  session=None, country=None, tier=None, proto=None,
                  timeout=10):
         parts = urlsplit(gateway)
@@ -94,7 +96,11 @@ def self_test():
     bad = IPPClient(gw, api_key="bad")
     s4, _ = bad.get("http://127.0.0.1:8888/")
     assert s4 == 403, f"bad key expect 403, got {s4}"
-    print(f"self-test OK: plain={s1} sticky={b2!r} badkey={s4}")
+    # D3：无头请求同样 403（门默认开启）。
+    nokey = IPPClient(gw, api_key=None)
+    s5, _ = nokey.get("http://127.0.0.1:8888/")
+    assert s5 == 403, f"missing key expect 403, got {s5}"
+    print(f"self-test OK: plain={s1} sticky={b2!r} badkey={s4} nokey={s5}")
 
 
 if __name__ == "__main__":

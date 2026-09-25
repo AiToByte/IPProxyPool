@@ -53,6 +53,16 @@ function Test-Port($Url) {
     }
 }
 
+# D3：网关默认开 Key 门——网关探针一律带开发 Key（mocks/metrics 无门，走 Test-Port）。
+$GWKEY = "default_key"
+function Test-GwPort($Url) {
+    try {
+        return curl.exe --max-time 5 -s -o NUL -w "%{http_code}" -H "X-Api-Key: $GWKEY" $Url
+    } catch {
+        return "000"
+    }
+}
+
 function Show-Port($Url, $Name) {
     Write-Output ("" + $Name + ":" + (Test-Port $Url))
 }
@@ -71,7 +81,7 @@ if ($Action -eq "status") {
     Show-Port "http://127.0.0.1:8888/" "mockA"
     Show-Port "http://127.0.0.1:8889/" "mockB"
     Show-Port "http://127.0.0.1:8890/" "mockC"
-    Show-Port "http://127.0.0.1:8916/" "gw"
+    Write-Output ("" + "gw:" + (Test-GwPort "http://127.0.0.1:8916/"))
     Show-Port "http://127.0.0.1:9091/metrics" "metrics"
     exit 0
 }
@@ -92,22 +102,23 @@ docker compose up -d
 docker exec ipproxy-redis redis-cli -a "$env:REDIS_PASSWORD" ping 2>$null
 # V1-verdict fix: fixed sleeps lose the readiness race on cold start;
 # poll until 200 (or timeout) instead.
-function Wait-Port($Url, $Name, $Tries = 12) {
+function Wait-Port($Url, $Name, $Tries = 12, $Keyed = $false) {
     # 无返回值（调用点无需接；接了反而吞打印，见 [void] 教训——要显示就别接）。
+    # D3：$Keyed 为真时走带 Key 网关探针。
     for ($i = 1; $i -le $Tries; $i++) {
-        $code = Test-Port $Url
+        if ($Keyed) { $code = Test-GwPort $Url } else { $code = Test-Port $Url }
         if ($code -eq "200") { Write-Output "$Name`:200 (ready after ${i}x5s)"; return }
         Start-Sleep 5
     }
-    $code = Test-Port $Url
+    if ($Keyed) { $code = Test-GwPort $Url } else { $code = Test-Port $Url }
     Write-Output "$Name`:$code (not ready after ${Tries}x5s, see log/)"
 }
 
-if ((Test-Port "http://127.0.0.1:8916/") -eq "200") {
+if ((Test-GwPort "http://127.0.0.1:8916/") -eq "200") {
     Write-Output "gw already listening, skip launch"
 } else {
     Start-Detached $GW "log/gw.out" "log/gw.err"
-    [void](Wait-Port "http://127.0.0.1:8916/" "gw")
+    [void](Wait-Port "http://127.0.0.1:8916/" "gw" 12 $true)
 }
 if ($Mocks) {
     foreach ($m in @(@(8888, "mock-a-us", "mockA"), @(8889, "mock-b-jp", "mockB"), @(8890, "mock-c-gb", "mockC"))) {
@@ -120,5 +131,6 @@ if ($Mocks) {
     }
 }
 Show-Port "http://127.0.0.1:9091/metrics" "metrics"
-curl.exe --max-time 5 -s -o NUL -w "plain:%{http_code} " http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "plain:%{http_code} " -H "X-Api-Key: default_key" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "nokey:%{http_code} " http://127.0.0.1:8916/
 curl.exe --max-time 5 -s -o NUL -w "badkey:%{http_code}`n" -H "X-Api-Key: bad" http://127.0.0.1:8916/

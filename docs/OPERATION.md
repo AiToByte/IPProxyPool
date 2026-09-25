@@ -23,7 +23,7 @@ D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\M
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/mockB.out log/mockB.err log/mock_upstream.py 8889 mock-b-jp
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/mockC.out log/mockC.err log/mock_upstream.py 8890 mock-c-gb
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe -s http://127.0.0.1:8916/                       # 200
+curl.exe -s -H "X-Api-Key: default_key" http://127.0.0.1:8916/   # 200（D3 缺省开门须带 Key）
 curl.exe -s http://127.0.0.1:9091/metrics                # Prometheus exposition
 ```
 
@@ -31,9 +31,10 @@ curl.exe -s http://127.0.0.1:9091/metrics                # Prometheus exposition
 日志一律落 `log/`，禁放 C 盘；`Get-NetTCPConnection` 禁用，
 探活用 `curl --max-time`。
 
-OPT-2 环境门：`REQUIRE_API_KEY=1` 启动网关后，无 `X-API-Key` 头直接 403，
-有头（即使错 Key）走租户鉴权（403/429）；默认关闭时无头走 `default_key`
-宽限额，存量行为不变。
+OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
+有头（即使错 Key）走租户鉴权（403/429）；`REQUIRE_API_KEY=0` 显式关闭时
+无头走 `default_key` 宽限额（GW-1~GW-4 旧行为）。本机开发带默认 Key
+`default_key`（SDK/脚本已默认带，curl 手工加 `-H`）。
 
 ## 3. 三家真 Key 灰度（GW-R2，用户给 Key 后执行）
 
@@ -100,7 +101,7 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
   开后 mismatch 按复检失败计（backoff＋`geo_fail`，TTL 内自愈）；
 - 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；
 - 后台工人停转：CB/sink/arbitrage 由 supervisor 托管，`supervisor_restarts_total{worker}` 涨即正在自愈（指数 backoff 1s 起 60s 封顶）；
-- 403 全拦截：X-API-Key 未注册（默认 `default_key` 已在 main 注册）；
+- 403 全拦截：X-API-Key 未注册或无头（D3 缺省开门；默认 `default_key` 已在 main 注册，带头即放行）；
 - /metrics 无数据：确认走 :8916 有流量（intercept 的 403 也计数）；
 - CH 查不到数：流式泵已上线（`ch_sink_group` 常驻，batch 5000/1s），查
   `SELECT count() FROM proxy.proxy_telemetry_log` 应随流量涨；不动则看
@@ -109,4 +110,4 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - OPT-R4 C5/C6 凭据：复制 `.env.example` 为 `.env` 后改密码；`tools/ipp.ps1` 自动加载（CI/显式 env 优先）；compose 用 `${VAR:-缺省}` 引用。依赖端口只绑回环（6379/8123/9090/3000），局域网直达已封。
 - Live 测试（`cargo test -- --ignored`）需带密环境：`$env:REDIS_URL="redis://:xxx@127.0.0.1:6379/"`＋`$env:CLICKHOUSE_PASSWORD="xxx"`（与 .env 同值）；CI 用无密 service 走缺省。
 - OPT-R4 C12 备份恢复：`tools/backup.ps1` 产出 `backup/<stamp>/`（redis-dump.rdb＋ch-telemetry-backup＋grafana-data.tar）。恢复：停服（`ipp.ps1 stop`＋`compose stop`）→ `docker cp` 拷回（rdb→`ipproxy-redis:/data/dump.rdb`；CH 先 `RESTORE TABLE ... FROM File(...)` 到临时表验行数再换名；grafana tar 解回卷）→ 起服＋`SELECT count()` 对账。演练建议：季度一次，用副本表验恢复不碰生产表。
-- D2 局域网敞口声明：`GATEWAY_ADDR` 缺省 `0.0.0.0:8916`，所在局域网可直达网关（无身份即 403 仍需 `X-API-Key`，但裸 HTTP 无加密）。单机用 `GATEWAY_ADDR=127.0.0.1:8916` 收回环；多机用 WireGuard 组网后绑 WG 地址（如 `GATEWAY_ADDR=10.8.0.1:8916`），密钥走 WG，不改网关代码。破坏性收紧（REQUIRE_API_KEY 默认 1＋监听收 127.0.0.1）见 NEXT 计划 D3 提案，待拍板未执行。
+- D2 局域网敞口声明：`GATEWAY_ADDR` 缺省 `127.0.0.1:8916`（D3 已收紧；此前 `0.0.0.0:8916` 局域网可直达）。多机用 WireGuard 组网后绑 WG 地址（如 `GATEWAY_ADDR=10.8.0.1:8916`），密钥走 WG，不改网关代码；容器场景显式覆写 `0.0.0.0:8916`（见 compose）。D3 破坏性收紧（REQUIRE_API_KEY 默认 1＋监听收 127.0.0.1）已按拍板执行（步骤 27），回退置 `REQUIRE_API_KEY=0`＋`GATEWAY_ADDR=0.0.0.0:8916`。

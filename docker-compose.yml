@@ -81,13 +81,14 @@ services:
       - "8916:8916"
       - "9091:9091"
     environment:
-      REQUIRE_API_KEY: "0"
+      # D3：与宿主缺省一致，门默认开启（本地开发带 default_key 头）。
+      REQUIRE_API_KEY: "1"
       REDIS_URL: "redis://:${REDIS_PASSWORD:-123456}@redis:6379/"
       CLICKHOUSE_URL: "http://clickhouse:8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proxy}
       CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-123456}"
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-proxy}
-      # 容器内必须绑 0.0.0.0（默认 GATEWAY_ADDR 已是；METRICS 默认 127.0.0.1 需覆写）。
+      # 容器内必须绑 0.0.0.0（D3 起宿主缺省已收 127.0.0.1，此处两者均显式覆写）。
       GATEWAY_ADDR: "0.0.0.0:8916"
       METRICS_ADDR: "0.0.0.0:9091"
     depends_on:
@@ -96,7 +97,7 @@ services:
       clickhouse:
         condition: service_healthy
 
-  # OPT-2 环境门示例（REQUIRE_API_KEY=1 开启无头 403，容器/宿主通用）：
+  # OPT-2 环境门示例（D3 起默认开启，无头 403；`REQUIRE_API_KEY=0` 显式关闭，容器/宿主通用）：
   # R2-8 配置 env 化示例（缺省沿用 main.rs code 常量，只覆盖需改项）：
   #     REQUIRE_API_KEY: "1"
   #     REDIS_URL: "redis://redis:6379/"
