@@ -44,3 +44,6 @@ Desktop.ini
 
 # --- Docker 本地数据目录（防未来误加；当前均为具名卷，无宿主挂载） ---
 data/
+
+# --- 备份输出（tools/backup.ps1 默认写 backup/<stamp>/，大体积不进仓） ---
+/backup/

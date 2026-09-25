@@ -83,6 +83,16 @@ pub struct MetricsRegistry {
     free_fetch_ms_sum: DashMap<String, AtomicU64>,
     /// OPT-R4 B9：按源抓取次数（`free_pool_source_fetch_ms_count{source}` 渲染；与 sum 配对算均值）。
     free_fetch_count: DashMap<String, AtomicU64>,
+    /// OPT-R5 E5：单节点转发延迟直方图写侧（`free_pool_fwd_latency_ms` 渲染；
+    /// 桶口径复用 `DURATION_BUCKETS_MS`，单原子写＋render 前缀累加，与主 histogram 同模式）。
+    free_fwd_buckets: Vec<AtomicU64>,
+    /// OPT-R5 E5：单节点转发延迟总数（`free_pool_fwd_latency_ms_count` 渲染；`+Inf` 行同值）。
+    free_fwd_count: AtomicU64,
+    /// OPT-R5 E5：单节点转发延迟和（`free_pool_fwd_latency_ms_sum` 渲染；饱和累加）。
+    free_fwd_sum_ms: AtomicU64,
+    /// OPT-R5 E5：按出口分组计数（`free_pool_exit_total{exit_ip}` 渲染；
+    /// 轮转语义不在此处存“上次 exit”状态，由 PromQL `changes()` 看，见 render 注释）。
+    free_exit_total: DashMap<String, AtomicU64>,
 }
 
 /// OPT-R4 A4：u64 饱和累加（CAS 循环；长稳运行 sum 不回绕，Prometheus sum 曲线不倒退）。
@@ -144,6 +154,12 @@ impl MetricsRegistry {
             free_evicted: AtomicU64::new(0),
             free_fetch_ms_sum: DashMap::new(),
             free_fetch_count: DashMap::new(),
+            free_fwd_buckets: (0..DURATION_BUCKETS_MS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            free_fwd_count: AtomicU64::new(0),
+            free_fwd_sum_ms: AtomicU64::new(0),
+            free_exit_total: DashMap::new(),
         }
     }
 
@@ -282,6 +298,31 @@ impl MetricsRegistry {
             .entry(source.to_string())
             .or_insert_with(|| AtomicU64::new(0));
         saturating_add(sum.value(), ms);
+    }
+
+    /// OPT-R5 E5：单节点转发延迟记一笔（ms 直记；单次截断 60_000ms，和值饱和累加；
+    /// 空值不过滤，调用方保证只在 FullCheck 成功路径记）。
+    pub fn note_free_fwd_latency(&self, ms: u64) {
+        let ms = ms.min(60_000);
+        if let Some(i) = DURATION_BUCKETS_MS.iter().position(|bound| ms <= *bound) {
+            self.free_fwd_buckets[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // 超最大桶：只进 `_count`/`_sum`（`+Inf` 行），各 `le` 桶不动（与 observe 同口径）。
+        }
+        self.free_fwd_count.fetch_add(1, Ordering::Relaxed);
+        saturating_add(&self.free_fwd_sum_ms, ms);
+    }
+
+    /// OPT-R5 E5：出口分组记一笔（空串不记；None 由调用方跳过，不在此处展开 Option；
+    /// 轮转语义＝该序列 `changes()`，见 render/HELP 注释）。
+    pub fn note_free_exit(&self, exit_ip: &str) {
+        if exit_ip.is_empty() {
+            return;
+        }
+        self.free_exit_total
+            .entry(exit_ip.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
     /// Record one finished proxied response (called from `logging`).
     ///
@@ -615,6 +656,41 @@ impl MetricsRegistry {
                 "free_pool_source_fetch_ms_count{{source=\"{s}\"}} {n}\n"
             ));
         }
+        // OPT-R5 E5：单节点转发延迟直方图（桶口径复用 DURATION_BUCKETS_MS；
+        // 写侧单原子＋此处前缀累加成累计桶，渲染值恒单调）。
+        out.push_str(
+            "# HELP free_pool_fwd_latency_ms FreePool single-node forward latency in ms.\n",
+        );
+        out.push_str("# TYPE free_pool_fwd_latency_ms histogram\n");
+        let mut fwd_cumulative = 0u64;
+        for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
+            fwd_cumulative += self.free_fwd_buckets[i].load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "free_pool_fwd_latency_ms_bucket{{le=\"{bound}\"}} {fwd_cumulative}\n"
+            ));
+        }
+        let fwd_count = self.free_fwd_count.load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "free_pool_fwd_latency_ms_bucket{{le=\"+Inf\"}} {fwd_count}\n"
+        ));
+        out.push_str(&format!("free_pool_fwd_latency_ms_count {fwd_count}\n"));
+        out.push_str(&format!(
+            "free_pool_fwd_latency_ms_sum {}\n",
+            self.free_fwd_sum_ms.load(Ordering::Relaxed)
+        ));
+        // OPT-R5 E5：出口分组计数（轮转不在此处算状态机，由 PromQL
+        // `changes(free_pool_exit_total[5m])` 看轮转；无数据时只 HELP/TYPE 无行）。
+        out.push_str("# HELP free_pool_exit_total FreePool forward passes by exit ip.\n");
+        out.push_str("# TYPE free_pool_exit_total counter\n");
+        let mut exits: Vec<(String, u64)> = self
+            .free_exit_total
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        exits.sort();
+        for (ip, n) in exits {
+            out.push_str(&format!("free_pool_exit_total{{exit_ip=\"{ip}\"}} {n}\n"));
+        }
         out
     }
 }
@@ -905,6 +981,24 @@ mod tests {
         assert!(r.contains("free_pool_evicted_total 3"));
         assert!(r.contains("free_pool_source_fetch_ms_sum{source=\"api0\"} 200"));
         assert!(r.contains("free_pool_source_fetch_ms_count{source=\"api0\"} 2"));
+    }
+
+    #[test]
+    fn free_fwd_latency_and_exit_rendered() {
+        // OPT-R5 E5（S）：单节点转发延迟直方图＋出口分组计数（轮转由 PromQL changes() 看）。
+        let m = MetricsRegistry::new();
+        m.note_free_fwd_latency(3);
+        m.note_free_fwd_latency(1200);
+        m.note_free_exit("1.2.3.4");
+        m.note_free_exit("1.2.3.4");
+        m.note_free_exit("5.6.7.8");
+        let r = m.render();
+        // 桶行为：3ms 落 le>=5 首桶；1200ms 落 le>=2500；累计语义。
+        assert!(r.contains("free_pool_fwd_latency_ms_bucket{le=\"5\"} 1"));
+        assert!(r.contains("free_pool_fwd_latency_ms_bucket{le=\"+Inf\"} 2"));
+        assert!(r.contains("free_pool_fwd_latency_ms_count 2"));
+        assert!(r.contains("free_pool_exit_total{exit_ip=\"1.2.3.4\"} 2"));
+        assert!(r.contains("free_pool_exit_total{exit_ip=\"5.6.7.8\"} 1"));
     }
 
     #[tokio::test]

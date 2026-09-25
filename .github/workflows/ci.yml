@@ -53,9 +53,16 @@ jobs:
         run: |
           python3 -c "import json,glob; [json.load(open(p)) for p in glob.glob('deploy/grafana/**/*.json', recursive=True)]"
           docker compose config --quiet
-      - name: Gateway port consistency (8916, PORT-8916)
-        # 正向断言（比全仓扫 8080 稳：18080/888x/历史注记天然豁免）。
+      - name: Gateway D3 defaults (127.0.0.1:8916 + REQUIRE_API_KEY=1)
+        # D3 缺省双断言：监听缺省收回环＋API Key 门缺省开启（PORT-8916/D3；
+        # 正向断言，比全仓扫 8080 稳：18080/888x/历史注记天然豁免）。
         run: |
-          grep -q "0.0.0.0:8916" gateway/src/main.rs
+          grep -q "127.0.0.1:8916" gateway/src/main.rs
+          grep -q '!= Ok("0")' gateway/src/main.rs
           grep -q "127.0.0.1:8916" tools/ipp.ps1
           grep -q "127.0.0.1:8916" tools/ipp_sdk.py
+      # OPT-R5 O8：C6 转 CI 云端验镜像（本地 Hub 不通零验证；ubuntu runner 有 docker）。
+      - name: Gateway image build
+        run: docker build -t ipproxy-gateway:ci ./gateway
+      - name: Compose dual-profile config (gateway + observability)
+        run: docker compose --profile gateway --profile observability config --quiet

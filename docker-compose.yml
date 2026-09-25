@@ -77,9 +77,11 @@ services:
     build: ./gateway
     profiles: ["gateway"]
     container_name: ipproxy-gateway
+    # OPT-R5 O5：网关端口收回环（D3 回环缺省；局域网需敞口时用显式覆写，
+    # 如 compose.override.yml 打开 0.0.0.0:8916:8916）。
     ports:
-      - "8916:8916"
-      - "9091:9091"
+      - "127.0.0.1:8916:8916"
+      - "127.0.0.1:9091:9091"
     environment:
       # D3：与宿主缺省一致，门默认开启（本地开发带 default_key 头）。
       REQUIRE_API_KEY: "1"
@@ -156,7 +158,24 @@ services:
       redis:
         condition: service_healthy
 
+  # OPT-R5 O9：alertmanager（profile-gated opt-in；仿 redis-exporter；
+  # receiver 仍 empty 占位，只先可见不投递）。
+  # 用法：docker compose --profile observability up -d alertmanager
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    profiles: ["observability"]
+    container_name: ipproxy-alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./deploy/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+
 volumes:
   redis-data:
   clickhouse-data:
   grafana-data:
+  alertmanager-data:

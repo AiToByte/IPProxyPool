@@ -703,3 +703,24 @@
 - 计划操作：用户指令“继续执行”→按既定节奏先提交（9529b1c：步骤 27 D3，17 文件）再备下一轮。派三路并行深读（稳定性/代理能力/运维余量）得 24 条→用户选定全做。新建`plan/2026年9月25日-OPT-R5优化方案.md`（S 稳定性根治 7 项→E 代理能力 7 项→O 运维收尾 10 项＋门禁落库）；`TASK_PLAN.md` 步骤 28 置待执行；本文件 append-only 记立项。
 - 关键输入：稳定性路钉死 Windows 退出双机制（`#[tokio::main]` 嵌套 drop-runtime panic＋pingora-core 0.6 Windows Graceful 300s 硬编码）；运维路抓获 D3 残留漂移 10 处；E7 CONNECT 隧道（L）独立分支可最后做。
 - 验收线：Rust 项 TDD 红→绿；新源/云端验证先验证再接线；破坏性默认变更本计划零条；本文件 append-only。
+
+### [2026-09-25] 步骤 28-S 完成：稳定性根治（S1~S7）
+- **根因实锤**：pingora-core 0.6 `run()` 在 Windows 无 main_loop 恒走 Graceful＋`thread::sleep(grace)`（缺省 EXIT_TIMEOUT=300s 即 5 分钟准时退出）；叠加本网关 `#[tokio::main]` 内调 run_forever 致 runtimes 在 async 上下文创建/销毁，触发 tokio drop-panic（pingora 自家注释“keep the runtime outside async”即此忌）。
+- **实际操作**：S1（同步 main＋block_on 装配＋run_forever 主线程跑，runtime binding 活到进程结束）/S6（ServerConf grace 可配，`GATEWAY_GRACE_SECS` 缺省 300）/S7（panic hook 落盘＋缺省 RUST_BACKTRACE=1）/S3（metrics/prewarmer/prober/sweep＋CB/pubsub/arbitrage/ch_sink/free 共 9 处进 stop-aware supervise_until；telemetry 单通道所有权证单次性，注释留痕不包）/S4（健康超 60s 复位 backoff）/S5（watch 广播＋signal 任务 ctrl_c/SIGTERM；旧 supervise 无调用后删除；在飞 tick 不排空如实声明，数据面排空仍由 pingora grace 主宰）/S2（长稳放 Linux/容器结论落 plan）。
+- **纠错记录**：中途 main.rs 括号连环误判（盲改叠加致 arbitrage＋ch_sink 整段被 revert 误删；教训：Edit 改 footer 必须 python 断言＋cargo check 逐段）；已全量恢复＋迁移，旧 supervise 删除；clippy 死代码（audit_free_once 删/getters＋wave_count 转 cfg(test)）清零。
+- **验证结果**：fmt/clippy 零告警；supervise_until 双单测（即停零重启/退出记数后停）＋全量 203 绿；S1 live：GRACE=600 的 S1 二进制准时 600s 清洁退出（双 "All runtimes exited" 即 run＋run_forever 正常序列，零 panic；旧二进制同窗必 panic），旧 PID 的 panic 经时间线排除（非 S1 进程）。
+
+### [2026-09-25] 步骤 28-E 完成：代理能力（E1~E6 落地，E7 spike 暂缓）
+- **实际操作**：E1（tools/ipp.pac：HTTP 走 18080＋HTTPS/内网 DIRECT＋USAGE 中英引用；node 改名验语法）/E2（Node/Go/.NET/Java 四 SDK 包＋USAGE 指向；node --check＋gofmt＋逐行 API 核对）/E3（relayglass http 152 行＋socks5 114 行双路实测 200＋行形态对，入 DEFAULT_GITHUB_URL 5→7＋fixture 测试；其余 9 候选或双路失败或形态不兼容或体量淹没，记落选）/E4（chunked 分块读透传＋IPP_MAX_BODY_BYTES env＋响应侧保持；18081 实例三组实测：普通 200/chunked 透传到上游语义/11MB 默认 413＋调参放行）/E5（fwd 直方图＋exit 分组＋Grafana 两面板＋free_pool 打点接线）/E6（pre-extend 判定＋CL 预检＋早停；new 签名本就 env 化，main 零改动）/E7（spike：0.6 无 CONNECT/裸流 API，Session 仅 HttpSession 语义；隧道需自定义 Service 重写数据面，提案暂缓，501 保持）。
+- **纠错记录**：E-D agent 限流失败实为前人已做完整 E4（diff 核对三点一致，直接验收）；E5 打点误入 TCP 降级分支（无 res 作用域，E0425），回滚后改 FullCheck 成功分支；max_body getter 死代码转 cfg(test)＋去重签名。
+- **验证结果**：socks_bridge 8 绿＋metrics 16 绿＋free_pool 55 绿；Grafana 面板 5→7 live；E4 三组 live 全对。
+
+### [2026-09-25] 步骤 28-O 完成：运维收尾（O1~O10，注册/云端按口径未执行）
+- **实际操作**：O1（OPERATION 恢复节改 FREEZE 口径）/O2（USAGE 自检 E-A 已补四项）/O3（.gitignore＋/backup/）/O4（CHANGELOG 步骤 26 三行）/O5（gateway 端口收 127.0.0.1）/O6（CI 双断言 D3 缺省）/O7（看护头注释同步 onstart，注册仍需管理员未执行）/O8（CI 加 docker build＋双 profile config）/O9（alertmanager profile 服务＋prom 接线放开；顶层键裸 alertmanagers 致整库起不来，冒烟抓获后改 alerting: 包裹）/O10（restore.ps1 dry-run）。
+- **纠错记录**：prometheus.yml 顶层 `alertmanagers:` 非法（应为 `alerting:` 包裹）致容器 CrashLoop，日志定位后修正重载；CI O6 断言以正向 8916＋缺省开门为准。
+- **验证结果**：compose config 双 profile 通过；rules 5 条 health ok；installer status 可用；backup 全量四件套已在 26-C 验证。
+
+### [2026-09-25] 步骤 28-V 完成：最终门禁＋回归＋落库
+- **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 209 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（带密，无 SKIP）／bench 编译过／`--release bandit` 12 过。
+- **回归**：D3 新语义（plain/keyed 200＋nokey/badkey 403）＋sticky 200/nohost 400/metrics 200＋D1 四断言＋SDK 四断言＋适配器带 Key 回包；XLEN 流动（消费组 lag=0）＋CH 精确对账＋Grafana 7 面板有数；SupervisorRestarted firing 系本轮 kill/churn，非生产信号。
+- **落库**：本计划 §状态表 S✅E✅O✅V✅＋本文件四条目＋TASK 28✅；禁未授权 commit（本次未提交；在途网关在线）。

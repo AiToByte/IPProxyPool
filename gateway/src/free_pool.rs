@@ -1430,9 +1430,14 @@ pub const DEFAULT_HTML_URL: &str = "https://free-proxy-list.net/";
 /// openproxylist http/socks5 双文件 2026-09-24 实测 200（行内无标记，按 URL 嗅探协议）。
 /// OPT-R4 B12：第 4 源 monosans（在维护，日更；http＋socks5 双文件，2026-09-25
 /// 经 VPN 路径实测 200：http 393 行／socks5 444 行，`ip:port` 行形态复用 parse_with）。
-/// 落选：TheSpeedX/SOCKS-List（同日实测 200＋2714 行格式对，但仓库已停更、
-/// 体量会淹没 intake cap，记备份不接）。
-pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt";
+/// OPT-R5 E3：第 5 源 relayglass（5min 活检；jsdelivr 双路实测 200：http 152 行／
+/// socks5 114 行，裸 `ip:port` 复用 parse_with，首行见 `e3_relayglass_fixture_parses`）。
+/// 落选：TheSpeedX/SOCKS-List（延续备份不接）；proxyscrape-v2（py200形态对但curl直连000超时）／
+/// spys.me（proxy.txt-403/socks.txt 头文本非ip:port）／openproxy.space（py403/curl521）／
+/// freeproxyupdate（无raw只有HTML）／proxy-list.download（双路502）／proxyscrape-v4＋proxifly系
+/// （`scheme://ip:port`形态不兼容parse_with）／proxyspace.pro（双路200＋3901/3232行形态对但首行
+/// 0.0.0.0污染＋体量大记备份）／hproxy（双路200＋43k行形态对但淹没intake记备份）。
+pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt,https://cdn.jsdelivr.net/gh/relayglass/free-proxy-list@main/protocol/http/http.txt,https://cdn.jsdelivr.net/gh/relayglass/free-proxy-list@main/protocol/socks5/socks5.txt";
 pub const DEFAULT_FULL_CHECK_BASE: &str = "https://httpbin.org";
 
 /// FullCheck 任务装配 helper（许可拿不到按失败计，沿 R2-7 `?`-in-bool 教训）。
@@ -1795,6 +1800,11 @@ impl FreePoolWorker {
                     if res.anon == AnonLevel::Elite {
                         self.metrics.note_free_source_elite(&raw.source);
                     }
+                    // OPT-R5 E5：FullCheck 成功路径记转发延迟＋出口（轮转由 PromQL 看）。
+                    self.metrics.note_free_fwd_latency(res.fwd_latency_ms);
+                    if let Some(ref exit) = res.exit_ip {
+                        self.metrics.note_free_exit(exit);
+                    }
                     // P4-1 geo 观察＋执法映射（默认只观察；开关开且实锤分歧→复检失败）。
                     let verdict = self.observe_geo(&raw, res.exit_ip.as_deref());
                     if self.config.geo_enforce {
@@ -2097,6 +2107,30 @@ mod tests {
             FreeProto::Socks5,
         );
         assert_eq!(socks.len(), 2);
+        assert!(socks.iter().all(|n| n.proto == FreeProto::Socks5));
+    }
+
+    #[test]
+    fn e3_relayglass_fixture_parses() {
+        // OPT-R5 E3：relayglass 双路实测首行（2026-09-25：py200＋curl200；
+        // http 152 行／socks5 114 行，裸 `ip:port` 无标记，靠默认协议）。
+        let http = GitHubSource::parse_with(
+            "relay",
+            "152.53.183.107:8081\n213.157.6.50:80\n",
+            FreeProto::Http,
+        );
+        assert_eq!(http.len(), 2);
+        assert_eq!(http[0].ip, "152.53.183.107");
+        assert_eq!(http[0].port, 8081);
+        assert!(http.iter().all(|n| n.proto == FreeProto::Http));
+        let socks = GitHubSource::parse_with(
+            "relay",
+            "169.58.97.115:1080\n185.87.255.54:1080\n",
+            FreeProto::Socks5,
+        );
+        assert_eq!(socks.len(), 2);
+        assert_eq!(socks[0].ip, "169.58.97.115");
+        assert_eq!(socks[0].port, 1080);
         assert!(socks.iter().all(|n| n.proto == FreeProto::Socks5));
     }
 

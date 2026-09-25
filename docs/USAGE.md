@@ -24,7 +24,7 @@ c = IPPClient("http://127.0.0.1:8916", session="job-42", tier="free", proto="soc
 status, body = c.get("http://httpbin.org/ip")   # 503 自动延迟重试 1 次
 ```
 
-自检：`python tools/ipp_sdk.py --self-test`（普通 200＋粘滞 200＋坏 Key 403）。
+自检：`python tools/ipp_sdk.py --self-test`（普通 200＋粘滞 200＋坏 Key 403＋无 Key 403）。
 
 ### 方式三：前置适配器（`tools/ipp_forward.py`，接浏览器/系统代理/标准 `HTTP_PROXY`）
 
@@ -42,6 +42,8 @@ Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 # 还原：ProxyEnable 0
 ```
 
+PAC 自动分流（`tools/ipp.pac`）：浏览器代理自动配置 URL 用 `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`；HTTP 走适配器 `127.0.0.1:18080`，HTTPS（CONNECT）与内网/局域网直连 `DIRECT`（绕开适配器 501 限制，见限制表）。
+
 ### 方式四：一键启停与观测（`tools/ipp.ps1`）
 
 ```powershell
@@ -52,12 +54,9 @@ powershell -ExecutionPolicy Bypass -File tools/ipp.ps1 stop          # 精确停
 
 观测：Grafana `:3000` 5 面板；`:9091/metrics` 16 组指标；`SELECT count() FROM proxy.proxy_telemetry_log` 随流量涨。
 
-### 多语言片段（展示，语义同 SDK）
+### 多语言 SDK（语义同 Python SDK，详见各文件头用法＋自检）
 
-Node (`fetch`)：`fetch("http://127.0.0.1:8916/ip", {headers:{Host:"httpbin.org","X-Api-Key":"default_key","X-Proxy-Tier":"free"}})`。
-.NET：`HttpClient` 发 `GET http://127.0.0.1:8916/ip` 并加 `Host`/`X-*` 请求头（必带 `X-Api-Key`；注意 `HttpClient` 默认保护 Host 头，需用 `request.Headers.Host`）。
-Go：`http.NewRequest("GET","http://127.0.0.1:8916/ip",nil)` 后 `req.Host="httpbin.org"`＋`req.Header.Set("X-Api-Key","default_key")`＋`req.Header.Set("X-Proxy-Tier","free")`。
-Java：`HttpRequest.newBuilder(URI.create("http://127.0.0.1:8916/ip")).header("Host","httpbin.org").header("X-Api-Key","default_key")`。
+Node 见 `tools/ipp_sdk_node.js`、Go 见 `tools/ipp_sdk_go.go`、.NET 见 `tools/ipp_sdk_dotnet.cs`、Java 见 `tools/ipp_sdk_java.java`（自检默认不自动跑，仅网关/mocks 活着时手动跑）。
 
 ### 限制表（实测结论）
 
@@ -118,6 +117,8 @@ Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 # revert: ProxyEnable 0
 ```
 
+PAC auto-split (`tools/ipp.pac`): browser proxy auto-config URL `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`; HTTP via adaptor `127.0.0.1:18080`, HTTPS (CONNECT) plus intranet/LAN `DIRECT` (bypasses adaptor 501 limits, see limits).
+
 ### Mode 4: One-click ops & observability (`tools/ipp.ps1`)
 
 ```powershell
@@ -128,12 +129,9 @@ powershell -ExecutionPolicy Bypass -File tools/ipp.ps1 stop
 
 Observe: Grafana `:3000` (5 panels); `:9091/metrics` (16 groups); `SELECT count() FROM proxy.proxy_telemetry_log` grows with traffic.
 
-### Snippets (illustrative, same semantics as SDK)
+### SDKs (same semantics as Python SDK; see file headers for usage + self-test)
 
-Node (`fetch`): `fetch("http://127.0.0.1:8916/ip", {headers:{Host:"httpbin.org","X-Api-Key":"default_key","X-Proxy-Tier":"free"}})`.
-.NET: `HttpClient` `GET http://127.0.0.1:8916/ip` plus `Host`/`X-*` headers (`X-Api-Key` required; note: set `Host` via `request.Headers.Host`).
-Go: `http.NewRequest(...)` then `req.Host="httpbin.org"` + `req.Header.Set("X-Api-Key","default_key")` + `req.Header.Set("X-Proxy-Tier","free")`.
-Java: `HttpRequest.newBuilder(URI.create("http://127.0.0.1:8916/ip")).header("Host","httpbin.org").header("X-Api-Key","default_key")`.
+Node `tools/ipp_sdk_node.js`, Go `tools/ipp_sdk_go.go`, .NET `tools/ipp_sdk_dotnet.cs`, Java `tools/ipp_sdk_java.java` (self-tests never auto-run; run manually only while gateway/mocks are alive).
 
 ### Limits (drill conclusions)
 

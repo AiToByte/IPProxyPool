@@ -102,6 +102,20 @@ pub struct BridgeResponse {
     pub body: bytes::Bytes,
 }
 
+/// E6：单 chunk 接纳判定（纯函数；`true`＝接纳后仍在上限内，含等于边界）。
+/// fetch 在 `extend` 前调用，超限 chunk 不进缓冲即早停（大文件不 transient 超占）；
+/// 饱和加防极端长度溢出 wrap。
+pub(crate) fn within_body_cap(current: usize, incoming: usize, max_body: u64) -> bool {
+    (current as u64).saturating_add(incoming as u64) <= max_body
+}
+
+/// E6：Content-Length 声明预检（纯函数；`true`＝声明即超限，可零读取早停）。
+/// 上游谎报偏大只会多一次换节点重试（调用方既有语义），不污染计量
+/// （`transferred_bytes` 只在成功时赋值，见 gateway `serve_via_socks`）。
+pub(crate) fn content_length_over_cap(content_length: Option<u64>, max_body: u64) -> bool {
+    matches!(content_length, Some(n) if n > max_body)
+}
+
 /// 某节点的出站代理 URL（socks5 走远端解析 `socks5h`；账密编码复用 prober 单份实现）。
 /// Http 节点桥不接 → None（防御分支，正常走不到：选路隔离已拦）。
 pub(crate) fn proxy_url_for_node(node: &ProxyNode) -> Option<String> {
@@ -149,6 +163,13 @@ impl SocksBridge {
     /// A9：单跳出站 timeout（整轮总预算＝此值＋8s 松弛，见 gateway `socks_overall_budget`）。
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// E6：出站 body 上限（`new` 第二参注入；main 经 `SOCKS_MAX_BODY_BYTES` 接 env，默认 10MB）。
+    /// 仅单测读取生产值（生产侧直接用字段），故 cfg(test)。
+    #[cfg(test)]
+    pub fn max_body(&self) -> u64 {
+        self.max_body
     }
 
     fn client_for(&self, node: &ProxyNode) -> Option<reqwest::Client> {
@@ -214,19 +235,29 @@ impl SocksBridge {
                 headers.push((name, val.to_string()));
             }
         }
-        // 逐 chunk 累加＋上限（超限即 Err，防内存爆；调用方按失败计）。
+        // E6：Content-Length 声明预检（超限零读取早停；错误文案前缀与旧口径一致，
+        // 调用方 gateway `serve_via_socks` 仍按失败计：bridge_errors＋换节点重试）。
+        if content_length_over_cap(resp.content_length(), self.max_body) {
+            return Err(format!(
+                "socks bridge: body over cap {} bytes (content-length {})",
+                self.max_body,
+                resp.content_length().unwrap_or(0),
+            ));
+        }
+        // E6：逐 chunk 累加＋上限（`extend` 前先判，超限 chunk 不进缓冲即早停，
+        // 大文件不 transient 超占；调用方按失败计）。
         use futures::StreamExt;
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let c = chunk.map_err(|e| format!("socks bridge: body read failed: {e}"))?;
-            body.extend_from_slice(&c);
-            if body.len() as u64 > self.max_body {
+            if !within_body_cap(body.len(), c.len(), self.max_body) {
                 return Err(format!(
                     "socks bridge: body over cap {} bytes",
                     self.max_body
                 ));
             }
+            body.extend_from_slice(&c);
         }
         Ok(BridgeResponse {
             status,
@@ -342,77 +373,156 @@ mod tests {
         assert_eq!(proxy_url_for_node(&http), None);
     }
 
-    /// 本地 relay-stub（~50 行）：SOCKS5 握手→CONNECT 解析目标→直连目标→双向管道。
+    /// 单连接 relay 逻辑（SOCKS5 握手→CONNECT 解析目标→直连目标→双向管道），
     /// 即“最简 SOCKS5 出口”，专供桥透传断言（解密/改写一律不做）。
+    async fn relay_once(mut s: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // greeting。
+        let mut head = [0u8; 2];
+        if s.read_exact(&mut head).await.is_err() {
+            return;
+        }
+        let mut methods = vec![0u8; head[1] as usize];
+        if s.read_exact(&mut methods).await.is_err() {
+            return;
+        }
+        if s.write_all(&[0x05, 0x00]).await.is_err() {
+            return;
+        }
+        // CONNECT：VER CMD RSV ATYP＋地址体。
+        let mut req4 = [0u8; 4];
+        if s.read_exact(&mut req4).await.is_err() {
+            return;
+        }
+        let (host, port) = match req4[3] {
+            0x01 => {
+                let mut b = [0u8; 6];
+                if s.read_exact(&mut b).await.is_err() {
+                    return;
+                }
+                (
+                    std::net::IpAddr::from([b[0], b[1], b[2], b[3]]).to_string(),
+                    u16::from_be_bytes([b[4], b[5]]),
+                )
+            }
+            0x03 => {
+                let mut l = [0u8; 1];
+                if s.read_exact(&mut l).await.is_err() {
+                    return;
+                }
+                let mut b = vec![0u8; l[0] as usize + 2];
+                if s.read_exact(&mut b).await.is_err() {
+                    return;
+                }
+                let n = b.len();
+                (
+                    String::from_utf8_lossy(&b[..n - 2]).to_string(),
+                    u16::from_be_bytes([b[n - 2], b[n - 1]]),
+                )
+            }
+            _ => return,
+        };
+        let mut up = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = s
+                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return;
+            }
+        };
+        if s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
+    }
+
+    /// 本地 relay-stub（单连接；存量透传断言用，语义与旧实现一致）。
     async fn spawn_relay_stub() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.expect("accept");
+            relay_once(s).await;
+        });
+        port
+    }
+
+    /// E6：循环版 relay-stub（多连接；单测内多次 fetch 共用一个出口）。
+    async fn spawn_relay_loop() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(relay_once(s));
+            }
+        });
+        port
+    }
+
+    /// E6：按路径路由的 mock 源站（短连接；`/big` 诚实 256B，`/chunked` 分块 256B 无 CL，
+    /// `/lying` 声明 100MB 实发 16B 后关连接——供零读取预检断言）。
+    async fn serve_routed_mock() -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.expect("accept");
-            // greeting。
-            let mut head = [0u8; 2];
-            if s.read_exact(&mut head).await.is_err() {
-                return;
-            }
-            let mut methods = vec![0u8; head[1] as usize];
-            if s.read_exact(&mut methods).await.is_err() {
-                return;
-            }
-            if s.write_all(&[0x05, 0x00]).await.is_err() {
-                return;
-            }
-            // CONNECT：VER CMD RSV ATYP＋地址体。
-            let mut req4 = [0u8; 4];
-            if s.read_exact(&mut req4).await.is_err() {
-                return;
-            }
-            let (host, port) = match req4[3] {
-                0x01 => {
-                    let mut b = [0u8; 6];
-                    if s.read_exact(&mut b).await.is_err() {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if head.contains("/lying") {
+                        // 声明 100MB 实发 16B 后直接关连接（旧实现读到断流报 read failed，
+                        // 新实现 Content-Length 预检零读取即 over cap）。
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-length: 104857600\r\nconnection: close\r\n\r\n0123456789abcdef",
+                            )
+                            .await;
+                        let _ = s.shutdown().await;
                         return;
                     }
-                    (
-                        std::net::IpAddr::from([b[0], b[1], b[2], b[3]]).to_string(),
-                        u16::from_be_bytes([b[4], b[5]]),
-                    )
-                }
-                0x03 => {
-                    let mut l = [0u8; 1];
-                    if s.read_exact(&mut l).await.is_err() {
+                    if head.contains("/chunked") {
+                        // 无 Content-Length 的分块体（走逐 chunk 累加口径；256 == 0x100）。
+                        let body = vec![b'x'; 256];
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n100\r\n",
+                            )
+                            .await;
+                        let _ = s.write_all(&body).await;
+                        let _ = s.write_all(b"\r\n0\r\n\r\n").await;
                         return;
                     }
-                    let mut b = vec![0u8; l[0] as usize + 2];
-                    if s.read_exact(&mut b).await.is_err() {
-                        return;
-                    }
-                    let n = b.len();
-                    (
-                        String::from_utf8_lossy(&b[..n - 2]).to_string(),
-                        u16::from_be_bytes([b[n - 2], b[n - 1]]),
-                    )
-                }
-                _ => return,
-            };
-            let mut up = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
-                Ok(v) => v,
-                Err(_) => {
+                    let body = vec![b'x'; 256];
                     let _ = s
-                        .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
                         .await;
-                    return;
-                }
-            };
-            if s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await
-                .is_err()
-            {
-                return;
+                    let _ = s.write_all(&body).await;
+                });
             }
-            let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
         });
         port
     }
@@ -463,5 +573,83 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "x-custom" && v == "yes"));
         assert!(!res.headers.iter().any(|(k, _)| k == "connection"));
+    }
+
+    #[test]
+    fn bridge_body_cap_checker_blocks_over_cap_chunk_before_buffering() {
+        // E6：超限 chunk 在 extend 前即判停（含等于边界放行；饱和加防极端长度溢出 wrap）。
+        assert!(within_body_cap(0, 10, 10));
+        assert!(within_body_cap(6, 4, 10));
+        assert!(!within_body_cap(6, 5, 10));
+        assert!(!within_body_cap(0, 11, 10));
+        assert!(within_body_cap(usize::MAX, 0, u64::MAX));
+        // 饱和到 u64::MAX 后仍大于 `u64::MAX - 1` 上限（无 wrap 回绕误放行）。
+        assert!(!within_body_cap(usize::MAX, 1, u64::MAX - 1));
+    }
+
+    #[test]
+    fn bridge_content_length_precheck_trips_without_reading() {
+        // E6：声明超限零读取早停（未知长度不拦；等于边界放行，由逐 chunk 口径兜底）。
+        assert!(!content_length_over_cap(None, 16));
+        assert!(!content_length_over_cap(Some(16), 16));
+        assert!(content_length_over_cap(Some(17), 16));
+        assert!(content_length_over_cap(Some(100 * 1024 * 1024), 16));
+    }
+
+    #[test]
+    fn bridge_max_body_configurable_via_new() {
+        // E6：上限可配——同 chunk 序列在不同 max_body 下判定不同（经 new 第二参注入）。
+        let tiny = SocksBridge::new(Duration::from_secs(10), 16);
+        let big = SocksBridge::new(Duration::from_secs(10), 1024 * 1024);
+        assert_eq!(tiny.max_body(), 16);
+        assert_eq!(big.max_body(), 1024 * 1024);
+        assert!(!within_body_cap(0, 256, tiny.max_body()));
+        assert!(within_body_cap(0, 256, big.max_body()));
+        // 下限钳制（0 → 1，沿既有 `.max(1)` 语义）。
+        assert_eq!(SocksBridge::new(Duration::from_secs(10), 0).max_body(), 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_fetch_stops_early_on_over_cap_body() {
+        // E6 超限早停＋上限可配（同上游不同 max_body 行为不同；错误口径与 gateway
+        // 调用方兼容：Err(String) 含 "over cap"，调用方记 bridge_errors＋换节点重试）。
+        let mock_port = serve_routed_mock().await;
+        let relay = spawn_relay_loop().await;
+        let node = socks5_node("127.0.0.1", relay);
+        let tiny = SocksBridge::new(Duration::from_secs(10), 16);
+        let big = SocksBridge::new(Duration::from_secs(10), 1024 * 1024);
+        let get = |path: &str| BridgeRequest {
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:{mock_port}{path}"),
+            headers: vec![("host".to_string(), format!("127.0.0.1:{mock_port}"))],
+            body: None,
+        };
+        // 诚实 256B：小上限 Content-Length 预检即停（Err），大上限全量成功。
+        // 注：不用 `expect_err`（`BridgeResponse` 无 Debug，不为单测加 derive 污染出参结构）。
+        let err = match tiny.fetch(&node, get("/big")).await {
+            Ok(_) => panic!("tiny cap must reject 256B"),
+            Err(e) => e,
+        };
+        assert!(err.contains("over cap"), "unexpected: {err}");
+        let ok = big
+            .fetch(&node, get("/big"))
+            .await
+            .expect("big cap must pass 256B");
+        assert_eq!(ok.body.len(), 256);
+        // 无 CL 分块体：走逐 chunk 累加口径，同样早停。
+        let err_chunked = match tiny.fetch(&node, get("/chunked")).await {
+            Ok(_) => panic!("tiny cap must reject chunked 256B"),
+            Err(e) => e,
+        };
+        assert!(
+            err_chunked.contains("over cap"),
+            "unexpected: {err_chunked}"
+        );
+        // 谎报 100MB：零读取预检即 over cap（旧实现会先读 16B 再断流报 read failed）。
+        let err_lying = match tiny.fetch(&node, get("/lying")).await {
+            Ok(_) => panic!("lying CL must trip precheck"),
+            Err(e) => e,
+        };
+        assert!(err_lying.contains("over cap"), "unexpected: {err_lying}");
     }
 }

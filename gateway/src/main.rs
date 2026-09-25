@@ -49,6 +49,7 @@ use router::RouterEngine;
 use socks_bridge::SocksBridge;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
+use std::time::Instant;
 use telemetry::{TelemetryEvent, TelemetryPublisher, TelemetryWorker, TELEMETRY_CHANNEL_CAP};
 use tenant::TenantManager;
 use tokio::sync::Semaphore;
@@ -115,28 +116,71 @@ fn skipped_probe_result() -> prober::ProbeResult {
     }
 }
 
-/// R2-8 后台 supervisor：worker 退出（panic 由 `JoinHandle` 捕获/意外返回）
-/// 即计数进 metrics + 指数 backoff（1s 起，封顶 60s）重启。本轮包 CB/sink/
-/// arbitrage 三个常驻消费组（telemetry/prober/sweep/prewarmer 维持现状）。
-async fn supervise<Make, Fut>(worker: &'static str, metrics: Arc<MetricsRegistry>, make: Make)
-where
+// OPT-R4 S5 stop-aware supervisor: stop broadcast aborts current run without respawn.
+// Boundary: in-flight ticks are not drained (abort lands on await points;
+// telemetry loss stays counted via channel_dropped/flush_dropped). Data-plane
+// drain remains governed by pingora grace; this only stops background revival.
+async fn supervise_until<Make, Fut>(
+    worker: &'static str,
+    metrics: Arc<MetricsRegistry>,
+    make: Make,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
     Make: Fn() -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let mut backoff = Duration::from_secs(1);
     loop {
+        // S5: stop broadcasts are honored at iteration boundaries and during
+        // backoff sleeps. In-flight runs are NOT aborted (bounded by worker
+        // tick timeouts); respawns stop, so shutdown windows see no churn.
+        if *stop.borrow() {
+            log::warn!("[Supervisor] {worker} stop set, exiting loop");
+            return;
+        }
+        let started = Instant::now();
         match tokio::spawn(make()).await {
             Ok(()) => log::error!("[Supervisor] {worker} exited unexpectedly, restarting"),
             Err(e) => log::error!("[Supervisor] {worker} panicked ({e:?}), restarting"),
         }
         metrics.note_supervisor_restart(worker);
-        tokio::time::sleep(backoff).await;
+        if started.elapsed() > Duration::from_secs(60) {
+            backoff = Duration::from_secs(1);
+        }
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|s| *s) => {
+                log::warn!("[Supervisor] {worker} stop during backoff, exiting loop");
+                return;
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// OPT-R4 S1/S7 同步入口.
+/// 后台 workers 跑在本 runtime 上（binding 活到进程结束，run_forever 永不返回）。
+fn main() {
+    // S7：panic 首行落盘（stderr 进 log/gw.err）＋缺省开 backtrace。
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[panic] {info}");
+    }));
+    if std::env::var("RUST_BACKTRACE").is_err() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let server = runtime.block_on(setup_gateway());
+    // runtime 不 drop（workers 在上面跑；run_forever 发散，drop 走不到）。
+    let _keep_alive = runtime;
+    server.run_forever();
+}
+
+/// 原 async main 本体：装配全部依赖＋后台 workers，返回配好的 Server。
+async fn setup_gateway() -> Server {
     // Must run before any rustls use (ring + aws-lc-rs both compiled in).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -238,11 +282,23 @@ async fn main() {
         telemetry_dropped.clone(),
         channel_dropped.clone(),
     ));
-    let metrics_addr = env_str("METRICS_ADDR", METRICS_ADDR);
-    let metrics_for_serve = metrics.clone();
-    tokio::spawn(async move {
-        serve_metrics(metrics_for_serve, &metrics_addr).await;
-    });
+    // OPT-R4 S5 shutdown broadcast (signal task holds the only Sender).
+    let (shutdown_tx, _shutdown_rx0) = tokio::sync::watch::channel(false);
+    // OPT-R4 S3/S5: metrics serve under supervise_until.
+    let serve_metrics_clone = metrics.clone();
+    let serve_addr = env_str("METRICS_ADDR", METRICS_ADDR);
+    tokio::spawn(supervise_until(
+        "metrics",
+        metrics.clone(),
+        move || {
+            let m = serve_metrics_clone.clone();
+            let addr = serve_addr.clone();
+            async move {
+                serve_metrics(m, &addr).await;
+            }
+        },
+        shutdown_tx.clone().subscribe(),
+    ));
 
     // 3. Zero-blocking telemetry pipe (capacity 10,000).
     // R2-4 降级零构造：无 Redis 时 publisher 不创建，网关 `logging` 走 None 分支，
@@ -327,19 +383,25 @@ async fn main() {
         };
         let free_router = router.clone();
         let free_metrics = metrics.clone();
+        let free_stop = shutdown_tx.subscribe();
         tokio::spawn(async move {
             tokio::time::sleep(startup_jitter()).await;
             log::info!("[FreePool] staggered start (second supply line)");
-            supervise("free_pool", free_metrics.clone(), move || {
-                let w = FreePoolWorker::new(
-                    free_router.clone(),
-                    free_metrics.clone(),
-                    free_config.clone(),
-                )
-                .with_geo(free_geo.clone());
-                // VPN-IMMUNE：共享 Client 禁系统代理（`free_pool::shared_client`）。
-                async move { w.run(free_pool::shared_client()).await }
-            })
+            supervise_until(
+                "free_pool",
+                free_metrics.clone(),
+                move || {
+                    let w = FreePoolWorker::new(
+                        free_router.clone(),
+                        free_metrics.clone(),
+                        free_config.clone(),
+                    )
+                    .with_geo(free_geo.clone());
+                    // VPN-IMMUNE：共享 Client 禁系统代理（`free_pool::shared_client`）。
+                    async move { w.run(free_pool::shared_client()).await }
+                },
+                free_stop,
+            )
             .await;
         });
     }
@@ -358,16 +420,21 @@ async fn main() {
         let cb_conn = conn.clone();
         let cb_router = router.clone();
         let cb_metrics = metrics.clone();
-        tokio::spawn(supervise("circuit_breaker", cb_metrics, move || {
-            PassiveCircuitBreaker::new(
-                cb_conn.clone(),
-                STREAM_KEY.to_string(),
-                CONSUMER_GROUP.to_string(),
-                "worker_01".to_string(),
-                cb_router.clone(),
-            )
-            .run()
-        }));
+        tokio::spawn(supervise_until(
+            "circuit_breaker",
+            cb_metrics,
+            move || {
+                PassiveCircuitBreaker::new(
+                    cb_conn.clone(),
+                    STREAM_KEY.to_string(),
+                    CONSUMER_GROUP.to_string(),
+                    "worker_01".to_string(),
+                    cb_router.clone(),
+                )
+                .run()
+            },
+            shutdown_tx.clone().subscribe(),
+        ));
 
         // PubSub delta sync → in-memory quarantine.
         // NEXT-A0：连接/订阅失败/流终止不再永久失联——包进 supervise，
@@ -375,32 +442,37 @@ async fn main() {
         let router_clone = router.clone();
         let sub_client = redis_client.clone();
         let sync_metrics = metrics.clone();
-        tokio::spawn(supervise("pubsub_delta", sync_metrics, move || {
-            let router_clone = router_clone.clone();
-            let sub_client = sub_client.clone();
-            async move {
-                let mut pubsub = match sub_client.get_async_pubsub().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("[Sync] PubSub connect failed: {e:?}");
+        tokio::spawn(supervise_until(
+            "pubsub_delta",
+            sync_metrics,
+            move || {
+                let router_clone = router_clone.clone();
+                let sub_client = sub_client.clone();
+                async move {
+                    let mut pubsub = match sub_client.get_async_pubsub().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::error!("[Sync] PubSub connect failed: {e:?}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = pubsub.subscribe(DELTA_CHANNEL).await {
+                        log::error!("[Sync] PubSub subscribe failed: {e:?}");
                         return;
                     }
-                };
-                if let Err(e) = pubsub.subscribe(DELTA_CHANNEL).await {
-                    log::error!("[Sync] PubSub subscribe failed: {e:?}");
-                    return;
-                }
-                let mut stream = pubsub.on_message();
-                use futures::StreamExt;
-                while let Some(msg) = stream.next().await {
-                    let payload: String = msg.get_payload().unwrap_or_default();
-                    if crate::circuit_breaker::apply_delta(&router_clone, &payload) {
-                        log::info!("[Sync] Applied delta quarantine: {payload}");
+                    let mut stream = pubsub.on_message();
+                    use futures::StreamExt;
+                    while let Some(msg) = stream.next().await {
+                        let payload: String = msg.get_payload().unwrap_or_default();
+                        if crate::circuit_breaker::apply_delta(&router_clone, &payload) {
+                            log::info!("[Sync] Applied delta quarantine: {payload}");
+                        }
                     }
+                    log::warn!("[Sync] delta stream ended, restarting");
                 }
-                log::warn!("[Sync] delta stream ended, restarting");
-            }
-        }));
+            },
+            shutdown_tx.clone().subscribe(),
+        ));
     } else {
         // R2-4：降级收发两端都丢弃（tx 随 publisher 闭包释放、rx 在此释放），
         // 通道彻底关闭，无残留缓冲。
@@ -512,23 +584,29 @@ async fn main() {
     let arb_analytics = analytics.clone();
     let arb_router = router.clone();
     let arb_metrics = metrics.clone();
+    let arb_stop = shutdown_tx.subscribe();
     tokio::spawn(async move {
         tokio::time::sleep(startup_jitter()).await;
         log::info!("[Arbitrage] staggered start (R2-7 jitter)");
-        supervise("arbitrage", arb_metrics, move || {
-            VendorArbitrageWorker::new(
-                arb_analytics.clone(),
-                arb_router.clone(),
-                vec![
-                    "mock-a".to_string(),
-                    "mock-b".to_string(),
-                    "mock-c".to_string(),
-                ],
-                vec!["US".to_string(), "JP".to_string(), "GB".to_string()],
-            )
-            .with_interval(arb_interval)
-            .run()
-        })
+        supervise_until(
+            "arbitrage",
+            arb_metrics,
+            move || {
+                VendorArbitrageWorker::new(
+                    arb_analytics.clone(),
+                    arb_router.clone(),
+                    vec![
+                        "mock-a".to_string(),
+                        "mock-b".to_string(),
+                        "mock-c".to_string(),
+                    ],
+                    vec!["US".to_string(), "JP".to_string(), "GB".to_string()],
+                )
+                .with_interval(arb_interval)
+                .run()
+            },
+            arb_stop,
+        )
         .await;
     });
 
@@ -538,14 +616,19 @@ async fn main() {
         let pump_conn = conn.clone();
         let pump_analytics = analytics.clone();
         let pump_metrics = metrics.clone();
-        tokio::spawn(supervise("ch_sink", pump_metrics, move || {
-            ChSinkWorker::new(
-                pump_conn.clone(),
-                pump_analytics.clone(),
-                STREAM_KEY.to_string(),
-            )
-            .run()
-        }));
+        tokio::spawn(supervise_until(
+            "ch_sink",
+            pump_metrics,
+            move || {
+                ChSinkWorker::new(
+                    pump_conn.clone(),
+                    pump_analytics.clone(),
+                    STREAM_KEY.to_string(),
+                )
+                .run()
+            },
+            shutdown_tx.clone().subscribe(),
+        ));
     } else {
         log::warn!("[GW-R2] sink pump offline (no Redis), warehouse landings paused");
     }
@@ -585,9 +668,38 @@ async fn main() {
         }
     });
 
+    // OPT-R4 S5: signal watcher holds the only shutdown Sender alive.
+    // ctrl_c everywhere; SIGTERM additionally on unix. Firing stops
+    // background respawns (data-plane drain stays governed by pingora grace).
+    let signal_tx = shutdown_tx;
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        log::warn!("[Shutdown] signal received, stopping background respawns");
+        let _ = signal_tx.send(true);
+    });
     // 5. Pingora data plane.
     let opt = Opt::parse_args();
-    let mut server = Server::new(Some(opt)).expect("Failed to create Pingora server");
+    let mut conf =
+        pingora_core::server::configuration::ServerConf::new().expect("ServerConf defaults");
+    conf.grace_period_seconds = Some(
+        env_str("GATEWAY_GRACE_SECS", "300")
+            .parse::<u64>()
+            .unwrap_or(300),
+    );
+    let mut server = Server::new_with_opt_and_conf(Some(opt), conf);
     server.bootstrap();
 
     let mut proxy_service = pingora_proxy::http_proxy_service(
@@ -613,7 +725,7 @@ async fn main() {
         "Pingora Smart Proxy Gateway (GW-4 tenants + arbitrage + metrics) on {gateway_addr}"
     );
     server.add_service(proxy_service);
-    server.run_forever();
+    server
 }
 
 #[cfg(test)]
@@ -709,5 +821,70 @@ mod tests {
         let sem = Arc::new(Semaphore::new(1));
         sem.close();
         assert!(sem.acquire_owned().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn supervise_until_immediate_stop_no_restart() {
+        // OPT-R4 S5：预置 stop 即返，不起 worker、不计数（60s 上限防挂）。
+        use crate::metrics::MetricsRegistry;
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("preset stop");
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            supervise_until(
+                "t-stop",
+                metrics,
+                move || {
+                    let runs2 = runs2.clone();
+                    async move {
+                        runs2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                rx,
+            ),
+        )
+        .await
+        .expect("stop must return promptly");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn supervise_until_restart_then_stop() {
+        // OPT-R4 S3/S5：worker 退出一次记一次重启；随后 stop 即停不再拉。
+        use crate::metrics::MetricsRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        let h = tokio::spawn(supervise_until(
+            "t-restart",
+            metrics.clone(),
+            move || {
+                let runs2 = runs2.clone();
+                async move {
+                    runs2.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            rx,
+        ));
+        // 等一次退出重启发生（worker 空转即返，backoff 首轮 1s）。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runs.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(runs.load(Ordering::Relaxed) >= 1, "worker must run first");
+        tx.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(60), h)
+            .await
+            .expect("stop must join promptly")
+            .expect("supervise task panicked");
+        let n = runs.load(Ordering::Relaxed);
+        // 停后不再拉：静置 1.5s（>首轮 backoff 1s）计数冻结。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(runs.load(Ordering::Relaxed), n, "no respawn after stop");
     }
 }

@@ -3,8 +3,9 @@
    exit ~every 5 min); this loop does: probe :8916/:9091, relaunch on miss
    with backoff, one line per action to log/ipp-watchdog.out.
     Run detached: python log/launch_detached.py powershell.exe log/ipp-watchdog.out log/ipp-watchdog.err -ExecutionPolicy Bypass -File D:\_MyProject\SuperSoft\IPProxyPool\tools\ipp_watchdog.ps1
-   Autostart at boot (TEMPLATE, register manually once as admin):
-     schtasks /create /tn IPProxyWatchdog /tr "powershell -ExecutionPolicy Bypass -File D:\_MyProject\SuperSoft\IPProxyPool\tools\ipp_watchdog.ps1" /sc minute /mo 5 /ru SYSTEM
+    Autostart at boot (TEMPLATE, register manually once as admin;
+      in sync with tools/install_watchdog.ps1; needs admin, doc only):
+      schtasks /create /tn IPProxyWatchdog /tr "powershell -ExecutionPolicy Bypass -File D:\_MyProject\SuperSoft\IPProxyPool\tools\ipp_watchdog.ps1" /sc onstart /ru SYSTEM /rl HIGHEST
    Stop: kill the powershell process running this file + schtasks /delete /tn IPProxyWatchdog /f
 #>
 $ErrorActionPreference = "Continue"
