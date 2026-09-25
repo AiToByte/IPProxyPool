@@ -1,0 +1,34 @@
+# IPProxyPool live tests (Phase C5): manual only, needs real deps.
+# Runs the `-- --ignored` integration tests (Redis + ClickHouse online,
+# asserts PONG/Ok first, fails on any SKIP line per project convention).
+name: live
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24-alpine
+        ports: ["8123:8123"]
+        env:
+          CLICKHOUSE_USER: proxy
+          CLICKHOUSE_PASSWORD: "123456"
+          CLICKHOUSE_DB: proxy
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: live integration tests (no SKIP allowed)
+        run: cargo test --workspace -- --ignored --nocapture

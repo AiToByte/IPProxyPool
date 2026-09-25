@@ -9,10 +9,10 @@
 
 ```text
                     ┌──────────── 客户端 ────────────┐
-                    │  X-API-Key / X-Session-Id /     │
-                    │  X-Tenant-Country / X-Proxy-*   │
+                    │  X-API-Key / X-Proxy-Session /  │
+                    │  X-Proxy-Country / X-Proxy-*   │
                     └──────────────┬──────────────────┘
-                                   ▼ :8080
+                                   ▼ :8916
 ┌──────────────────────────────────────────────────────────────┐
 │ 数据面 Data plane (`gateway.rs` Pingora ProxyHttp)            │
 │  request_filter → upstream_peer → response_filter →           │
@@ -66,10 +66,10 @@ Redis 中断：数据面 200 不降级（内存隔离独立），恢复后行数
 
 ```text
                     ┌──────────── Clients ───────────────┐
-                    │  X-API-Key / X-Session-Id /         │
-                    │  X-Tenant-Country / X-Proxy-*       │
+                    │  X-API-Key / X-Proxy-Session /      │
+                    │  X-Proxy-Country / X-Proxy-*        │
                     └──────────────┬──────────────────────┘
-                                   ▼ :8080
+                                   ▼ :8916
 ┌──────────────────────────────────────────────────────────────┐
 │ Data plane (`gateway.rs` Pingora ProxyHttp)                   │
 │  request_filter → upstream_peer → response_filter →           │

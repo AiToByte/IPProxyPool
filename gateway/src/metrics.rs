@@ -26,6 +26,13 @@ pub struct MetricsRegistry {
     req_4xx: AtomicU64,
     req_5xx: AtomicU64,
     req_other: AtomicU64,
+    /// NEXT-A4：欠费 402（租户余额门）与限流 429（QPS/并发）独立计数（`observe` 分流）。
+    req_402: AtomicU64,
+    req_429: AtomicU64,
+    /// NEXT-A4：SOCKS 桥出站失败计数（网关 `serve_via_socks` Err 分支）。
+    bridge_errors: AtomicU64,
+    /// NEXT-A4：内存隔离表水位（sweep 滴答同步 `quarantine_map.len()`）。
+    quarantine_nodes: AtomicU64,
     forbidden_by_provider: DashMap<String, AtomicU64>,
     bytes_total: AtomicU64,
     duration_buckets: Vec<AtomicU64>,
@@ -48,6 +55,9 @@ pub struct MetricsRegistry {
     free_pool_nodes: AtomicU64,
     /// FreePool per-source 抓取产出（`free_pool_source_yield_total{source}` 渲染）。
     free_source_yield: DashMap<String, AtomicU64>,
+    /// NEXT-B5：per-source Elite 产出（`free_pool_source_elite_total{source}` 渲染；
+    /// 回答“哪个源真出货”，yield 高≠elite 高，调用方保证源名集合）。
+    free_source_elite: DashMap<String, AtomicU64>,
     /// FreePool 质检结果计数（`free_pool_verify_total{result}` 渲染；
     /// result∈pass/tcp_fail/full_fail/backoff_skip，调用方保证集合）。
     free_verify: DashMap<String, AtomicU64>,
@@ -82,6 +92,10 @@ impl MetricsRegistry {
             req_4xx: AtomicU64::new(0),
             req_5xx: AtomicU64::new(0),
             req_other: AtomicU64::new(0),
+            req_402: AtomicU64::new(0),
+            req_429: AtomicU64::new(0),
+            bridge_errors: AtomicU64::new(0),
+            quarantine_nodes: AtomicU64::new(0),
             forbidden_by_provider: DashMap::new(),
             bytes_total: AtomicU64::new(0),
             duration_buckets: (0..DURATION_BUCKETS_MS.len())
@@ -96,6 +110,7 @@ impl MetricsRegistry {
             logs_sampled: AtomicU64::new(0),
             free_pool_nodes: AtomicU64::new(0),
             free_source_yield: DashMap::new(),
+            free_source_elite: DashMap::new(),
             free_verify: DashMap::new(),
             free_anonymity: DashMap::new(),
             free_suspended: DashMap::new(),
@@ -158,6 +173,14 @@ impl MetricsRegistry {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    /// NEXT-B5：per-source Elite 记一笔（FullCheck 判 Elite 即调；只增不减）。
+    pub fn note_free_source_elite(&self, source: &str) {
+        self.free_source_elite
+            .entry(source.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// FreePool 质检结果计数（result 调用方保证∈pass/tcp_fail/full_fail/backoff_skip/geo_fail）。
     pub fn note_free_verify(&self, result: &str) {
         self.free_verify
@@ -209,9 +232,28 @@ impl MetricsRegistry {
     /// 根治旧累计存储的撕裂：旧写法按桶序逐个 +1，`render` 若在两次 +1 之间
     /// 读到相邻两桶，会渲染出 `le 小 > le 大` 的非单调行；单原子写下渲染值
     /// 恒为非负前缀和，天然单调。
+    /// NEXT-A4：桥出站失败记一笔（调用方：`serve_via_socks` Err 分支）。
+    pub fn note_bridge_error(&self) {
+        self.bridge_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// NEXT-A4：内存隔离表水位同步（调用方：sweep 滴答）。
+    pub fn set_quarantine_nodes(&self, n: u64) {
+        self.quarantine_nodes.store(n, Ordering::Relaxed);
+    }
+
     pub fn observe(&self, status: u16, provider: Option<&str>, bytes: u64, duration: Duration) {
         match status {
             200..=299 => self.req_2xx.fetch_add(1, Ordering::Relaxed),
+            // NEXT-A4：402/429 独立计数（仍进 4xx 总盘，不破坏存量口径）。
+            402 => {
+                self.req_4xx.fetch_add(1, Ordering::Relaxed);
+                self.req_402.fetch_add(1, Ordering::Relaxed)
+            }
+            429 => {
+                self.req_4xx.fetch_add(1, Ordering::Relaxed);
+                self.req_429.fetch_add(1, Ordering::Relaxed)
+            }
             400..=499 => self.req_4xx.fetch_add(1, Ordering::Relaxed),
             500..=599 => self.req_5xx.fetch_add(1, Ordering::Relaxed),
             _ => self.req_other.fetch_add(1, Ordering::Relaxed),
@@ -269,6 +311,33 @@ impl MetricsRegistry {
                 "proxy_requests_forbidden_total{{provider=\"{p}\"}} {n}\n"
             ));
         }
+        // NEXT-A4：欠费/限流独立计数＋桥失败＋隔离水位（Dashboard 巡检用）。
+        out.push_str("# HELP proxy_requests_unpaid_total Tenant out-of-balance (402) responses.\n");
+        out.push_str("# TYPE proxy_requests_unpaid_total counter\n");
+        out.push_str(&format!(
+            "proxy_requests_unpaid_total {}\n",
+            self.req_402.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP proxy_requests_limited_total Rate/concurrency limited (429) responses.\n",
+        );
+        out.push_str("# TYPE proxy_requests_limited_total counter\n");
+        out.push_str(&format!(
+            "proxy_requests_limited_total {}\n",
+            self.req_429.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP socks_bridge_errors_total SOCKS bridge egress failures.\n");
+        out.push_str("# TYPE socks_bridge_errors_total counter\n");
+        out.push_str(&format!(
+            "socks_bridge_errors_total {}\n",
+            self.bridge_errors.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP quarantine_nodes Quarantined domain:ip entries in memory.\n");
+        out.push_str("# TYPE quarantine_nodes gauge\n");
+        out.push_str(&format!(
+            "quarantine_nodes {}\n",
+            self.quarantine_nodes.load(Ordering::Relaxed)
+        ));
         out.push_str("# HELP gateway_transferred_bytes_total Egress bytes metered.\n");
         out.push_str("# TYPE gateway_transferred_bytes_total counter\n");
         out.push_str(&format!(
@@ -350,6 +419,22 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "free_pool_source_yield_total{{source=\"{s}\"}} {n}\n"
             ));
+        }
+        // NEXT-B5：per-source Elite（只在有数据时出 HELP/TYPE＋行，保持干净）。
+        if !self.free_source_elite.is_empty() {
+            out.push_str("# HELP free_pool_source_elite_total FreePool Elite nodes by source.\n");
+            out.push_str("# TYPE free_pool_source_elite_total counter\n");
+            let mut elites: Vec<(String, u64)> = self
+                .free_source_elite
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            elites.sort();
+            for (s, n) in elites {
+                out.push_str(&format!(
+                    "free_pool_source_elite_total{{source=\"{s}\"}} {n}\n"
+                ));
+            }
         }
         // FreePool 质检结果分布。
         out.push_str("# HELP free_pool_verify_total FreePool verify outcomes by result.\n");
@@ -519,6 +604,23 @@ mod tests {
     }
 
     #[test]
+    fn auth_bridge_quarantine_signals_rendered() {
+        // NEXT-A4：402/429 独立计数（仍进 4xx 总盘）＋桥失败＋隔离水位。
+        let m = MetricsRegistry::new();
+        m.observe(402, None, 0, Duration::from_millis(1));
+        m.observe(429, None, 0, Duration::from_millis(1));
+        m.observe(403, None, 0, Duration::from_millis(1));
+        m.note_bridge_error();
+        m.set_quarantine_nodes(3);
+        let text = m.render();
+        assert!(text.contains("proxy_requests_unpaid_total 1"));
+        assert!(text.contains("proxy_requests_limited_total 1"));
+        assert!(text.contains("proxy_requests_total{status=\"4xx\"} 3"));
+        assert!(text.contains("socks_bridge_errors_total 1"));
+        assert!(text.contains("quarantine_nodes 3"));
+    }
+
+    #[test]
     fn histogram_buckets_render_monotonic() {
         // R2-6：混合延迟 + 超界值下渲染桶恒单调（单原子写 + 前缀累加的直接收益）；
         // 超最大桶只进 +Inf/count，不污染各 le 行。
@@ -618,6 +720,19 @@ mod tests {
         assert!(m
             .render()
             .contains("free_pool_source_suspended{source=\"gh0\"} 0"));
+    }
+
+    #[test]
+    fn free_pool_source_elite_rendered() {
+        // NEXT-B5：无数据时无线（exposition 干净）；记两笔后按源名字序渲染。
+        let m = MetricsRegistry::new();
+        assert!(!m.render().contains("free_pool_source_elite_total"));
+        m.note_free_source_elite("gh0");
+        m.note_free_source_elite("api0");
+        m.note_free_source_elite("api0");
+        let r = m.render();
+        assert!(r.contains("free_pool_source_elite_total{source=\"api0\"} 2"));
+        assert!(r.contains("free_pool_source_elite_total{source=\"gh0\"} 1"));
     }
 
     #[test]

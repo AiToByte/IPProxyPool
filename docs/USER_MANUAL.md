@@ -9,7 +9,7 @@
 ### 1. 安装前置
 
 - Windows（验功能）或 Linux（验性能）；Rust 1.93＋`cargo`；Docker Desktop；Python 3（仅辅助脚本）。
-- 端口：8080（网关）/9091（指标）/6379/8123/9090/3000（依赖）。CH 原生端口已避让为 `127.0.0.1:9010:9000`。
+- 端口：8916（网关，2026-09-24 由 8080 迁出，避让本机 cvat traefik）/9091（指标）/6379/8123/9090/3000（依赖）。CH 原生端口已避让为 `127.0.0.1:9010:9000`。
 
 ### 2. 启动（5 步）
 
@@ -21,7 +21,7 @@ curl.exe -s "http://127.0.0.1:8123/ping" --user "proxy:123456"
 # 期待 Ok.
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8080/
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/
 # 期待 200
 ```
 
@@ -31,12 +31,12 @@ curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8080/
 
 ```powershell
 # 普通（无状态，LinUCB/加权）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8080/
-# 粘滞（同 session 两次命中同节点）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Session-Id: demo-1" -H "X-Tenant-Country: US" http://127.0.0.1:8080/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8916/
+# 粘滞（同 session 两次命中同节点；头名与网关同名，误名会被静默忽略）
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
 # 坏 Key（期待 403）、缺 Host（期待 400）
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8080/
-curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8080/ -o NUL -w "%{http_code}\n"
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8916/ -o NUL -w "%{http_code}\n"
 # 指标
 curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_pool_nodes_total"
 ```
@@ -71,7 +71,7 @@ curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_poo
 ### 1. Prerequisites
 
 - Windows (function) or Linux (performance); Rust 1.93 + `cargo`; Docker Desktop; Python 3 (helper scripts only).
-- Ports: 8080 (gateway) / 9091 (metrics) / 6379 / 8123 / 9090 / 3000 (deps). CH native port remapped to `127.0.0.1:9010:9000`.
+- Ports: 8916 (gateway, moved from 8080 on 2026-09-24 to dodge local cvat traefik) / 9091 (metrics) / 6379 / 8123 / 9090 / 3000 (deps). CH native port remapped to `127.0.0.1:9010:9000`.
 
 ### 2. Startup (5 steps)
 
@@ -83,7 +83,7 @@ curl.exe -s "http://127.0.0.1:8123/ping" --user "proxy:123456"
 # expect Ok.
 cargo build --manifest-path gateway/Cargo.toml
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8080/
+curl.exe --max-time 5 -s -o NUL -w "gw:%{http_code}\n" http://127.0.0.1:8916/
 # expect 200
 ```
 
@@ -93,12 +93,12 @@ Notes: background processes must go through `log/launch_detached.py` (DETACHED, 
 
 ```powershell
 # plain (stateless, LinUCB/weighted)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8080/
-# sticky (same session hits same node twice)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Session-Id: demo-1" -H "X-Tenant-Country: US" http://127.0.0.1:8080/
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8916/
+# sticky (same session hits same node twice; header names must match the gateway's)
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Proxy-Session: demo-1" -H "X-Proxy-Country: US" http://127.0.0.1:8916/
 # bad key (expect 403), missing Host (expect 400)
-curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8080/
-curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8080/ -o NUL -w "%{http_code}\n"
+curl.exe --max-time 5 -s -o NUL -w "%{http_code}\n" -H "X-Api-Key: bad" http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -H "Host:" http://127.0.0.1:8916/ -o NUL -w "%{http_code}\n"
 # metrics
 curl.exe --max-time 5 -s http://127.0.0.1:9091/metrics | Select-String "free_pool_nodes_total"
 ```

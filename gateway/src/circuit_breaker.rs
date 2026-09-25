@@ -61,6 +61,18 @@ pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
     }
 }
 
+/// NEXT-A0：增量报文应用纯函数（parse＋合法性守卫＋内存隔离）。
+/// 返回是否生效；PubSub 循环体调它（网络重连由 supervise 托管，见 main）。
+pub fn apply_delta(router: &RouterEngine, payload: &str) -> bool {
+    match parse_delta_message(payload) {
+        Some((domain, ip, ttl)) => {
+            router.set_quarantine(&domain, &ip, ttl);
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn field_text(fields: &HashMap<String, redis::Value>, key: &str) -> Option<String> {
     match fields.get(key) {
         Some(redis::Value::BulkString(bytes)) => String::from_utf8(bytes.clone()).ok(),
@@ -248,6 +260,39 @@ mod tests {
         assert_eq!(parse_delta_message("QUARANTINE||10.0.0.9|60"), None);
         assert_eq!(parse_delta_message("QUARANTINE|a.com||60"), None);
         assert_eq!(parse_delta_message("QUARANTINE|a.com|none|60"), None);
+    }
+
+    #[test]
+    fn apply_delta_applies_valid_and_rejects_junk() {
+        // NEXT-A0：增量应用纯函数（PubSub 循环体抽取，可单测；网络循环由 supervise 托管）。
+        use crate::router::RouterEngine;
+        let router = RouterEngine::new(vec![]);
+        assert!(apply_delta(&router, "QUARANTINE|a.com|10.0.0.9|60"));
+        assert!(!apply_delta(&router, "GARBAGE"));
+        assert!(!apply_delta(&router, "QUARANTINE||10.0.0.9|60"));
+        assert!(!apply_delta(&router, "QUARANTINE|a.com|none|60"));
+        // 生效验证：被隔离域选路摘空（空池本就 None，换有节点断言）。
+        let node = ProxyNode::new(
+            "10.0.0.9".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let router2 = RouterEngine::new(vec![node]);
+        let spec = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: None,
+            target_domain: "a.com".to_string(),
+            proto: None,
+        };
+        assert!(router2.select_node(&spec).is_some());
+        assert!(apply_delta(&router2, "QUARANTINE|a.com|10.0.0.9|60"));
+        assert!(router2.select_node(&spec).is_none());
     }
 
     #[test]

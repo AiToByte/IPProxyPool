@@ -23,7 +23,7 @@ D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\M
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/mockB.out log/mockB.err log/mock_upstream.py 8889 mock-b-jp
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/mockC.out log/mockC.err log/mock_upstream.py 8890 mock-c-gb
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py .\gateway\target\debug\pingora-proxy-gateway.exe log/gw.out log/gw.err
-curl.exe -s http://127.0.0.1:8080/                       # 200
+curl.exe -s http://127.0.0.1:8916/                       # 200
 curl.exe -s http://127.0.0.1:9091/metrics                # Prometheus exposition
 ```
 
@@ -86,7 +86,7 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 ## 6. 故障速查
 
 - 网关 503 全域：池被 quarantine 摘空（查 CB 日志 + Redis key）或 mocks 挂了；
- - 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（网关层不强制，租户侧规约：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
+ - 免费线零信任：免费节点**禁止**承载含认证/cookie/支付/银行流量（D1 起网关层强制：`tier=free`＋`Authorization`/`Cookie` 直接 403，租户侧规约同步：敏感租户绑定 tier≠free；`FREE_REQUIRE_ELITE=1` 为敏感实践）；Transparent 节点在 REQUIRE_ELITE=1 时被 merge 门强制过滤，为 0 时仅服务无归属流量（OPERATION 警告）；
  - VPN 免疫（H1/H2 加固后）：网关全链路直连（共享 Client 禁系统代理；桥/复检/探针显式代理本就免疫），结果与操作员本机 VPN 状态无关；`curl.exe` 从不走系统代理，可作真直连基线；匿名度分级是“出口 vs 直连基线”比较；
 - 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - SOCKS 桥零信任延续：socks 节点同样禁敏感流量（与免费线同规）；握手/CONNECT 只连验证与请求目标，不做扫描；relay 只在 E2E 脚本出现，不进生产；
@@ -101,8 +101,9 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - 缺 Host 400：R2-2 起畸形请求（无 Host 头）直接 400，不占租户配额；
 - 后台工人停转：CB/sink/arbitrage 由 supervisor 托管，`supervisor_restarts_total{worker}` 涨即正在自愈（指数 backoff 1s 起 60s 封顶）；
 - 403 全拦截：X-API-Key 未注册（默认 `default_key` 已在 main 注册）；
-- /metrics 无数据：确认走 :8080 有流量（intercept 的 403 也计数）；
+- /metrics 无数据：确认走 :8916 有流量（intercept 的 403 也计数）；
 - CH 查不到数：流式泵已上线（`ch_sink_group` 常驻，batch 5000/1s），查
   `SELECT count() FROM proxy.proxy_telemetry_log` 应随流量涨；不动则看
   网关日志 `[ChSink]`（insert 失败会 hold 住 ack 等 CH 恢复）；
 - Windows 传 JSON 给 redis-cli 会丢引号：用 `log/redis_inject.py`（raw RESP）。
+- D2 局域网敞口声明：`GATEWAY_ADDR` 缺省 `0.0.0.0:8916`，所在局域网可直达网关（无身份即 403 仍需 `X-API-Key`，但裸 HTTP 无加密）。单机用 `GATEWAY_ADDR=127.0.0.1:8916` 收回环；多机用 WireGuard 组网后绑 WG 地址（如 `GATEWAY_ADDR=10.8.0.1:8916`），密钥走 WG，不改网关代码。破坏性收紧（REQUIRE_API_KEY 默认 1＋监听收 127.0.0.1）见 NEXT 计划 D3 提案，待拍板未执行。

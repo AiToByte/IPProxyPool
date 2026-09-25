@@ -46,7 +46,7 @@ if ($Action -eq "status") {
     Show-Port "http://127.0.0.1:8888/" "mockA"
     Show-Port "http://127.0.0.1:8889/" "mockB"
     Show-Port "http://127.0.0.1:8890/" "mockC"
-    Show-Port "http://127.0.0.1:8080/" "gw"
+    Show-Port "http://127.0.0.1:8916/" "gw"
     Show-Port "http://127.0.0.1:9091/metrics" "metrics"
     exit 0
 }
@@ -76,11 +76,11 @@ function Wait-Port($Url, $Name, $Tries = 12) {
     Write-Output "$Name`:$code (not ready after ${Tries}x5s, see log/)"
 }
 
-if ((Test-Port "http://127.0.0.1:8080/") -eq "200") {
+if ((Test-Port "http://127.0.0.1:8916/") -eq "200") {
     Write-Output "gw already listening, skip launch"
 } else {
     Start-Detached $GW "log/gw.out" "log/gw.err"
-    [void](Wait-Port "http://127.0.0.1:8080/" "gw")
+    [void](Wait-Port "http://127.0.0.1:8916/" "gw")
 }
 if ($Mocks) {
     foreach ($m in @(@(8888, "mock-a-us", "mockA"), @(8889, "mock-b-jp", "mockB"), @(8890, "mock-c-gb", "mockC"))) {
@@ -93,5 +93,5 @@ if ($Mocks) {
     }
 }
 Show-Port "http://127.0.0.1:9091/metrics" "metrics"
-curl.exe --max-time 5 -s -o NUL -w "plain:%{http_code} " http://127.0.0.1:8080/
-curl.exe --max-time 5 -s -o NUL -w "badkey:%{http_code}`n" -H "X-Api-Key: bad" http://127.0.0.1:8080/
+curl.exe --max-time 5 -s -o NUL -w "plain:%{http_code} " http://127.0.0.1:8916/
+curl.exe --max-time 5 -s -o NUL -w "badkey:%{http_code}`n" -H "X-Api-Key: bad" http://127.0.0.1:8916/

@@ -48,7 +48,7 @@
 
 ### 3. 基础设施（`docker-compose.yml`）
 
-Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 11.1（3000）；网关为宿主二进制（:8080 数据面，:9091 指标）。
+Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 11.1（3000）；网关为宿主二进制（:8916 数据面，:9091 指标）。
 
 ## English
 
@@ -94,4 +94,4 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 
 ### 3. Infrastructure (`docker-compose.yml`)
 
-Redis 7 (6379) / ClickHouse 24 (8123) / Prometheus 2.53 (9090) / Grafana 11.1 (3000); gateway runs as host binary (:8080 data, :9091 metrics).
+Redis 7 (6379) / ClickHouse 24 (8123) / Prometheus 2.53 (9090) / Grafana 11.1 (3000); gateway runs as host binary (:8916 data, :9091 metrics).

@@ -114,19 +114,62 @@ async fn conditional_get(
 pub struct ApiSource {
     pub name: &'static str,
     pub url: String,
+    /// NEXT-B2：并发抓取页数（1＝单页礼貌轮询；>1＝多页 plain-GET 合并，上限 5）。
+    pub pages: usize,
     etag: parking_lot::Mutex<Option<String>>,
     last_modified: parking_lot::Mutex<Option<String>>,
 }
+
+/// NEXT-B2：API 分页上限（服务端负载礼貌；Geonode limit=100 时 3 页≈300 raw 足够）。
+pub const API_MAX_PAGES: usize = 5;
 
 impl ApiSource {
     pub fn new(name: &'static str, url: String) -> Self {
         Self {
             name,
             url,
+            pages: 1,
             etag: parking_lot::Mutex::new(None),
             last_modified: parking_lot::Mutex::new(None),
         }
     }
+
+    pub fn with_pages(mut self, pages: usize) -> Self {
+        self.pages = pages.clamp(1, API_MAX_PAGES);
+        self
+    }
+
+    /// 分页 URL：重写 `page` 查询参数（缺省补 `page=N`；非法 URL 回落原串）。
+    fn page_url(&self, page: usize) -> String {
+        let mut url = match reqwest::Url::parse(&self.url) {
+            Ok(u) => u,
+            Err(_) => return self.url.clone(),
+        };
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "page")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(kept)
+            .append_pair("page", &page.to_string());
+        url.to_string()
+    }
+    /// NEXT-B1：Geonode `anonymityLevel` 预筛——`transparent` 声明丢弃。
+    /// 实测依据（2026-09-24 实样）：声明值仅 elite/anonymous/transparent 三档；
+    /// 历史 pass 全为 Elite；`latency/responseTime` 量纲不明（elite 样样本 responseTime
+    /// 反而最大），不做数值门。字段缺失 fail-open（他源/旧格式不受影响）。
+    fn anonymity_passes(item: &serde_json::Value) -> bool {
+        match item.get("anonymityLevel").and_then(|v| v.as_str()) {
+            None => true,
+            Some(level) => {
+                let low = level.to_ascii_lowercase();
+                low != "transparent"
+            }
+        }
+    }
+
     pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
         let v: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
@@ -137,6 +180,9 @@ impl ApiSource {
         for item in arr.into_iter().flatten() {
             let ip = item.get("ip").and_then(|s| s.as_str()).unwrap_or("");
             if ip.is_empty() {
+                continue;
+            }
+            if !Self::anonymity_passes(item) {
                 continue;
             }
             let port: Option<u16> = match item.get("port") {
@@ -181,10 +227,49 @@ impl Source for ApiSource {
     }
 
     async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
-        match conditional_get(client, &self.url, &self.etag, &self.last_modified).await? {
-            Some(body) => Ok(FetchOutcome::nodes(Self::parse(self.name, &body))),
-            None => Ok(FetchOutcome::not_modified()),
+        if self.pages <= 1 {
+            match conditional_get(client, &self.url, &self.etag, &self.last_modified).await? {
+                Some(body) => Ok(FetchOutcome::nodes(Self::parse(self.name, &body))),
+                None => Ok(FetchOutcome::not_modified()),
+            }
+        } else {
+            self.fetch_pages(client).await
         }
+    }
+}
+
+impl ApiSource {
+    /// NEXT-B2：多页并发抓取（plain-GET；ETag 只适用于单页礼貌轮询，多页礼貌靠
+    /// 上限 5 页＋外层 15s 超时）。单页失败容忍（其余页照常合并）；全失败才 Err。
+    async fn fetch_pages(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
+        let futs: Vec<_> = (1..=self.pages)
+            .map(|p| {
+                let url = self.page_url(p);
+                async move {
+                    let r = client.get(&url).send().await;
+                    (p, r)
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(futs).await;
+        let mut nodes = Vec::new();
+        let mut ok_pages = 0u32;
+        for (p, r) in results {
+            match r {
+                Ok(resp) => match resp.text().await {
+                    Ok(body) => {
+                        ok_pages += 1;
+                        nodes.extend(Self::parse(self.name, &body));
+                    }
+                    Err(e) => log::warn!("[FreePool] api page {p} read failed: {e}"),
+                },
+                Err(e) => log::warn!("[FreePool] api page {p} fetch failed: {e}"),
+            }
+        }
+        if ok_pages == 0 {
+            return Err(format!("all {} api pages failed", self.pages));
+        }
+        Ok(FetchOutcome::nodes(nodes))
     }
 }
 
@@ -346,25 +431,31 @@ impl Source for HtmlSource {
     }
 }
 
-/// GitHub raw 仓源（默认 clarketm/proxy-list raw；URL env 可配）。
-/// 行格式：`ip:port`（`#` 开头与空行跳过；行尾 `socks4`/`socks5` 标记协议）。
+/// raw 行列表源（默认 clarketm＋openproxylist；URL env 可配）。
+/// 行格式：`ip:port`（`#` 开头与空行跳过；行内 `socks4`/`socks5` 标记优先，
+/// 无标记落 `default_proto`，供 openproxylist 按文件切分协议）。
 /// 礼貌轮询：ETag 缓存＋If-None-Match，304 返回 `not_modified`（Task 10 不计零产出）。
 pub struct GitHubSource {
     pub name: &'static str,
     pub url: String,
+    pub default_proto: FreeProto,
     etag: parking_lot::Mutex<Option<String>>,
 }
 
 impl GitHubSource {
-    pub fn new(name: &'static str, url: String) -> Self {
+    pub fn new(name: &'static str, url: String, default_proto: FreeProto) -> Self {
         Self {
             name,
             url,
+            default_proto,
             etag: parking_lot::Mutex::new(None),
         }
     }
 
-    pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
+    /// NEXT-B3：`default_proto` 供无行内标记的裸 `ip:port` 文件
+    /// （openproxylist 按文件切分协议）；行内标记优先；octet 逐段校验＋
+    /// 拒绝全零地址（openproxylist 首行 `0.0.0.0:80` 实锤）。
+    pub fn parse_with(source: &str, body: &str, default_proto: FreeProto) -> Vec<RawNode> {
         let mut out = Vec::new();
         for line in body.lines() {
             let line = line.trim();
@@ -377,7 +468,7 @@ impl GitHubSource {
             } else if lower.contains("socks4") {
                 FreeProto::Socks4
             } else {
-                FreeProto::Http
+                default_proto
             };
             let addr = line.split_whitespace().next().unwrap_or("");
             let (ip, port) = match addr.rsplit_once(':') {
@@ -388,7 +479,13 @@ impl GitHubSource {
                 Some(p) if p > 0 => p,
                 _ => continue,
             };
-            if ip.split('.').count() != 4 {
+            let octets: Vec<&str> = ip.split('.').collect();
+            if octets.len() != 4
+                || octets.iter().any(|o| o.parse::<u8>().is_err())
+                || octets
+                    .iter()
+                    .all(|o| *o == "0" || *o == "00" || *o == "000")
+            {
                 continue;
             }
             out.push(RawNode {
@@ -428,7 +525,11 @@ impl Source for GitHubSource {
             .text()
             .await
             .map_err(|e| format!("read {} failed: {e}", self.url))?;
-        Ok(FetchOutcome::nodes(Self::parse(self.name, &body)))
+        Ok(FetchOutcome::nodes(Self::parse_with(
+            self.name,
+            &body,
+            self.default_proto,
+        )))
     }
 }
 
@@ -612,16 +713,51 @@ pub struct FullCheckResult {
 /// 非 HTTP(S) 直接 None（Phase 2 前 SOCKS 不复检）。
 #[derive(Clone)]
 pub struct FullChecker {
-    base_url: String,
+    bases: Vec<String>,
     timeout: Duration,
+    /// NEXT-B4：per-代理 Client 缓存（逐节点重建浪费连接池；沿 prober OPT-5）。
+    clients: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, reqwest::Client>>>,
 }
 
 impl FullChecker {
     pub fn new(base_url: String, timeout: Duration) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            bases: vec![base_url.trim_end_matches('/').to_string()],
             timeout,
+            clients: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// NEXT-B4：追加备用基址（首基址抖动不再判整节点失败；去重＋保序）。
+    pub fn with_fallback_bases(mut self, bases: Vec<String>) -> Self {
+        for b in bases {
+            let t = b.trim_end_matches('/').to_string();
+            if !self.bases.contains(&t) {
+                self.bases.push(t);
+            }
+        }
+        self
+    }
+
+    fn client_for(&self, proxy_url: &str) -> Option<reqwest::Client> {
+        if let Some(c) = self.clients.lock().get(proxy_url) {
+            return Some(c.clone());
+        }
+        let proxy = reqwest::Proxy::all(proxy_url).ok()?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(self.timeout)
+            .build()
+            .ok()?;
+        self.clients
+            .lock()
+            .insert(proxy_url.to_string(), client.clone());
+        Some(client)
+    }
+
+    #[cfg(test)]
+    fn client_count(&self) -> usize {
+        self.clients.lock().len()
     }
 
     pub async fn check(&self, raw: &RawNode, baseline_ip: &str) -> Option<FullCheckResult> {
@@ -633,35 +769,42 @@ impl FullChecker {
             FreeProto::Socks4 => "socks4",
         };
         let proxy_url = format!("{scheme}://{}:{}", raw.ip, raw.port);
-        let proxy = reqwest::Proxy::all(&proxy_url).ok()?;
-        let client = reqwest::Client::builder()
-            .proxy(proxy)
-            .timeout(self.timeout)
-            .build()
-            .ok()?;
+        let client = self.client_for(&proxy_url)?;
         let start = std::time::Instant::now();
+        for base in &self.bases {
+            if let Some(res) = self.check_one(&client, base, raw, baseline_ip, start).await {
+                return Some(res);
+            }
+        }
+        None
+    }
+
+    /// NEXT-B4：单基址三端点并发（`join!`；单端点超时沿用 client 级 `timeout`，
+    /// 判定口径与串行一致，墙钟≈最慢端点而非三者之和）。
+    async fn check_one(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        raw: &RawNode,
+        baseline_ip: &str,
+        start: std::time::Instant,
+    ) -> Option<FullCheckResult> {
+        let (ip_r, h_r, c_r) = futures::future::join3(
+            client.get(format!("{base}/ip")).send(),
+            client.get(format!("{base}/headers")).send(),
+            client
+                .get(format!("{base}/anything/{FULL_CHECK_MARKER}"))
+                .send(),
+        )
+        .await;
         // 1. 出口。
-        let ip_body: serde_json::Value = client
-            .get(format!("{}/ip", self.base_url))
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let ip_body: serde_json::Value = ip_r.ok()?.json().await.ok()?;
         let exit = ip_body
             .get("origin")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         // 2. 回显头。
-        let h_body: serde_json::Value = client
-            .get(format!("{}/headers", self.base_url))
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let h_body: serde_json::Value = h_r.ok()?.json().await.ok()?;
         let mut echoed = std::collections::HashMap::new();
         if let Some(map) = h_body.get("headers").and_then(|v| v.as_object()) {
             for (k, v) in map {
@@ -671,14 +814,7 @@ impl FullChecker {
             }
         }
         // 3. canary（内容篡改检测；arXiv:2403.02445 16,923 篡改样本）。
-        let c_body: serde_json::Value = client
-            .get(format!("{}/anything/{}", self.base_url, FULL_CHECK_MARKER))
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let c_body: serde_json::Value = c_r.ok()?.json().await.ok()?;
         let canary_ok = c_body
             .get("url")
             .and_then(|v| v.as_str())
@@ -1071,6 +1207,18 @@ pub async fn fetch_all(
     raws
 }
 
+/// NEXT-B7：进检 intake 上限（shuffle 后截断；调用方保证 cap>0）。
+/// openproxylist 单 tick 数千 raw 会拖尾整轮（50 并发×3s 超时≈540s），
+/// 上限取 `max_nodes×2`＋逐轮 shuffle 轮换覆盖；API 预筛后小集不受影响。
+fn cap_intake(mut raws: Vec<RawNode>, cap: usize, rng: &mut impl rand::Rng) -> Vec<RawNode> {
+    if raws.len() > cap {
+        use rand::seq::SliceRandom;
+        raws.shuffle(rng);
+        raws.truncate(cap);
+    }
+    raws
+}
+
 /// VPN-IMMUNE：共享出站 Client（抓取＋基线）：显式禁用系统代理。
 /// reqwest 默认跟随 OS 系统代理（Windows 注册表 Clash `127.0.0.1:7890`），
 /// 操作员开 VPN 即污染基线/抓取；`no_proxy()` 后行为与操作员 VPN 状态无关。
@@ -1087,6 +1235,8 @@ pub fn shared_client() -> reqwest::Client {
 #[derive(Debug, Clone)]
 pub struct FreePoolConfig {
     pub api_urls: Vec<String>,
+    /// NEXT-B2：API 分页数（1＝单页礼貌轮询；>1＝多页合并，上限见 `API_MAX_PAGES`）。
+    pub api_pages: usize,
     pub html_urls: Vec<String>,
     pub github_urls: Vec<String>,
     pub fetch_interval: Duration,
@@ -1097,6 +1247,8 @@ pub struct FreePoolConfig {
     pub full_concurrent: usize,
     pub max_nodes: usize,
     pub full_check_base: String,
+    /// NEXT-B4：备用复检基址（首基址抖动时轮询；空即单基址；https-only）。
+    pub full_check_bases: Vec<String>,
     pub require_elite: bool,
     pub max_zero_cycles: u32,
     pub suspend_retry_every: u64,
@@ -1107,8 +1259,10 @@ pub struct FreePoolConfig {
 /// Source 默认 URL（全 env 可覆盖；单源挂了只 hold 旧集，不清空池）。
 pub const DEFAULT_API_URL: &str = "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc";
 pub const DEFAULT_HTML_URL: &str = "https://free-proxy-list.net/";
-pub const DEFAULT_GITHUB_URL: &str =
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt";
+/// NEXT-B3：raw 行列表默认三源（逗号分隔，`split_env_list` 切分）。
+/// clarketm 在部分网络不可达（hold 旧集＋熔断，不阻塞他源）；
+/// openproxylist http/socks5 双文件 2026-09-24 实测 200（行内无标记，按 URL 嗅探协议）。
+pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt";
 pub const DEFAULT_FULL_CHECK_BASE: &str = "https://httpbin.org";
 
 /// FullCheck 任务装配 helper（许可拿不到按失败计，沿 R2-7 `?`-in-bool 教训）。
@@ -1244,12 +1398,15 @@ impl FreePoolWorker {
     fn build_sources(&mut self) -> Vec<Box<dyn Source>> {
         // 先克隆 URL 表（避免 config 不可变借用与 intern_name 可变借用冲突）。
         let api_urls = self.config.api_urls.clone();
+        let api_pages = self.config.api_pages;
         let html_urls = self.config.html_urls.clone();
         let github_urls = self.config.github_urls.clone();
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         for (i, url) in api_urls.iter().enumerate() {
             let name = self.intern_name(format!("api{i}"));
-            sources.push(Box::new(ApiSource::new(name, url.clone())));
+            sources.push(Box::new(
+                ApiSource::new(name, url.clone()).with_pages(api_pages),
+            ));
         }
         for (i, url) in html_urls.iter().enumerate() {
             let name = self.intern_name(format!("html{i}"));
@@ -1261,7 +1418,20 @@ impl FreePoolWorker {
         }
         for (i, url) in github_urls.iter().enumerate() {
             let name = self.intern_name(format!("gh{i}"));
-            sources.push(Box::new(GitHubSource::new(name, url.clone())));
+            // NEXT-B3：按 URL 嗅探文件协议（openproxylist 按文件切分，无行内标记）。
+            let lower = url.to_ascii_lowercase();
+            let default_proto = if lower.contains("socks5") {
+                FreeProto::Socks5
+            } else if lower.contains("socks4") {
+                FreeProto::Socks4
+            } else {
+                FreeProto::Http
+            };
+            sources.push(Box::new(GitHubSource::new(
+                name,
+                url.clone(),
+                default_proto,
+            )));
         }
         if self.guards.len() != sources.len() {
             self.guards = (0..sources.len())
@@ -1281,7 +1451,14 @@ impl FreePoolWorker {
         let tick = self.tick;
         // 1-2. 组装＋并发抓取（失败 hold 旧集）＋ suspend 指标同步。
         let sources = self.build_sources();
-        let raws = fetch_all(&sources, &mut self.guards, client, tick).await;
+        let mut raws = fetch_all(&sources, &mut self.guards, client, tick).await;
+        // NEXT-B7：进检 intake 上限（yield 已按抓取计数，此处只裁质检量）。
+        let intake_cap = self.config.max_nodes.saturating_mul(2).max(100);
+        if raws.len() > intake_cap {
+            let before = raws.len();
+            raws = cap_intake(raws, intake_cap, &mut rand::thread_rng());
+            log::info!("[FreePool] intake capped {before}->{intake_cap} (shuffle rotation)");
+        }
         for (i, s) in sources.iter().enumerate() {
             self.metrics
                 .set_free_source_suspended(s.name(), self.guards[i].suspended());
@@ -1348,7 +1525,8 @@ impl FreePoolWorker {
         let checker = FullChecker::new(
             self.config.full_check_base.clone(),
             self.config.verify_timeout,
-        );
+        )
+        .with_fallback_bases(self.config.full_check_bases.clone());
         let now = Instant::now();
         let mut fset = tokio::task::JoinSet::new();
         while let Some(joined) = set.join_next().await {
@@ -1396,6 +1574,10 @@ impl FreePoolWorker {
                         AnonLevel::Transparent => "transparent",
                         AnonLevel::Unknown => "unknown",
                     });
+                    // NEXT-B5：Elite 记来源（回答哪个源真出货）。
+                    if res.anon == AnonLevel::Elite {
+                        self.metrics.note_free_source_elite(&raw.source);
+                    }
                     // P4-1 geo 观察＋执法映射（默认只观察；开关开且实锤分歧→复检失败）。
                     let verdict = self.observe_geo(&raw, res.exit_ip.as_deref());
                     if self.config.geo_enforce {
@@ -1438,7 +1620,19 @@ impl FreePoolWorker {
         require_elite: bool,
     ) {
         let now = Instant::now();
-        let snap = registry.snapshot(now, require_elite);
+        let mut snap = registry.snapshot(now, require_elite);
+        // NEXT-B6：合并时应用审计因子（存量快照权重是复检健康值；因子表在 Router 侧，
+        // 跨 tick 持久；下限语义沿 Q5：factor<=0 摘除，>0 保底 1）。
+        for n in &mut snap {
+            let f = router.free_factor(&n.provider, &n.country);
+            if (f - 1.0).abs() > f64::EPSILON {
+                n.weight = if f <= 0.0 {
+                    0
+                } else {
+                    ((n.weight as f64 * f).round() as u32).max(1)
+                };
+            }
+        }
         metrics.set_free_pool_nodes(snap.len() as u64);
         // 按出站协议聚合水位（三档恒设 0/数值，仪表盘行稳定；P2-5）。
         let (mut http, mut s5, mut s4) = (0u64, 0u64, 0u64);
@@ -1467,6 +1661,86 @@ impl FreePoolWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_source_prefilters_by_anonymity() {
+        // NEXT-B1：Geonode `anonymityLevel` 预筛——transparent 声明丢弃（质检预算集中到
+        // elite/anonymous；历史 pass 全为 Elite，见步骤 18/19/演示）；字段缺失 fail-open。
+        let body = r#"{"data":[
+            {"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"elite"},
+            {"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE","anonymityLevel":"anonymous"},
+            {"ip":"192.0.2.1","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"transparent"},
+            {"ip":"192.0.2.2","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"TRANSPARENT"},
+            {"ip":"192.0.2.3","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"192.0.2.4","port":"8080","protocols":["socks5"],"country":"US","anonymityLevel":"elite"}
+        ]}"#;
+        let nodes = ApiSource::parse("geonode", body);
+        let ips: Vec<&str> = nodes.iter().map(|n| n.ip.as_str()).collect();
+        assert_eq!(
+            ips,
+            vec!["203.0.113.7", "198.51.100.9", "192.0.2.3", "192.0.2.4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_source_fetches_multiple_pages() {
+        // NEXT-B2：多页并发合并（page1/2 各 1 节点）；`page` 参数确经 URL 传递
+        // （stub 按查询串回不同体）；单页 URL 形态（无 page 参数）补 page=1。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let page = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split("page=")
+                    .nth(1)
+                    .unwrap_or("?")
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>();
+                let body = match page.as_str() {
+                    "2" => {
+                        r#"{"data":[{"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
+                    }
+                    _ => {
+                        r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#
+                    }
+                };
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let src =
+            ApiSource::new("api", format!("http://127.0.0.1:{port}/list?limit=1")).with_pages(2);
+        assert_eq!(src.pages, 2);
+        // 缺 page 参数的 URL 补 page=2（含 limit 保留）。
+        assert!(src.page_url(2).contains("page=2") && src.page_url(2).contains("limit=1"));
+        let outcome = src.fetch(&client).await.expect("fetch pages");
+        assert!(!outcome.not_modified);
+        let mut ips: Vec<String> = outcome.nodes.iter().map(|n| n.ip.clone()).collect();
+        ips.sort();
+        assert_eq!(
+            ips,
+            vec!["198.51.100.9".to_string(), "203.0.113.7".to_string()]
+        );
+    }
 
     #[test]
     fn api_source_parses_geonode_shape() {
@@ -1509,10 +1783,24 @@ mod tests {
     fn github_source_parses_line_list() {
         let body =
             "203.0.113.7:8080\n\n# comment\n198.51.100.9:3128 socks5\nbad-line\n10.0.0.1:0\n";
-        let nodes = GitHubSource::parse("gh", body);
+        let nodes = GitHubSource::parse_with("gh", body, FreeProto::Http);
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].proto, FreeProto::Http);
         assert_eq!(nodes[1].proto, FreeProto::Socks5);
+    }
+
+    #[test]
+    fn github_parse_honors_default_proto_and_rejects_junk() {
+        // NEXT-B3：openproxylist 形态（裸 `ip:port` 无行内标记）按源默认协议；
+        // 非法 octet/全零地址丢弃（openproxylist 首行 `0.0.0.0:80` 实锤）。
+        let body = "1.12.55.136:2080\n0.0.0.0:80\n999.1.1.1:80\n10.0.0.300:8080\n";
+        let nodes = GitHubSource::parse_with("opl", body, FreeProto::Socks5);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].ip, "1.12.55.136");
+        assert_eq!(nodes[0].proto, FreeProto::Socks5);
+        // 行内标记优先于默认值。
+        let mixed = GitHubSource::parse_with("opl", "9.9.9.9:1080 socks4\n", FreeProto::Socks5);
+        assert_eq!(mixed[0].proto, FreeProto::Socks4);
     }
 
     #[tokio::test]
@@ -1539,7 +1827,11 @@ mod tests {
                 .await;
         });
         let client = reqwest::Client::new();
-        let src = GitHubSource::new("gh", format!("http://127.0.0.1:{port}/list.txt"));
+        let src = GitHubSource::new(
+            "gh",
+            format!("http://127.0.0.1:{port}/list.txt"),
+            FreeProto::Http,
+        );
         let outcome = src.fetch(&client).await.expect("fetch");
         assert!(!outcome.not_modified);
         assert_eq!(outcome.nodes.len(), 1);
@@ -1593,7 +1885,11 @@ mod tests {
             }
         });
         let client = reqwest::Client::new();
-        let src = GitHubSource::new("gh", format!("http://127.0.0.1:{port}/list.txt"));
+        let src = GitHubSource::new(
+            "gh",
+            format!("http://127.0.0.1:{port}/list.txt"),
+            FreeProto::Http,
+        );
         let first = src.fetch(&client).await.expect("first");
         assert_eq!(first.nodes.len(), 1);
         assert!(!first.not_modified);
@@ -1862,6 +2158,34 @@ mod tests {
             source: "t".to_string(),
         };
         assert!(c.check(&raw, "1.2.3.4").await.is_none());
+    }
+
+    #[test]
+    fn checker_reuses_client_per_proxy() {
+        // NEXT-B4：同代理 URL 复用 Client（逐节点重建浪费连接池；沿 prober OPT-5）。
+        let c = FullChecker::new("http://127.0.0.1:1".to_string(), Duration::from_secs(3));
+        assert!(c.client_for("http://127.0.0.1:9").is_some());
+        assert!(c.client_for("http://127.0.0.1:9").is_some());
+        assert_eq!(c.client_count(), 1);
+        assert!(c.client_for("http://127.0.0.1:10").is_some());
+        assert_eq!(c.client_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn checker_falls_back_to_second_base() {
+        // NEXT-B4：首基址拒连→次基址成功即 pass（单基址抖动不再判整节点失败）。
+        let good = spawn_stub_proxy(false).await;
+        let c = FullChecker::new("http://127.0.0.1:1".to_string(), Duration::from_secs(3))
+            .with_fallback_bases(vec![format!("http://127.0.0.1:{good}")]);
+        let raw = RawNode {
+            ip: "127.0.0.1".to_string(),
+            port: good,
+            proto: FreeProto::Http,
+            country: None,
+            source: "t".to_string(),
+        };
+        let res = c.check(&raw, "1.2.3.4").await.expect("fallback pass");
+        assert_eq!(res.anon, AnonLevel::Elite);
     }
 
     #[tokio::test]
@@ -2172,6 +2496,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn intake_cap_bounds_and_covers() {
+        // NEXT-B7：进检 intake 上限（max_nodes×2）：超限截断＋子集合法＋小池原样。
+        let mut big = Vec::new();
+        for i in 0..500 {
+            big.push(raw(&format!("10.1.{}.{}", i / 254, i % 254 + 1), "a"));
+        }
+        let capped = cap_intake(big, 100, &mut rand::thread_rng());
+        assert_eq!(capped.len(), 100);
+        assert!(capped.iter().all(|r| r.source == "a"));
+        let small = vec![raw("10.0.0.1", "a")];
+        assert_eq!(cap_intake(small, 100, &mut rand::thread_rng()).len(), 1);
+    }
+
     struct FailSource {
         name: &'static str,
     }
@@ -2295,6 +2633,46 @@ mod tests {
             "concurrency escaped cap: high={}",
             high.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn merge_applies_arbitrage_factor_across_ticks() {
+        // NEXT-B6：审计 scale 沉入合并——复检快照（权重重置）重合并后缩放仍保持，
+        // 不再被 `replace_vendor_nodes` 全量覆盖洗掉。
+        use crate::metrics::MetricsRegistry;
+        use crate::router::RouterEngine;
+        use std::sync::Arc;
+        let router = Arc::new(RouterEngine::new(vec![]));
+        let metrics = Arc::new(MetricsRegistry::new());
+        let mut reg = Registry::new(Duration::from_secs(1800));
+        reg.upsert_full(
+            &raw("10.0.0.9", "a"),
+            50,
+            AnonLevel::Elite,
+            None,
+            Instant::now(),
+        );
+        let w0 = reg.snapshot(Instant::now(), false)[0].weight;
+        assert!(w0 > 1);
+        FreePoolWorker::merge_once(&router, &metrics, &reg, false);
+        router.scale_vendor_weights("free-a", "US", 0.5);
+        FreePoolWorker::merge_once(&router, &metrics, &reg, false);
+        let w1 = router
+            .snapshot_all()
+            .iter()
+            .find(|n| n.ip == "10.0.0.9")
+            .map(|n| n.weight)
+            .unwrap();
+        assert_eq!(w1, ((w0 as f64 * 0.5).round() as u32).max(1));
+        // 复检快照权重重置为 w0 → 重合并 → 缩放仍在（修前回到 w0，即红）。
+        FreePoolWorker::merge_once(&router, &metrics, &reg, false);
+        let w2 = router
+            .snapshot_all()
+            .iter()
+            .find(|n| n.ip == "10.0.0.9")
+            .map(|n| n.weight)
+            .unwrap();
+        assert_eq!(w2, w1);
     }
 
     fn socks_raw(ip: &str, source: &str) -> RawNode {

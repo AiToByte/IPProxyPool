@@ -49,7 +49,7 @@
 
 | Key | 默认 | 说明 |
 |-----|------|------|
-| `GATEWAY_ADDR`／`METRICS_ADDR` | `0.0.0.0:8080`／`127.0.0.1:9091` | 监听地址 |
+| `GATEWAY_ADDR`／`METRICS_ADDR` | `0.0.0.0:8916`／`127.0.0.1:9091` | 监听地址 |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | 缺失即降级（遥测仅日志） |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | 缺失即 hold 权重 |
 | `REQUIRE_API_KEY` | `0` | `1` 时无头 403 |
@@ -115,7 +115,7 @@
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `GATEWAY_ADDR` / `METRICS_ADDR` | `0.0.0.0:8080` / `127.0.0.1:9091` | listen addresses |
+| `GATEWAY_ADDR` / `METRICS_ADDR` | `0.0.0.0:8916` / `127.0.0.1:9091` | listen addresses |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | degraded (log-only telemetry) when missing |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | hold weights when missing |
 | `REQUIRE_API_KEY` | `0` | `1` → headerless 403 |

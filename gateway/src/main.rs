@@ -2,7 +2,7 @@
 //!
 //! Assembly: telemetry batch worker → circuit-breaker consumer → PubSub delta
 //! sync → canary prober → warm-ticket keeper → vendor SLA arbitrage →
-//! Prometheus exposition (:9091) → Pingora data plane on :8080 (tenant gate +
+//! Prometheus exposition (:9091) → Pingora data plane on :8916 (tenant gate +
 //! LinUCB select + Chrome profile + byte metering per request).
 //!
 //! Redis is optional at boot (degraded: log-only telemetry). ClickHouse is
@@ -30,11 +30,11 @@ mod vendor_arbitrage;
 use analytics::AnalyticsEngine;
 use bandit::{LinUCBEngine, DEFAULT_ALPHA};
 use ch_sink::ChSinkWorker;
-use circuit_breaker::{parse_delta_message, PassiveCircuitBreaker, DELTA_CHANNEL};
+use circuit_breaker::{PassiveCircuitBreaker, DELTA_CHANNEL};
 use dashmap::DashMap;
 use free_pool::{
-    FreePoolConfig, FreePoolWorker, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE, DEFAULT_GITHUB_URL,
-    DEFAULT_HTML_URL,
+    FreePoolConfig, FreePoolWorker, API_MAX_PAGES, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE,
+    DEFAULT_GITHUB_URL, DEFAULT_HTML_URL,
 };
 use gateway::{SmartProxyGateway, DEFAULT_API_KEY};
 use metrics::{serve_metrics, MetricsRegistry, METRICS_ADDR};
@@ -272,6 +272,11 @@ async fn main() {
         let free_geo = geo_db.clone();
         let free_config = FreePoolConfig {
             api_urls: split_env_list("FREE_API_URLS", DEFAULT_API_URL),
+            // NEXT-B2：API 分页数（默认 1＝单页礼貌轮询；生产开 3 即 ~300 raw）。
+            api_pages: env_str("FREE_API_PAGES", "1")
+                .parse::<usize>()
+                .unwrap_or(1)
+                .clamp(1, API_MAX_PAGES),
             html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
             github_urls: split_env_list("FREE_GITHUB_URLS", DEFAULT_GITHUB_URL),
             fetch_interval: env_secs("FREE_FETCH_INTERVAL_SECS", 600),
@@ -290,6 +295,11 @@ async fn main() {
                 .parse::<usize>()
                 .unwrap_or(2000),
             full_check_base: full_base,
+            // NEXT-B4：备用复检基址列表（逗号分隔；仅 https 入选，默认空＝单基址）。
+            full_check_bases: split_env_list("FREE_FULL_CHECK_URLS", "")
+                .into_iter()
+                .filter(|u| u.starts_with("https://"))
+                .collect(),
             require_elite: env_str("FREE_REQUIRE_ELITE", "0") == "1",
             max_zero_cycles: env_str("FREE_SOURCE_MAX_ZERO_CYCLES", "3")
                 .parse::<u32>()
@@ -344,30 +354,37 @@ async fn main() {
         }));
 
         // PubSub delta sync → in-memory quarantine.
+        // NEXT-A0：连接/订阅失败/流终止不再永久失联——包进 supervise，
+        // 退出即 backoff 重连＋`supervisor_restarts_total{worker="pubsub_delta"}` 计数。
         let router_clone = router.clone();
         let sub_client = redis_client.clone();
-        tokio::spawn(async move {
-            let mut pubsub = match sub_client.get_async_pubsub().await {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("[Sync] PubSub connect failed: {e:?}");
+        let sync_metrics = metrics.clone();
+        tokio::spawn(supervise("pubsub_delta", sync_metrics, move || {
+            let router_clone = router_clone.clone();
+            let sub_client = sub_client.clone();
+            async move {
+                let mut pubsub = match sub_client.get_async_pubsub().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("[Sync] PubSub connect failed: {e:?}");
+                        return;
+                    }
+                };
+                if let Err(e) = pubsub.subscribe(DELTA_CHANNEL).await {
+                    log::error!("[Sync] PubSub subscribe failed: {e:?}");
                     return;
                 }
-            };
-            if let Err(e) = pubsub.subscribe(DELTA_CHANNEL).await {
-                log::error!("[Sync] PubSub subscribe failed: {e:?}");
-                return;
-            }
-            let mut stream = pubsub.on_message();
-            use futures::StreamExt;
-            while let Some(msg) = stream.next().await {
-                let payload: String = msg.get_payload().unwrap_or_default();
-                if let Some((domain, ip, ttl)) = parse_delta_message(&payload) {
-                    router_clone.set_quarantine(&domain, &ip, ttl);
-                    log::info!("[Sync] Applied delta quarantine on gateway memory: {domain}:{ip}");
+                let mut stream = pubsub.on_message();
+                use futures::StreamExt;
+                while let Some(msg) = stream.next().await {
+                    let payload: String = msg.get_payload().unwrap_or_default();
+                    if crate::circuit_breaker::apply_delta(&router_clone, &payload) {
+                        log::info!("[Sync] Applied delta quarantine: {payload}");
+                    }
                 }
+                log::warn!("[Sync] delta stream ended, restarting");
             }
-        });
+        }));
     } else {
         // R2-4：降级收发两端都丢弃（tx 随 publisher 闭包释放、rx 在此释放），
         // 通道彻底关闭，无残留缓冲。
@@ -393,7 +410,19 @@ async fn main() {
             if evicted > 0 {
                 log::info!("[Prober] evicted {evicted} idle clients");
             }
-            let candidates = probe_router.get_healthy_candidates(&RoutingSpec::default());
+            // NEXT-A3：三路并取（默认 http＋显式 socks5/socks4，沿 pool.rs 预热口径；
+            // 默认隔离下 socks 对 default-spec 不可见，不并取即漏探 socks 节点存活）。
+            let mut candidates = probe_router.get_healthy_candidates(&RoutingSpec::default());
+            for proto in [
+                crate::model::EgressProto::Socks5,
+                crate::model::EgressProto::Socks4,
+            ] {
+                let spec = RoutingSpec {
+                    proto: Some(proto),
+                    ..Default::default()
+                };
+                candidates.extend(probe_router.get_healthy_candidates(&spec));
+            }
             // OPT-5：复用 Client 池大小随滴答打 debug（稳定即无建链抖动）。
             log::debug!(
                 "[Prober] tick start nodes={} clients={}",
@@ -499,6 +528,7 @@ async fn main() {
     // P2-7：同节拍淘汰 bridge 闲置 Client（socks 节点下线/账密 rotation 后 key 不常驻）。
     let sweep_router = router.clone();
     let sweep_arms = bandit_arms.clone();
+    let sweep_metrics = metrics.clone();
     let sweep_interval = env_secs("SWEEP_INTERVAL_SECS", 60);
     // P2 SOCKS 翻译桥（显式 socks 请求出站执行器；env 见计划 §2）。
     let socks_bridge = Arc::new(SocksBridge::new(
@@ -515,6 +545,8 @@ async fn main() {
         loop {
             ticker.tick().await;
             let (sessions, quarantines) = sweep_router.sweep_expired();
+            // NEXT-A4：隔离水位同步（过期清理后读 len，gauge 语义）。
+            sweep_metrics.set_quarantine_nodes(sweep_router.quarantine_len() as u64);
             let arms = gateway::prune_stale_arms(&sweep_arms, &sweep_router);
             let bridged = sweep_bridge.evict_idle();
             if sessions + quarantines + arms + bridged > 0 {
@@ -543,8 +575,9 @@ async fn main() {
             bridge: Some(socks_bridge.clone()),
         },
     );
-    // R2-8：网关监听地址 env 化（`GATEWAY_ADDR`，默认 0.0.0.0:8080）。
-    let gateway_addr = env_str("GATEWAY_ADDR", "0.0.0.0:8080");
+    // R2-8：网关监听地址 env 化（默认 0.0.0.0:8916；2026-09-24 由 8080 迁出，
+    // 起因：本机 cvat traefik 常驻 :8080 且 Windows 后绑定者赢，见 PORT-8916 计划）。
+    let gateway_addr = env_str("GATEWAY_ADDR", "0.0.0.0:8916");
     proxy_service.add_tcp(&gateway_addr);
 
     log::info!(

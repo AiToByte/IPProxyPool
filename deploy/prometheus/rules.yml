@@ -1,0 +1,66 @@
+# IPProxyPool Prometheus alert rules (Phase C3).
+# All LHS series are rendered by the gateway itself (gateway/src/metrics.rs);
+# no exporter needed. `up` is the built-in scrape-health series.
+# NOTE (honest gap): Redis Stream XLEN (consumer lag) has no series yet —
+# there is no redis_exporter in compose. The commented placeholder below
+# shows the intended rule; wire an exporter first, then uncomment.
+groups:
+  - name: ipp-gateway
+    interval: 30s
+    rules:
+      # 数据面成功率：2xx / 全部分类。分母含 4xx 拦截（坏 Key/无头属预期行为，
+      # 压测坏 Key 会拉低成功率，见 annotation）。
+      - alert: GatewaySuccessRateLow
+        expr: |
+          sum(rate(proxy_requests_total{status="2xx"}[5m]))
+          /
+          sum(rate(proxy_requests_total[5m]))
+          < 0.99
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关 5 分钟成功率 < 99%"
+          describe: "2xx 占比 {{ $value | humanizePercentage }}；分母含 4xx 拦截，坏 Key 压测属预期拉低。"
+
+      # 免费池水位：30 分钟窗口最大值仍为 0 即干旱。severity 仅 warning——
+      # 免费源本就轮转低谷常态 pool=0（见 FREE_BASELINE），此规则抓超长干旱。
+      - alert: FreePoolDry30m
+        expr: max_over_time(free_pool_nodes_total[30m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "免费池连续 30 分钟水位 0"
+          describe: "免费源轮转低谷属正常；超 30 分钟请查源站存活与熔断 free_pool_source_suspended。"
+
+      # 后台 worker 重启（supervisor 捕获 panic/意外返回后自愈）。
+      # Windows 本机调试偶发 tokio 退出抖动（见 EXEC），重启本身是自愈证据；
+      # 频繁重启（15 分钟窗内多次）才值得看。
+      - alert: SupervisorRestarted
+        expr: increase(supervisor_restarts_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "后台 worker 发生重启 ({{ $labels.worker }})"
+          describe: "15 分钟窗内重启 {{ $value }} 次；单次多为 Windows 退出抖动自愈，连续多次请查对应 worker 日志。"
+
+      # 网关抓取失联（内置 up 序列，无需额外指标）。
+      - alert: GatewayDown
+        expr: up{job="pingora-gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关 /metrics 抓取失联超 2 分钟"
+          describe: "先看网关进程与看护日志 log/ipp-watchdog.out，再查 :9091 本机直访。"
+
+      # ---- 待接线（需 redis_exporter，当前 compose 未含，故注释冻结） ----
+      # - alert: TelemetryStreamLagGrowing
+      #   expr: increase(redis_stream_length{key="telemetry"}[10m]) > 0
+      #   for: 10m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "遥测 Stream 积压持续增长"

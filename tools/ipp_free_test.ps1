@@ -45,7 +45,7 @@ if ($proto -eq "socks5") { $headers += "X-Proxy-Proto: socks5" }
 $hargs = @()
 foreach ($h in $headers) { $hargs += "-H"; $hargs += $h }
 $bodyFile = Join-Path ([System.IO.Path]::GetTempPath()) "ipp_free_body.txt"
-& curl.exe --noproxy '*' --max-time 40 -s -o $bodyFile -w "HTTP:%{http_code} size:%{size_download}" @hargs "http://127.0.0.1:8080/ip"
+& curl.exe --noproxy '*' --max-time 40 -s -o $bodyFile -w "HTTP:%{http_code} size:%{size_download}" @hargs "http://127.0.0.1:8916/ip"
 Write-Output ""
 $body = Get-Content $bodyFile -Raw -ErrorAction SilentlyContinue
 Write-Output "body: $($body.Substring(0, [Math]::Min(120, $body.Length)))"

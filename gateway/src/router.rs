@@ -51,6 +51,14 @@ pub struct RouterEngine {
     session_store: DashMap<String, (Arc<ProxyNode>, Instant)>,
     /// Key = `{domain}:{ip}`, value = quarantine expiry.
     quarantine_map: DashMap<String, Instant>,
+    /// NEXT-B6：免费套利因子表（(provider, country小写)→factor；`merge_once` 应用，
+    /// 审计 scale 不再被下轮合并覆盖；缺省 1.0；键空间随池多样性有界）。
+    free_scale: DashMap<(String, String), f64>,
+}
+
+/// NEXT-B6：因子表键（provider 精确＋country 小写；与匹配侧 `eq_ignore_ascii_case` 同语义）。
+fn scale_key(vendor: &str, country: &str) -> (String, String) {
+    (vendor.to_string(), country.to_ascii_lowercase())
 }
 
 impl RouterEngine {
@@ -59,7 +67,16 @@ impl RouterEngine {
             pools: ArcSwap::from_pointee(initial_nodes.into_iter().map(Arc::new).collect()),
             session_store: DashMap::new(),
             quarantine_map: DashMap::new(),
+            free_scale: DashMap::new(),
         }
+    }
+
+    /// NEXT-B6：查询免费套利因子（merge 应用；缺省 1.0 即无缩放）。
+    pub fn free_factor(&self, vendor: &str, country: &str) -> f64 {
+        self.free_scale
+            .get(&scale_key(vendor, country))
+            .map(|v| *v.value())
+            .unwrap_or(1.0)
     }
 
     /// 施加域级隔离（GW-2 熔断器 / PubSub 增量同步调用）。
@@ -80,6 +97,11 @@ impl RouterEngine {
     /// R2-6：`Arc` 句柄向量（引用计数 +1，不克隆节点 `String`）。
     pub fn snapshot_all(&self) -> Vec<Arc<ProxyNode>> {
         self.pools.load().as_ref().clone()
+    }
+
+    /// NEXT-A4：内存隔离表水位（sweep 滴答同步进 `quarantine_nodes` gauge）。
+    pub fn quarantine_len(&self) -> usize {
+        self.quarantine_map.len()
     }
 
     /// 周期清理：删除已过期的会话绑定与隔离条目。
@@ -202,6 +224,10 @@ impl RouterEngine {
         excluded: &[String],
     ) -> Option<Arc<ProxyNode>> {
         let now = Instant::now();
+        // NEXT-A5：tier 请求侧归一前移到入口（粘滞复核与新鲜选择共用同一归一 spec；
+        // 原 Q8 hoist 只在步骤 2，粘滞路径用的还是原文 tier）。
+        let mut spec = spec.clone();
+        spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
 
         // 1. Sticky session fast path (skip quarantined/derated/excluded bindings).
         if let Some(ref session_id) = spec.session_id {
@@ -221,9 +247,18 @@ impl RouterEngine {
                 let excluded_hit = excluded.iter().any(|e| e == &node.addr);
                 // REVIEW-R2 Q9：`elapsed()` 时钟回拨即 panic（数据面不可炸），与
                 // `sweep_expired_at` 同口径改 saturating（回拨按 0 处理，会话多活一轮）。
+                // NEXT-A5：粘滞命中复核 country/tier 约束（spec.tier 入口已归一，
+                // 与 matches 同语义；换约束即迁移，不再粘错节点）。
+                let country_ok = spec
+                    .country
+                    .as_deref()
+                    .is_none_or(|c| node.country.eq_ignore_ascii_case(c));
+                let tier_ok = spec.tier.as_deref().is_none_or(|t| node.tier == *t);
                 if !excluded_hit
                     && now.saturating_duration_since(*created_at).as_secs() < SESSION_TTL_SECS
                     && still_live
+                    && country_ok
+                    && tier_ok
                     && !self.is_node_quarantined(node, &spec.target_domain, now)
                 {
                     return Some(Arc::clone(node));
@@ -231,11 +266,8 @@ impl RouterEngine {
             }
         }
 
-        // 2. Filter snapshot.
+        // 2. Filter snapshot（spec 已在入口归一，直接用）。
         let guard = self.pools.load();
-        // REVIEW-R2 Q8：同候选入口，tier 请求侧归一一次。
-        let mut spec = spec.clone();
-        spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
         let candidates: Vec<Arc<ProxyNode>> = guard
             .iter()
             .filter(|n| !excluded.iter().any(|e| e == &n.addr))
@@ -303,6 +335,8 @@ impl RouterEngine {
     /// 写时复制同 `adjust_vendor_weight`；`factor<=0` 即摘除（matches 滤 0），
     /// 复检 upsert 按 health 重置权重即恢复；`factor>1` 不用（free 永不自动抬权，调用方保证）。
     pub fn scale_vendor_weights(&self, vendor: &str, country: &str, factor: f64) {
+        // NEXT-B6：因子同步记表（含 factor<=0 显式摘除，合并后依然生效）。
+        self.free_scale.insert(scale_key(vendor, country), factor);
         let guard = self.pools.load();
         let next: Vec<Arc<ProxyNode>> = guard
             .iter()
@@ -420,6 +454,33 @@ mod tests {
         let a = r.select_node(&spec).expect("node");
         let b = r.select_node(&spec).expect("node");
         assert_eq!(a.ip, b.ip);
+    }
+
+    #[test]
+    fn sticky_migrates_on_constraint_change() {
+        // NEXT-A5：同 session 换 country/tier 约束→迁移（原绑定失配不再命中）；
+        // 约束不变→仍粘滞。US/residential 绑 10.0.0.1；切 JP→10.0.0.2。
+        let r = RouterEngine::new(fixtures());
+        let us = RoutingSpec {
+            country: Some("US".to_string()),
+            session_id: Some("task-7".to_string()),
+            tier: None,
+            target_domain: "example.com".to_string(),
+            proto: None,
+        };
+        assert_eq!(r.select_node(&us).expect("us").ip, "10.0.0.1");
+        assert_eq!(r.select_node(&us).expect("sticky").ip, "10.0.0.1");
+        let jp = RoutingSpec {
+            country: Some("JP".to_string()),
+            ..us.clone()
+        };
+        assert_eq!(r.select_node(&jp).expect("migrate").ip, "10.0.0.2");
+        let tier = RoutingSpec {
+            country: None,
+            tier: Some("datacenter".to_string()),
+            ..us.clone()
+        };
+        assert_eq!(r.select_node(&tier).expect("tier").ip, "10.0.0.2");
     }
 
     #[test]

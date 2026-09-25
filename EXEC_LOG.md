@@ -602,9 +602,32 @@
 - **实测**：脚本首跑 CLEAN（D=27.x／V=3.38.x／G=31.220.40.59 200＋CH 落库）；用户亲手 171.x 200＋CH 落库 corroborate。
 - **附带抓获**：双网关同存分流（Pingora 端口复用；启动前必须 `Get-Process` 确认单实例，已清理）；`.ps1` 中文无 BOM 解析失败（已全量 BOM 化，见 V1 排查）；脚本 `-match` 数组陷阱（curl 多行输出先拼单串，已修）。
 
+### [2026-09-24] 步骤 24-Phase A 完成：数据面加固（168 单测＋双活验）
+- **实际操作**：A0（`apply_delta` 纯函数＋2 单测＋main 包 supervise；Redis 断线演练：数据面 200＋pubsub 指数重启×4＋恢复 PONG/200 同 PID 无 panic）/A1 驳回（下游写失败重试反增上游成本＋节点无过错不记 failed，Q9 先记账语义成立）/A2 驳回（attempts≤max_retries+1＝4≪16 上限不可达，防御性保留）/A3（prober 三路并取，沿 pool 口径）/A4（402/429 独立计数＋bridge_errors＋quarantine gauge＋sweep 同步＋render 单测）/A5（spec 入口归一＋粘滞 country/tier 复核＋迁移单测；curl 活验 US×2 mock-a-us→JP mock-b-jp）。
+- **附带抓获（P0-doc 级）**：全仓 `X-Session-Id/X-Tenant-Country` 系误名头（网关只认 `X-Proxy-*`）→SDK 改真名＋加 country 参数＋粘滞确定性自检、适配器白名单改真名（原缺 Country/Session 实掉头）、USAGE×4/USER_MANUAL×2/ARCHITECTURE 图×4 全改；历史 plan/EXEC 冻结不改。旧 curl  lore（无约束选 mock-b）与 A5 活验（约束选 mock-a）差异即头名之误，诚实记录。
+- **验证结果**：168 通过/4 ignored（基线 157；新增 11＝B 8＋A 3）；fmt/clippy 绿；curl 六用例语义（真名头）全绿。
+
+### [2026-09-24] 步骤 24 立项: NEXT全迭代计划冻结（先落库再执行）
+- 计划操作：用户指令“准备下一阶段优化，先通读项目给方向”。派三路并行深读（数据面/免费效果/产品运维缺口）得 30 条→主事人抽验载荷项（PubSub 失联/桥写失败/prober 漏 socks/CH 无 TTL 全实锤）→收敛四主题 20 项，用户选定全做。新建`plan/2026年9月24日-NEXT全迭代实施计划.md`（B→A→C→D＋门禁落库）；`TASK_PLAN.md` 步骤 24 置进行中；本文件 append-only 记立项。
+- 验收线：B 以 pool 常态>0 为准（不达标 C/D 解耦照常）；D3 破坏性默认变更只提案不执行；B3/B2 先验证再接线。
+
+### [2026-09-24] 步骤 24-Phase B 完成：免费线效果（B1~B7，165 单测＋live pool 7 全 Elite）
+- **实际操作**：B1（Geonode 实样定字段，`anonymityLevel` 预筛；`responseTime` 量纲不明弃数值门，如实记录）/B2（分页参数双验证＋`ApiSource::with_pages`＋`FREE_API_PAGES`＋单页 ETag 路径冻结）/B3（逐源 curl：GitHub raw 全墙落选，openproxylist http/socks5 双 200 入选；`parse_with` 默认协议＋octet/全零 hardening＋URL 嗅探＋默认三源）/B4（per-代理 Client 缓存＋三端点 join3 并发＋多基址轮询＋`FREE_FULL_CHECK_URLS`；超时口径沿用 client 级，墙钟≈最慢端点）/B5（`free_pool_source_elite_total{source}`；漏斗与既有四组重复，诚实裁剪）/B6（Router 因子表＋merge 应用＋Q5 下限一致）/B7（live 抓获：openproxylist 单 tick 9000+ raw 拖尾→`cap_intake` 上限 max_nodes×2＋shuffle 轮换）。
+- **验证结果**：165 通过/4 ignored（基线 157，+8）；fmt/clippy 绿；live（pages=3＋三源）：intake 9314→400 截断＋tick 间隔 60s 无拖尾＋pool 3→7＋pass/elite 7/7＋source_elite gh1=6/gh2=1/api0=0＋by_proto http6/socks5·1。结论：新源是 Elite 主力，预筛把 api0 单 tick 300→~9；B 验收线超额达成。
+- **教训**：供给放大必须配 intake 上限（先有量再有质 mouse trap）；逝去的单测红（B2/B5 加法特性）以“方法事前不存在”为红证据，如实声明。
+
 ### [2026-09-24] 继续执行：Docker 复活＋Grafana provisioning＋基线干旱记录
 - **实际操作**：Docker Desktop 退出（npipe 丢失）→重拉 backend→`compose up -d` 四容器 Up＋PONG；新增 `deploy/grafana/provisioning/{datasources,dashboards}`＋compose 双目录挂载（文件挂载与目录挂载冲突致容器起不来，改全目录挂载解决）；`--force-recreate grafana` 后 provisioning 日志成功＋面板/数据源 API 对齐（uid `prometheus`）；`ipp.ps1 start -Mocks` 全栈 200/403；自动化基线重跑：D=27.x 稳定／V 又转 `103.136.147.175`（第 4 个值）／5+ tick pool 全 0 干旱，脚本诚实 FAIL；回滚默认网关 200。
 - **结论**：新鲜 volume 开箱即有完整可观测；干旱期属源站轮转低谷（FREE_BASELINE 已记）。教训：容器级挂载优先目录挂载；V 值见一次记一次，永不复用。
+
+### [2026-09-24] 端口争用发现：:8080 与 cvat traefik 同机争用（后绑定者赢）
+- **现象**：V1 stop 后 `gw:000`/`metrics:000` 交替出现 404；`netstat` 示 docker backend 占 `0.0.0.0:8080`，cvat traefik 发布 `8080->8080`；本网关重起后 10/10 全 200（后绑定赢，无 lottery）。
+- **影响界定**：凡 “200＋正确语义＋mock 包体＋metrics/CH 行” 的读数必为我方（traefik 产不出）；404＝traefik（我方已死或失绑）；000＝两边皆无。历史结论不受影响（证据链均有包体/计数器 corroborate）。
+- **已做**：watchdog 改身份探针（200＋`mock-` 包体才算活，404 即外人）；当前我方为后绑定者，正常服务中。
+- **待决策（需用户拍板，不擅动）**：(a) 本网关默认端口迁出 8080（改动面大：docs/tests/scripts 全串）；(b) 关 cvat traefik 的 8080 发布（动用户别项目）；(c) 维持现状＋每次验证前先 10× 探针确权。教训：同机多项目先 `netstat` 看端口归属再测。
+
+### [2026-09-24] 步骤 25 立项: PORT-8916 迁移计划冻结（先落库再执行）
+- 决策：用户选 a，端口定 8916（traefik 留守 :8080 不碰）。分类完成：网关监听 1 处＋tools 11 处＋docs 约 42 处改；fixture/18080/mocks/历史冻结一律不动。新建`plan/2026年9月24日-PORT-8916迁移实施计划.md`；`TASK_PLAN.md` 步骤 25 置进行中；本文件 append-only 记立项。
 - **基线结论**：VPN 出口轮转（13.x→54.x→3.38.x），V 永不可复用旧值；D 长期 27.x；免费出口 6 个皆≠同期 D/V。
 
 ### [2026-09-23] 步骤 22 已完成: USE-便捷落地（U1~U4 全✅）
@@ -623,3 +646,24 @@
 - **成功证据链（13:43，网关 PID:40092 存活）**：`X-Proxy-Tier: free＋X-Proxy-Proto: socks5＋Host: httpbin.org` → 200 `origin 104.245.245.218`；网关 metrics `2xx=1`＋34 字节计量（请求确经网关）；同期直连对照 `origin 27.18.3.145`（我方出口，两者不同即免费节点出口实锤）；CH 落库 `free-api0|104.245.245.218|200|free|34`。
 - **纠错记录**：中途两次 `origin 27.18.3.145` 的 200 系直连（curl 目标误写公网地址绕过网关，metrics 2xx=0＋CH 无行实锤），已向用户澄清；教训：经网关流量必须以网关地址为 curl 目标＋Host 头指定上游。
 - **收尾**：已回滚默认网关 200（PID:288）。免费线结论重申：Elite 偶发，pool 常态 0，生产开线保持 `FREE_ENABLED=1＋REQUIRE_ELITE=1` 建议。
+
+### [2026-09-24] 步骤 25 已完成: PORT-8916 迁移（网关默认端口避开 cvat traefik 争用）
+- **实际操作**：P1（`main.rs:580` 默认 `0.0.0.0:8916`＋注释，前序已切，本轮复核）/P2（`ipp.ps1`×5＋`ipp_free_test.ps1`×1＋`ipp_sdk.py`×3＋`ipp_forward.py` 默认 8916＋`ipp_watchdog.ps1` 探针 8916，前序已切，本轮复核）/P3（README＋6 docs 全 8916；本轮补 `docs/USAGE.md` 中英两处适配器示例 `18080 127.0.0.1 8080`→`8916`，18080/8888 零误伤）/复核（目标 13 文件 `rg 8080` 仅剩历史注记 main/watchdog/USER_MANUAL＋18080/8888 子串，网关侧活端口零残留）。
+- **验证结果**：`cargo build` 10.6s 过；fmt clean；clippy `-D warnings` 零告警；`cargo test` 168 通过/0 失败/4 ignored（计划 156+11，以实测为准）；bench 编译过＋`--release bandit` 12 过；:8916 回归 plain 200/sticky 200/badkey 403/nohost 400/metrics 200＋包体 mock-b-jp＋适配器 :18080→mock-b-jp＋SDK 自检 OK；traefik :8080=404 未动。
+- **纠错记录**：回归中抓获 stale 适配器 PID:9568（旧默认指 :8080，经它走落 traefik 404 实锤）→精确杀＋按新 USAGE 以 8916 重拉 PID:34948 后 200；网关 PID:11476 中途退出（`gw.err`：All runtimes exited＋tokio blocking-context drop panic，PORT 改动仅默认值＋文档，无因果，疑似树上未提交 NEXT 改动或已知 Windows 退出抖动，已重拉 PID:24504 全绿，如实记录待观察）。
+- **下一步**：禁未授权 commit（本次未提交）；plan §3＋TASK 25 已✅。
+
+### [2026-09-25] 步骤 24-Phase C 完成：运维产品化（C1~C7）
+- **实际操作**：C1（看护脚本复核＋硬化：`$PSScriptRoot` 定根/重拉字面量内联/3-strike 防启动风暴；DETACHED powershell 本会话存活不了，改前台＋并行 kill 做 live 对照）/C2（launcher 50MB 轮转：51MB 实测切 `.1`＋旧 `.1` 被替＋小文件不动）/C3（rules.yml 4 告警＋compose 挂载＋prom 重载；XLEN 无 series，注释冻结＋如实记录；另加 GatewayDown 用内置 up）/C4（schema 加 TTL＋现网 ALTER；DateTime64 须包 toDateTime，BAD_TTL_EXPRESSION 实锤后修正；SHOW CREATE 含 TTL）/C5（ci.yml＋live.yml 双 workflow；YAML 合法；命令与本地四门同源）/C6（Dockerfile 多阶段＋compose profile-gated service＋注释扶正，8916 取代计划原文 8080）/C7（CHANGELOG 回填 24 步＋发版 5 行）。
+- **验证结果**：C1 两次 kill 均重拉出 PID 并回 200＋mock 包体（R1/R2），启动窗内零重复（3-strike 生效）；C2 只留 2 代；C3 4 规则 health ok，GatewayDown 在真实 down 窗正确 pending、FreePoolDry30m 在干旱下 firing、SuccessRateLow 在坏 Key 压测下 pending——三路误报方向全对；C4 TTL 生效；C5 YAML OK；Grafana 数据源＋面板＋prom 实时序列有数。
+- **纠错记录**：C1 连抓四 bug 全修——(1) 未跟踪草稿 try/catch＋-match 单行 return 致 PS5.1 UnexpectedToken（逐段二分定位，改直列式通过）；(2) `$GW` 被循环 `$gw` 大小写覆写（改名仍空，弃变量改字面量内联）；(3) `$GwExe` 运行时 Get-Variable 查无（赋值字节级正常，hex＋哈希对齐，机制未明，内联后连续出 PID，诚实记录）；(4) 无 3-strike 时启动窗重复拉起抢 :8916（计数器守卫后单 PID）。C6 容器 RUN 被环境阻断：Hub 拉取不通（auth.docker.io 超时；本地 hubproxy 代理无 debian 缓存）＋宿主无交叉链接器（rustup 加 target 超时）；冒烟变体误拷 Windows PE 进 Linux 容器实锤后回滚清场；canonical Dockerfile＋compose 服务已交付，RUN 待有网环境，诚实记部分完成。
+- **环境注记**：网关 tokio blocking-context panic 退出自 09-19 起全 log 皆有（pre-existing，非 B/C 引入）；prom 容器时钟快约 9h（相对窗口不受影响）；DETACHED powershell 在本会话必死（trivial sleep 亦死，native/python 子进程不受影响），看护生产值守走 schtasks 模板。
+
+### [2026-09-25] 步骤 24-Phase D 完成：安全收紧（D1＋D2，D3 零执行）
+- **实际操作**：D1（TDD 红 E0425→绿：`free_tier_with_credentials` 纯谓词＋7 断言；`request_filter` 在 parse 后接入，命中回 403；tier 精确 `free` 与选路由径同口径；网关自有 X-API-Key 不在列；HeaderMap::get 大小写不敏感）/D2（OPERATION §6 追加 LAN 敞口＋WG 回环＋D3 引用，同步修正“网关层不强制”→D1 已强制；USAGE 中英限制表各加 free-403＋LAN 两行）/D3 零执行（提案留计划内）。
+- **验证结果**：fmt（1 处自动排版）/clippy 零告警/test 169＋0＋4 ignored；live 四断言：free＋Authorization 403/free＋Cookie 403/free裸 503（默认网关免费池空，语义对）/res＋Authorization 200（付费档零误伤）；SDK 自检 OK（SDK 不发敏感头，无回归）。
+
+### [2026-09-25] 步骤 24-V 完成：最终门禁＋回归＋落库
+- **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 169 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（PONG/Ok，无 SKIP）／bench 编译过／`--release bandit` 12 过（<200ns 断言）。
+- **回归**：plain 200/sticky 200/badkey 403/nohost 400/metrics 200＋SDK 自检＋适配器 mock-b-jp；XLEN 常 0（sink 紧跟，健康）＋CH 3670→3683（+13，与本轮请求数精确对账）；free 两档沿用 Phase B live 证据（pool 7 全 Elite；默认网关 FREE 未开，如实记录不重跑）；Grafana 数据源＋`IPProxyPool GW-R1 Gateway` 面板＋prom 实时序列（2xx/4xx）有数。
+- **落库**：本计划 §状态表 C✅D✅V✅（C6 诚实部分）＋本文件三条目＋TASK 24✅；禁未授权 commit（本次未提交；在途网关 PID:21732 在线）。

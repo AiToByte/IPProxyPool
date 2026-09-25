@@ -82,6 +82,24 @@ pub fn status_for_auth_error(msg: &str) -> u16 {
         403
     }
 }
+
+/// D1 纯谓词：`tier=free` 请求是否夹带凭据头（网关回 403 拦截）。
+///
+/// - free 是匿名共享出口：下游凭据（`Authorization` Bearer/支付 token、
+///   `Cookie` 会话/支付状态——支付类敏感信息现实中就走这两载体，
+///   不存在独立的“支付头”标准）一旦经免费节点出站即泄露给陌生出口，
+///   故直接拒绝；误伤面：free 匿名流量本就没有认证头（注释写明）。
+/// - 网关自己的 `X-API-Key` 不在此列（那是网关身份，稍后 scrub 环节摘除）。
+/// - tier 精确等于 `"free"` 才拦截（与 router 选路 `node.tier == *t` 同口径，
+///   大小写敏感；`free-socks` 等节点档不是请求约束档，不在此列）。
+/// - 非 free 档一律 false（付费/default 存量语义零变化）。
+pub fn free_tier_with_credentials(
+    tier: Option<&str>,
+    has_authorization: bool,
+    has_cookie: bool,
+) -> bool {
+    tier == Some("free") && (has_authorization || has_cookie)
+}
 /// R2-6：取本请求的 bandit 上下文——`upstream_peer` 已算好则复用（选学一致，
 /// 省一次 `extract_context` 含时钟 syscall），否则现算（粘滞路径/直调兼容）。
 pub fn resolve_bandit_context(ctx: &ProxyContext, engine: &LinUCBEngine, domain: &str) -> VectorD {
@@ -340,6 +358,8 @@ impl SmartProxyGateway {
                 }
                 Err(e) => {
                     log::warn!("[SocksBridge] via {} failed: {e}", node.addr);
+                    // NEXT-A4：桥失败可观测（换节点重试语义不变）。
+                    self.metrics.note_bridge_error();
                     record_failed_addr(ctx);
                     if ctx.retry_count < ctx.max_retries {
                         ctx.retry_count += 1;
@@ -457,6 +477,20 @@ impl ProxyHttp for SmartProxyGateway {
 
         // R2-2 会话租户隔离：`{tenant}:{session}`，跨租户同名会话不串绑定。
         apply_tenant_namespace(&mut ctx.routing_spec, ctx.tenant_id.as_deref());
+
+        // D1：free 匿名出口拒收下游凭据头（403，不占租户配额；网关自己的
+        // X-API-Key 不在此列，见 free_tier_with_credentials 注释）。
+        // HeaderMap::get 大小写不敏感，`authorization`/`cookie` 全形态覆盖。
+        let has_authorization = session.req_header().headers.contains_key("authorization");
+        let has_cookie = session.req_header().headers.contains_key("cookie");
+        if free_tier_with_credentials(
+            ctx.routing_spec.tier.as_deref(),
+            has_authorization,
+            has_cookie,
+        ) {
+            session.respond_error(403).await?;
+            return Ok(true);
+        }
 
         // GW-3: Chrome 124+ header alignment before scrubbing.
         FingerprintHardener::align_http2_headers(session.req_header_mut());
@@ -817,6 +851,20 @@ mod tests {
         assert_eq!(status_for_auth_error("Insufficient balance"), 402);
         assert_eq!(status_for_auth_error("Invalid API Key"), 403);
         assert_eq!(status_for_auth_error("Tenant is disabled"), 403);
+    }
+
+    #[test]
+    fn free_tier_rejects_credential_headers() {
+        // D1：tier=free（匿名共享出口）＋Authorization/Cookie → 拦截（网关回 403）。
+        assert!(free_tier_with_credentials(Some("free"), true, false));
+        assert!(free_tier_with_credentials(Some("free"), false, true));
+        assert!(free_tier_with_credentials(Some("free"), true, true));
+        // free 但无敏感头 → 放行。
+        assert!(!free_tier_with_credentials(Some("free"), false, false));
+        // 非 free 档（付费/default/未指定）携带同样头 → 一律放行（存量语义不变）。
+        assert!(!free_tier_with_credentials(Some("res"), true, true));
+        assert!(!free_tier_with_credentials(Some("dc"), true, true));
+        assert!(!free_tier_with_credentials(None, true, true));
     }
 
     #[test]

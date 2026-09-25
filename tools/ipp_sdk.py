@@ -5,7 +5,7 @@
 
 Usage:
     from ipp_sdk import IPPClient
-    c = IPPClient("http://127.0.0.1:8080", session="job-42")
+    c = IPPClient("http://127.0.0.1:8916", session="job-42")
     status, body = c.get("http://httpbin.org/ip")
 Self-test:
     python tools/ipp_sdk.py --self-test   # 普通200＋粘滞＋坏Key403
@@ -18,24 +18,30 @@ from urllib.parse import urlsplit
 
 
 class IPPClient:
-    def __init__(self, gateway="http://127.0.0.1:8080", api_key=None,
-                 session=None, tier=None, proto=None, timeout=10):
+    def __init__(self, gateway="http://127.0.0.1:8916", api_key=None,
+                 session=None, country=None, tier=None, proto=None,
+                 timeout=10):
         parts = urlsplit(gateway)
         self.gw_host = parts.hostname or "127.0.0.1"
         self.gw_port = parts.port or 80
         self.base = f"http://{self.gw_host}:{self.gw_port}"
         self.api_key = api_key
         self.session = session
+        self.country = country
         self.tier = tier
         self.proto = proto
         self.timeout = timeout
 
     def _headers_for(self, target_host):
+        # 头名与网关 parse_routing_spec 严格同名（X-Proxy-Session/Country…；
+        # 误名头会被网关静默忽略，A5 live 复验抓获过 X-Session-Id 版）。
         h = {"Host": target_host, "User-Agent": "ipp-sdk/1.0"}
         if self.api_key:
             h["X-Api-Key"] = self.api_key
         if self.session:
-            h["X-Session-Id"] = self.session
+            h["X-Proxy-Session"] = self.session
+        if self.country:
+            h["X-Proxy-Country"] = self.country
         if self.tier:
             h["X-Proxy-Tier"] = self.tier
         if self.proto:
@@ -75,17 +81,20 @@ class IPPClient:
 
 
 def self_test():
-    gw = "http://127.0.0.1:8080"
-    c = IPPClient(gw, session="sdk-selftest-1")
+    gw = "http://127.0.0.1:8916"
+    c = IPPClient(gw)
     s1, b1 = c.get("http://127.0.0.1:8888/")
     assert s1 == 200, f"plain expect 200, got {s1} {b1[:80]}"
     assert b"mock-" in b1, f"body must carry mock marker, got {b1[:80]}"
-    s2, _ = c.get("http://127.0.0.1:8889/")
-    assert s2 == 200, f"sticky expect 200, got {s2}"
+    # 粘滞确定性证明：country=US 约束下同 session 两次必中 mock-a-us。
+    s = IPPClient(gw, session="sdk-selftest-1", country="US")
+    _, b2 = s.get("http://127.0.0.1:8888/")
+    _, b3 = s.get("http://127.0.0.1:8888/")
+    assert b2 == b3 == b"mock-a-us", f"sticky must pin mock-a-us, got {b2[:16]!r} {b3[:16]!r}"
     bad = IPPClient(gw, api_key="bad")
-    s3, _ = bad.get("http://127.0.0.1:8888/")
-    assert s3 == 403, f"bad key expect 403, got {s3}"
-    print(f"self-test OK: plain={s1} sticky={s2} badkey={s3} marker={b1[:16]!r}")
+    s4, _ = bad.get("http://127.0.0.1:8888/")
+    assert s4 == 403, f"bad key expect 403, got {s4}"
+    print(f"self-test OK: plain={s1} sticky={b2!r} badkey={s4}")
 
 
 if __name__ == "__main__":

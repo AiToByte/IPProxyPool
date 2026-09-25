@@ -41,6 +41,8 @@ services:
       - "9090:9090"
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # C3 告警规则（rules 原生能力，无需额外 feature flag）。
+      - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -57,19 +59,44 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana:/etc/grafana/dashboards:ro
 
-  # OPT-2 环境门示例（网关为宿主二进制直跑，不在 compose 内；如容器化网关，
-  # 在 gateway 服务加 `environment: REQUIRE_API_KEY: "1"` 即开启无头 403）。
+  # C6 容器化网关（profile-gated opt-in：默认 `compose up` 行为不变，
+  # 仍是宿主二进制直跑＋prom 抓宿主 :9091；冒烟见下，生产切换（prom 改抓
+  # gateway:9091）是后续独立事项，本计划内不做）。
+  # 冒烟：docker compose --profile gateway up -d --build gateway
+  #      → curl :8916（宿主 mock 不可达时 503 空池，属预期）＋ :9091/metrics 200
+  #      → docker compose --profile gateway stop gateway（宿主网关不受影响）。
+  gateway:
+    build: ./gateway
+    profiles: ["gateway"]
+    container_name: ipproxy-gateway
+    ports:
+      - "8916:8916"
+      - "9091:9091"
+    environment:
+      REQUIRE_API_KEY: "0"
+      REDIS_URL: "redis://redis:6379/"
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_USER: "proxy"
+      CLICKHOUSE_PASSWORD: "123456"
+      CLICKHOUSE_DB: "proxy"
+      # 容器内必须绑 0.0.0.0（默认 GATEWAY_ADDR 已是；METRICS 默认 127.0.0.1 需覆写）。
+      GATEWAY_ADDR: "0.0.0.0:8916"
+      METRICS_ADDR: "0.0.0.0:9091"
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  # OPT-2 环境门示例（REQUIRE_API_KEY=1 开启无头 403，容器/宿主通用）：
   # R2-8 配置 env 化示例（缺省沿用 main.rs code 常量，只覆盖需改项）：
-  # gateway:
-  #   build: ./gateway
-  #   environment:
   #     REQUIRE_API_KEY: "1"
   #     REDIS_URL: "redis://redis:6379/"
   #     CLICKHOUSE_URL: "http://clickhouse:8123"
   #     CLICKHOUSE_USER: "proxy"
   #     CLICKHOUSE_PASSWORD: "123456"
   #     CLICKHOUSE_DB: "proxy"
-  #     GATEWAY_ADDR: "0.0.0.0:8080"
+  #     GATEWAY_ADDR: "0.0.0.0:8916"
   #     METRICS_ADDR: "127.0.0.1:9091"
   #     PROBE_INTERVAL_SECS: "60"
   #     SWEEP_INTERVAL_SECS: "60"

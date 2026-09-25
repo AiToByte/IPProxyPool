@@ -3,15 +3,16 @@
 背景：网关是反向式 egress 路由（origin-form＋Host 定上游），标准代理形态
 （absolute-URI）被 Pingora 以 400 拒绝——浏览器/系统代理/标准 HTTP_PROXY
 直连网关不可用。本适配器做最小翻译：
-  absolute-URI（GET http://host:port/path）→ origin-form（GET /path＋Host: host:port）→ 网关 :8080
+  absolute-URI（GET http://host:port/path）→ origin-form（GET /path＋Host: host:port）→ 网关 :8916
   origin-form 直转（补 Host  unchanged）
-  转发表头白名单：X-Api-Key/X-Session-Id/X-Tenant-Country/X-Proxy-Tier/X-Proxy-Proto
+  转发表头白名单：X-Api-Key/X-Proxy-Country/X-Proxy-Session/X-Proxy-Tier/X-Proxy-Proto
+  （与网关 parse_routing_spec 同名；误名头会被网关忽略）
   （网关选择语义）＋Content-Type/Length/Host/Authorization 等常规头透传。
 诚实限制：CONNECT（HTTPS 隧道）→ 501；分块请求体（chunked）→ 501；
   请求体>10MB → 413；只服务 127.0.0.1（禁远程）。
 
 Usage: python tools/ipp_forward.py [listen_port] [gateway_host] [gateway_port]
-  default: 127.0.0.1:18080 -> 127.0.0.1:8080
+  default: 127.0.0.1:18080 -> 127.0.0.1:8916
 验证：curl.exe -x http://127.0.0.1:18080 http://127.0.0.1:8888/  # 经网关命中 mock
 """
 import sys
@@ -21,15 +22,17 @@ import http.client
 
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18080
 GW_HOST = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
-GW_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8080
+GW_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8916
 MAX_BODY = 10 * 1024 * 1024
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection",
 }
+# 头名以网关 parse_routing_spec 为准（X-Proxy-Country/Session/Tier/Proto＋X-Api-Key；
+# 曾误用 X-Session-Id/X-Tenant-Country（网关不认），A5 live 复验抓获，已修正）。
 PASS_HEADERS = {
-    "x-api-key", "x-session-id", "x-tenant-country",
+    "x-api-key", "x-proxy-country", "x-proxy-session",
     "x-proxy-tier", "x-proxy-proto",
 }
 
