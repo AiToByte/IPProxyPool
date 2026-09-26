@@ -724,3 +724,12 @@
 - **门禁**：fmt clean／clippy `-D warnings` 零告警／`cargo test` 209 通过＋0 失败＋4 ignored／`-- --ignored` 4 真过（带密，无 SKIP）／bench 编译过／`--release bandit` 12 过。
 - **回归**：D3 新语义（plain/keyed 200＋nokey/badkey 403）＋sticky 200/nohost 400/metrics 200＋D1 四断言＋SDK 四断言＋适配器带 Key 回包；XLEN 流动（消费组 lag=0）＋CH 精确对账＋Grafana 7 面板有数；SupervisorRestarted firing 系本轮 kill/churn，非生产信号。
 - **落库**：本计划 §状态表 S✅E✅O✅V✅＋本文件四条目＋TASK 28✅；禁未授权 commit（本次未提交；在途网关在线）。
+
+### [2026-09-26] 步骤 29 立项: DOC-S2 文档五件套计划冻结（先落库再执行）
+- 计划操作：用户点题 5 份高质量文档（架构/功能/数据流/用户使用/相关开源），要求重点突出详细丰满。既有 9 份偏条目式（33~156 行），缺全景深文档，故新建 5 文件不碰既有。新建`plan/2026年9月26日-DOC-S2文档五件套实施计划.md`（D1~D5＋V）；`TASK_PLAN.md` 步骤 29 置待执行；本文件 append-only 记立项。
+- 口径锚点：D3 默认值（Key 门开＋127.0.0.1:8916）、209 单测、`default_key`、monosans/relayglass 七源；本文件 append-only。
+
+### [2026-09-26] 步骤 29 完成: DOC-S2 文档五件套（D1~D5＋V）
+- **实际操作**：D1 系统架构（定位/目标/总览图/组件表/拓扑/决策/非目标）/D2 功能说明（F1~F10 四段式）/D3 数据流（请求生命周期＋遥测落库＋免费管道＋PubSub＋重试＋指标六节＋ASCII 图）/D4 用户使用（安装/5 步 quickstart/四形态可复制命令/免费线/巡检/FAQ）/D5 相关开源（Rust 依赖＋ infra 镜像＋GeoLite2/数据源许可＋本仓 posture，Grafana AGPL 与 MaxMind 署名注记）/V（7URL/grace/门开/回环/d4/面板数等 12 项抽查全对＋五文件互链）。
+- **纠错记录**：复数 checkbox 批量替换误伤头注示例（*- [ ]* → *- [x]*），已恢复；DATAFLOW 锚点文本两次失配改走文件脚本定位。
+- **落库**：本计划 §状态表全✅＋本条目＋TASK 29✅；禁未授权 commit（本次未提交）。
