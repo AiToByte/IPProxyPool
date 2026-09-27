@@ -48,7 +48,7 @@ IPProxyPool is a Pingora-based enterprise proxy gateway: smart routing (LinUCB +
 - Control plane: prober/prewarmer/sweep/arbitrage/free_pool background tickers, supervised.
 - Quality: 201 unit tests + 4 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage self-healing).
 
-Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) · [`docs/OPERATION.md`](docs/OPERATION.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) · [`docs/OPERATION.md`](docs/OPERATION.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · hands-on [`docs/HANDS-ON.md`](docs/HANDS-ON.md) · arch [`docs/SYSTEM-ARCHITECTURE.md`](docs/SYSTEM-ARCHITECTURE.md) · features [`docs/FEATURES.md`](docs/FEATURES.md) · dataflow [`docs/DATAFLOW.md`](docs/DATAFLOW.md) · usage [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) · oss [`docs/OPEN-SOURCE.md`](docs/OPEN-SOURCE.md).
 
 ### Quickstart (5 steps, see user manual)
 
