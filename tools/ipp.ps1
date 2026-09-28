@@ -75,8 +75,16 @@ function Start-Detached {
 
 if ($Action -eq "status") {
     docker ps --format "{{.Names}} {{.Status}}" | Select-String "ipproxy"
-    docker exec ipproxy-redis redis-cli -a "$env:REDIS_PASSWORD" ping 2>$null
-    curl.exe --max-time 10 -s "http://127.0.0.1:8123/ping" --user "$($env:CLICKHOUSE_USER):$($env:CLICKHOUSE_PASSWORD)"
+    # OPT-R8 A3：凭据走环境变量，不进 argv。
+    #   redis-cli：REDISCLI_AUTH 是 redis-cli 官方专设的认证环境变量，设置后
+    #     自动认证，命令行不再出现 -a <password>（否则同机任何用户读
+    #     `Get-CimInstance Win32_Process` / `/proc/<pid>/cmdline` 即可拿到密码）。
+    #   ClickHouse：改用 X-ClickHouse-User / X-ClickHouse-Key 请求头，
+    #     头值不出现在 argv（`--user u:p` 会）。
+    docker exec -e REDISCLI_AUTH="$env:REDIS_PASSWORD" ipproxy-redis redis-cli ping 2>$null
+    curl.exe --max-time 10 -s "http://127.0.0.1:8123/ping" `
+        -H "X-ClickHouse-User: $env:CLICKHOUSE_USER" `
+        -H "X-ClickHouse-Key: $env:CLICKHOUSE_PASSWORD"
     Write-Output ""
     Show-Port "http://127.0.0.1:8888/" "mockA"
     Show-Port "http://127.0.0.1:8889/" "mockB"
@@ -99,7 +107,8 @@ if ($Action -eq "stop") {
 
 # start （网关子进程自动继承本脚本 env：REDIS_URL/CLICKHOUSE_* 已在顶部备好）
 docker compose up -d
-docker exec ipproxy-redis redis-cli -a "$env:REDIS_PASSWORD" ping 2>$null
+# OPT-R8 A3：同 status 分支——REDISCLI_AUTH 传 env，密码不入 argv。
+docker exec -e REDISCLI_AUTH="$env:REDIS_PASSWORD" ipproxy-redis redis-cli ping 2>$null
 # V1-verdict fix: fixed sleeps lose the readiness race on cold start;
 # poll until 200 (or timeout) instead.
 function Wait-Port($Url, $Name, $Tries = 12, $Keyed = $false) {

@@ -6,6 +6,7 @@
 //! - `Degraded`: reachable but unexpected status;
 //! - `Dead`: transport/timeout failure.
 
+use crate::janitor;
 use crate::model::ProxyNode;
 use dashmap::DashMap;
 use reqwest::Client;
@@ -110,7 +111,9 @@ impl CanaryProber {
         let before = self.clients.len();
         self.clients
             .retain(|_, c| now.saturating_duration_since(c.last_used) < CLIENT_IDLE_TTL);
-        before - self.clients.len()
+        // OPT-R6 S2：饱和减法（与 router/socks_bridge 同口径）。当前由单线程 60s
+        // 滴答单点调用、风险低于另两处，但三处同源缺陷一并根治，防后续接并发后复发。
+        janitor::removed_count(before, self.clients.len())
     }
 
     /// R2-7 userinfo 百分号编码：`user:pass@` 含空格/保留字符时代理 URL 非法

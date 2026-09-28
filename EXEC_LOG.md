@@ -743,3 +743,64 @@
 - **三重证据**：2xx=11、pool 24、CH 行 `free-api0|45.192.197.165|200|free`×3（另有诚实 404 一行）；直连基线 D=27.18.26.166。
 - **劫持案一（env 代理）**：用户回 142.249.36.116（VPN 出口，记 V 值）。诊断：curl -v 首行 Uses proxy env＋netstat 确认 8916 归属网关 PID 无冒充＋CH 无对应行→请求被 Clash 按 Host 头劫持。修：NO_PROXY/no_proxy＋TUN 检查。
 - **劫持案二（引号陷阱，根因级）**：用户关 TUN、配 no_proxy 后 `--noproxy '*'` 仍回 142 段。根因：CMD 单引号非引号，curl 实际收到 pattern `' * '`（三字符）永不匹配→bypass 静默失效；PowerShell 则相反（不加引号会被通配展开）。修：cmd 用 `--noproxy *` 裸星，PS 用 `--noproxy '*'`。已同步 HANDS-ON §0 与 FREE_BASELINE（V 值补 142.249.36.116＋引号注记）。
+
+### [2026-09-28] 步骤 31 立项: OPT-R6 止血优化（3×P0＋P1 supervisor 覆盖）
+- **前置**：全仓审阅（Rust 源码 + 部署/文档/工具链双路）产出 90 条风险清单；3 个 P0 全部**逐行实证确认**（非推测），落库方案 plan/2026年9月28日-OPT-R6止血优化方案.md。
+- **P0-1（安全，最急）**：free 凭据护栏可一行头绕过。gateway.rs:96-102 仅在 X-Proxy-Tier=="free" 时拦截，而 outer.rs:222-237 无 tier 约束时按权重**本就可能命中 free 节点** ⇒ 带 Authorization/Cookie 但不发 tier 头的请求可经陌生免费出口泄露凭据；ree_pool.rs:733 注释承诺的「Transparent 永不服务认证流量」与 FREE_REQUIRE_ELITE 默认关相互矛盾。修法：判定输入从「请求声明 tier」改为「**实际选中节点档位**」（选路后校验，粘滞/新鲜共用）。
+- **P0-2（可用性）**：淘汰计数下溢。outer.rs:145-150 等 efore - len() 两次取值间 session_store 被数据面并发 insert（:322）⇒ debug panic / release 回绕。同类三处：outer.rs:150,155、socks_bridge.rs:274、prober.rs:113。放大链路：sweep 是裸 spawn（main.rs:652）**无 supervisor**，panic 即静默死亡 → 会话/隔离表无界增长至 OOM。修法：共享 emoved_count 助手 + saturating_sub。
+- **P0-3（门禁）**：live.yml:22-28 的 CH service 不挂  01_schema.sql，而全仓无 CREATE TABLE ⇒ ch_sink.rs:598 必失败；且 :3 宣称的 SKIP 门未实现（:35-36 无断言），ch_sink.rs:526/538/551 三处 SKIP 会静默 return ⇒ **依赖全挂也报绿**。唯一集成测试门从未真正跑通。
+- **P1（联动）**：4 条裸 spawn 无 supervisor（main.rs:318 prewarmer／:417 telemetry／:488 prober／:652 sweep）⇒ panic 等于功能永久静默死亡。S2 与 V1 必须同批落地才能真正消除 OOM 链路。
+- **范围纪律**：其余 P1/P2 已在方案「不在本轮范围」显式登记（可观测性组/部署组/结构组），无静默丢弃；每个修复配回归单测；S1 属**行为收紧**（破坏性），已在方案决策 1 写明理由与存量影响面。
+
+### [2026-09-28] 步骤 31 完成: OPT-R6 止血优化（3×P0＋P1 supervisor 覆盖）
+- **S1（P0 安全，free 凭据护栏）**：新增 ree_node_exits_with_credentials（按**实际选中节点**档位判定）＋has_authorization/has_cookie 助手；接入 upstream_peer（HTTP）与 serve_via_socks（SOCKS，逐跳重试内每跳重判）两条出站路径。保留显式 	ier=free 提前拒绝；付费节点零变化；比较用 eq_ignore_ascii_case（零分配，避免热路径 String）。**6 项回归单测全绿。**
+- **S2（P0 可用性，淘汰计数下溢）**：新增 gateway/src/janitor.rs（emoved_count 单一真源，附完整单测）；outer.rs/socks_bridge.rs/prober.rs 三处改饱和减法。**红测有效性实证**：临时回退为普通减法后，opt_r6_s2_sweep_survives_concurrent_session_writes（Barrier＋双线程真实竞态）立即 panic ttempt to subtract with overflow，与 P0 根因逐字一致；恢复后全绿。
+- **S3（P0 门禁，live workflow）**：挂 CH schema 到 initdb（landed=1 前提）＋依赖可达性前置门＋CH healthcheck＋**SKIP 断言门**（grep -qE '^SKIP' 命中即红）＋失败 artifact 上传。YAML 解析验证通过；SKIP 门逻辑三态实测（无 SKIP 放行／行首 SKIP 判红／行中含 SKIP 字样放行，证 ^ 锚定必要）。
+- **V1（P1 supervisor 覆盖）**：prewarmer/prober/sweep 三条裸 spawn 包 supervise_until（prober 的 CanaryProber/Semaphore 下沉闭包内以支持重启）；telemetry 因 Receiver 不可 Clone 改为**有尽监督**（崩溃记 supervisor_restarts_total{worker="telemetry"} 后停止，不假装自愈）。现 9 个后台 worker 全部有监督。**3 项回归单测全绿。**
+- **四门全绿**：fmt exit=0；clippy -D warnings exit=0；cargo test **223 passed 0 failed 4 ignored**（基线 213 → +10）；bench exit=0；cargo test --release bandit 12 passed。
+- **端到端实证**（本机起网关＋mock 上游）：D3 语义 plain 200／nokey 403／badkey 403；显式 	ier=free＋凭据 → 403；匿名流量走免费线 → 200（**免费线功能未被误伤**）；付费档带凭据 → 200（**存量零变化**）。完整绕过场景由新增集成单测 opt_r6_s1_undeclared_request_hitting_free_node_is_caught_by_guard 锁定（200 次选路验证命中免费节点必被拦、付费路径必放行）。
+- **诚实记录**：①S1 的两个 Pingora 钩子因 Session 不可构造无法单测，「护栏被调用」靠走查＋端到端，已在测试注释显式写明盲区；②S3 未在 Actions 真跑，仅做 YAML＋门逻辑验证；③新增 1 个纯函数助手模块 janitor.rs；④本机 RUSTUP_HOME 误设为空的 D:\DevSoft\rustup，真实 MSVC 工具链在 C:\Users\xiaoj\.rustup（rustc 1.93.0）。
+- **落库**：本条目＋plan §状态表✅＋TASK 31✅；禁未授权 commit。
+### [2026-09-28] 步骤 32 立项: OPT-R7 可观测性与部署加固
+- **前置**：承接步骤 31 后的审阅 P1 清单；本轮所有断言**逐条实证**——线上 SHOW CREATE TABLE proxy.proxy_telemetry_log 确认排序键为 (target_domain, provider, status_code, event_time) 且**零跳过索引**；ules.yml 逐行读确认两处 PromQL 语义 bug；docker ps 确认 ipproxy-clickhouse 长期 unhealthy。
+- **A 组（查询性能，P1）**：nalytics.rs:88-91 的唯一查询按 provider + country + event_time 过滤，而排序键首位 	arget_domain 不在任何 WHERE 里、country 根本不在排序键中 ⇒ 每次 SLA 查询**分区全扫描**；endor_arbitrage 每分钟并发 9 次，90 天累积线性劣化。ClickHouse 排序键**不可 ALTER**，只能重建表 ⇒ 提供  02_reorder.sql，**只写脚本不在生产执行**。
+- **B 组（告警语义，P1）**：①TelemetryStreamLagGrowing 对 gauge 用 increase() 且阈值 >0 ⇒ **系统健康时永久 firing**；②SupervisorRestarted 无 sum by (worker) 而 annotation 用 $labels.worker ⇒ 聚合后标签消失、无法定位 worker。补三类零告警：延迟／源站熔断／遥测丢数。
+- **C 组（部署，P1）**：①CH healthcheck 用 wget --spider 而项目文档自承该探针不可靠，gateway 服务又 depends_on: clickhouse: service_healthy ⇒ **--profile gateway up 下网关永不启动**；②prometheus **无持久化卷**，每次 recreate 全量历史指标归零；③alertmanager receiver 为 empty ⇒ **所有 firing 静默丢弃**。
+- **D 组（编码与口径，P1）**：①6 个 .ps1 的 UTF-8 BOM 被 * text=auto 剥离；②DURATION_BUCKETS_MS 桶顶 2500ms 而 peer 超时预算 1500/5000/3000ms ⇒ 慢时段 P99 **系统性失真**。
+- **范围纪律**：零新生产依赖；不动数据面 Rust 逻辑（除桶常量）；CI 组／凭据组／脚本组／结构组／文档组已在方案显式登记为后续立项。
+
+### [2026-09-28] 步骤 32 完成: OPT-R7 可观测性与部署加固
+- **A1/A2（CH 查询性能）**：排序键改为 (provider, country, event_time)，去 status_code（SLA 用 countIf 聚合不需它进排序键，600 取值会打散时间局部性）、	arget_domain 降普通列；补 set(64)/set(512) 跳过索引。**真实数据量化收益**：临时库灌 5 万行后 EXPLAIN indexes=1 实测 旧 PrimaryKey Granules 5/5（零剪枝）→ 新 Granules 1/5（剪掉 80%）；迁移全流程已跑通，生产表未触碰。
+- **CH 迁移执行（用户确认后）**：建备份表（实测 CREATE TABLE AS **只复制结构不拷数据**得 0 行，改用显式列名 INSERT SELECT 得 3981 行）→ 建 _v2（新排序键＋两索引）→ INSERT SELECT 搬 3981 行 → RENAME TABLE 原子换名。**对账：new/old/backup 三表均 3981 行；provider×status 分布逐行完全一致；nalytics.rs sla_sql 口径的 4 组 SLA 查询全部正常返回**。_old 与 _backup_20260928 **保留作回滚保险**。
+- **B1/B2（告警语义）**：修两处语义 bug——TelemetryStreamLagGrowing（gauge 用 increase()＋阈值 >0＝健康时永久 firing）→ 改名 TelemetryStreamBacklogHigh 改 max_over_time(...) > 1000；SupervisorRestarted 补 sum by (worker)。新增 5 条告警。**12 条规则被真实 Prometheus 引擎加载，health 全部 ok**。顺带修掉一处**我自己引入的** PromQL 错误：403 比值分母原用 sum by(provider)，但 proxy_requests_total 只有 status 标签无 provider 标签（实测 metrics.rs:404-416），标签集不匹配会错配——已改全局分母＋阈值降 5%＋注释如实标注该限制。
+- **C1（网关永不启动）**：CH healthcheck 改 clickhouse-client --query "SELECT 1" ＋ 新增 start_period: 20s。**实测：本机容器由 unhealthy 转 healthy。**
+- **C2（指标归零）**：compose 补 prometheus-data 卷；修正注释「重载 prom 即投递」→ 实为必须 restart（**实测 /-/reload 无效、restart 才生效**，Prometheus 默认禁用 reload）。
+- **C3（告警投递）**：alertmanager 补 webhook/email **注释态**配置＋inhibit_rules（critical 抑制同 alertname 的 warning）。
+- **D1（BOM）：原设计的 .gitattributes 方案被实测证伪**——git 2.52 下五种组合（	ext eol=crlf／-text+inary／working-tree-encoding=UTF-8／core.autocrlf=false+-text／hash-object --no-filters）产出的 blob 首 3 字节**一律 3C 23 52（无 BOM）**，即 BOM 剥离是 git 内建行为。处置：移除无效配置＋新增 	ools/check_ps1_bom.py CI 断言（双向验证：6/6 通过、造无 BOM 文件判红并打印修复命令）＋.gitattributes 留完整实测记录表。
+- **D2（P99 失真）**：DURATION_BUCKETS_MS 由 10 桶扩到 14 桶（与 60s 截断对齐）——此前桶顶 2500ms 而超时预算就有 5000/3000ms，>2500ms 全落 +Inf，histogram_quantile 只能外推，**慢时 P99 显示好看**（最坏的失败方向）。2 项专项单测。修正了初版单测对 +Inf 累积语义的误解（+Inf 行 == count）。
+- **顺带修两处真实缺口**：①ci.yml 三条 Python 检查用 open(path) 无编码参数，本机 GBK 下**全部抛 UnicodeDecodeError**，已统一加 encoding="utf-8"；②.gitignore 漏 log/*.txt（实测污染 6 个未跟踪文件）。
+- **四门全绿**：fmt/clippy exit=0；cargo test **226 passed 0 failed 4 ignored**（223 → +3）；bench exit=0；cargo test --release bandit 12 passed。
+- **待验证**：告警端到端 firing 演练未做（12 条全 inactive）；Linux 侧 host.docker.internal 不可解析致 GatewayDown 永久 firing（本轮未修，需 Linux 实测给方案）；Grafana 面板语义属 P2 批次未动。
+### [2026-09-28] 步骤 33 立项: OPT-R8 凭据与运维脚本加固
+- **A 组（凭据出 argv，P1）**：用 Select-String 逐条实测确认泄漏面共 **9 处**——compose 侧 4 处（edis-server --requirepass、healthcheck edis-cli -a、REDIS_URL 内嵌密码、CLICKHOUSE_PASSWORD 环境），脚本侧 5 处（ipp.ps1:78/102 与 ackup.ps1:58 的 edis-cli -a；ipp.ps1:79 与 ackup.ps1:68/74 的 curl --user／clickhouse-client --password；ipp_free_test.ps1:62 还硬编码了 proxy:123456）。任何同机用户可经 Get-CimInstance Win32_Process／/proc/<pid>/cmdline 读到。
+- **B 组（脚本健壮性，P1）**：①ackup.ps1:78/83 硬编码卷名 → 用 -p other 或 COMPOSE_PROJECT_NAME 时 docker run -v 自动建**空卷**，tar 打包空目录后照常打印 ALL BACKUP DONE ⇒ **静默备份空卷**；修法双重＝卷名推导 ＋ **产物校验**（校验比参数化更关键）。②ipp_watchdog.ps1:68-83 身份探针写死 mock-*，而 docs/OPERATION.md:42-43 的真 Key 灰度流程要求把 mock 换成真实节点 ⇒ 换完后**无限重拉**（每 3 轮约 90s）；修法「端口归属＋HTTP 探活」双判据，mock- 降为日志指纹。③ipp_free_test.ps1:50-58 的 $verdict 初始值 CLEAN，而 -match 对 $null 返回 $false ⇒ 网关 502/503/超时时判定**停留在 CLEAN**——**失败方向与安全方向相反**；修法加 UNKNOWN 态＋非零退出码。④estore.ps1 只有 dry-run，FEATURES.md 引用的 --dry-run 参数还不存在 ⇒ **有备份无恢复**。
+- **范围纪律**：零 Rust 改动；不硬编码任何新凭据；.ps1 改动后须过 OPT-R7 D1 的 BOM 断言；B4 属破坏性操作，演练需用户在场。
+
+### [2026-09-28] 步骤 33 完成: OPT-R8 凭据与运维脚本加固
+- **A 组**：ipp.ps1/ackup.ps1 的 edis-cli -a 改 docker exec -e REDISCLI_AUTH=，clickhouse-client --password 改 env，curl --user u:p 改 X-ClickHouse-Key 请求头；ipp_free_test.ps1 硬编码 proxy:123456 改读 .env/env。**A3 实测：ipp.ps1 status 返回 PONG/Ok.（凭据经 env 仍认证成功）。**
+- **A1 降级（设计变更，如实说明）**：原计划「Redis 配置文件传密码」降级为**只做 healthcheck 侧**——实测确认 edis-server --requirepass **无环境变量替代**（Redis 自身限制），彻底规避需配置文件＋挂载＋生成器，属更大改动，故该处 argv 泄漏**保留**并在 compose 注释标注。
+- **A5（新增 CI 断言）**：	ools/check_no_plaintext_creds.py 已接入 ci.yml。**双向实测：真实仓库 0 误报；注入 3 类违规全被抓住。断言自身经历 3 轮修正**：①误报自己（文档字符串含违规样例字面量）→ 排除自身；②live.yml 的 $（容器 env 引用，正确形态）被误判 → 放宽为变量引用放行（并顺手把 live.yml 的 --password 123456 字面量改成 $）；③反向验证时发现**真实漏检**——docker exec ... redis-cli -a "" 被第 2 轮规则误放行，补「$env: 必须与 docker exec -e VAR= 同行才算安全注入」。**教训：断言的价值不在一次写对，而在用「正向 0 误报＋反向必抓」双向实测校准；只跑正向会写出自欺欺人的门禁。**
+- **B1（静默备份空卷）**：ackup.ps1 卷名改从 compose 实际项目名推导＋**两道闸**。**双向实测**：错误项目名→第一道闸 olume not found 中止且**未创建空卷**；绕过第一道闸时第二道闸 rchive has only 1 entries (< 3) — backup FAILED 退出 1；正确项目名→CH 2000 条目/433MB、Grafana 6 条目/1MB 正常完成。附带把 Start-Sleep 3 换成 db_bgsave_in_progress 轮询（原写法可能拷到上一版 dump.rdb）。**第一道闸最初是失效的**：原写 if (-not (docker volume inspect  2>))，实测本机 docker volume inspect **对存在的卷也返回 exit=1 并写 stderr 告警** ⇒ 输出非空、-not 恒 false、闸门形同虚设；改用 docker volume ls 列取比对后生效。**这正是「两道闸」的价值——第一道失效时第二道仍抓住了空卷。**
+- **B2（看护无限重拉）**：ipp_watchdog.ps1 身份探针改「端口归属（
+etstat -ano 比对可执行路径）＋ HTTP 探活」双判据。**四场景实测**：真供应商 body（无 mock-）旧逻辑 404-foreign（无限重拉）→ 新逻辑 200（健康）；mock 场景两版一致；端口无人监听→
+o-owner（仍重拉）；他人占端口→
+o-owner（不误认）。按 EXEC 教训用 
+etstat -ano 而非 Get-NetTCPConnection（后者 Win11 有卡死 20s+ 实测）。
+- **B3（误判 CLEAN）**：ipp_free_test.ps1 改四态判定＋记录 http_code＋非零退出码。**六场景实测**：503／超时／502 三种失败旧逻辑全判 CLEAN（误判）→ 新逻辑全判 UNKNOWN 且 exit=1；SUSPECT-VPN／TRANSPARENT／真 CLEAN 三种成功场景判定与旧一致（无回归）。附带修了一个隐藏问题：旧代码在 Clash 不可达时 V="UNKNOWN"，Escape("UNKNOWN") 会去响应体里匹配字面 "UNKNOWN"（语义失真），新代码显式跳过。
+- **B4（有备份无恢复）**：estore.ps1 实现 -Execute 真恢复（停服→RDB 拷回→双 tar 回放→起服→行数对账），**默认 dry-run 行为不变**；三道闸＝产物完整性校验＋键入 RESTORE 交互确认（非交互会话直接拒绝）＋分阶段失败即停。**实测**：缺备份时明确报错；产物完整时 dry-run 打印计划且**零写入**、exit 0。**-Execute 属破坏性操作，本轮刻意未演练。**
+- **两处 PowerShell 陷阱（已修并留注记）**：①项目名解析连续踩坑——docker inspect -f "{{ index .Config.Labels \"com.docker.compose.project\" }}" 本机返回 **0 行**（PowerShell 双引号串里 \" 不构成对 docker 的转义）；简化模板 {{.Config.Labels.com.docker.compose.project}} 返回字面 **<no value>**（键名含点被当嵌套路径）⇒ 最终用全量 JSON＋ConvertFrom-Json 直读标签。②Write-Output "text " +  的**行尾 + 被 PowerShell 当续行符**，输出出现孤立 + 行 ⇒ 改用 "text "。
+- **一次虚惊如实记录**：验证 restore 时报「backup incomplete（tar MISSING）」，排查确认是**我并发调用了两次 backup**、后一次未写完即被读取——**非脚本缺陷**；但它恰好证明「产物完整性校验」这道闸有效。
+- **四门全绿**：fmt/clippy exit=0；cargo test **226 passed 0 failed 4 ignored**（本轮零 Rust 改动）；bench exit=0；cargo test --release bandit 12 passed。CI 静态门全绿。
+- **落库工具教训（重要）**：EXEC_LOG.md 原为 CRLF，本轮用 ReadAllText/WriteAllText 往返与 git add 曾两次污染该文件（index blob 膨胀到 171770 字节、虚假 diff 1500+ 行），并致已写条目丢失。**正确姿势：git reset + git checkout 恢复后，用 [IO.File]::Open(..., Append) 二进制追加且显式 CRLF，全程不经暂存区。** 本次已按此重做。
+- **待验证（如实登记）**：①estore.ps1 -Execute 真恢复未演练（破坏性，需用户在场）；②容器环境变量仍可被 docker inspect 读到（Docker 固有行为），本项只把暴露面从「同机任意用户」缩到「有 Docker 权限者」；③edis-server --requirepass 的 argv 泄漏保留；④CI 组／结构组／文档组仍待后续立项。
+- **落库**：本条目＋plan §状态表✅＋TASK 33✅；禁未授权 commit。

@@ -1,12 +1,24 @@
-# IPProxyPool Prometheus alert rules (Phase C3, OPT-R4 C9/C11 tuned).
-# All LHS series are rendered by the gateway itself (gateway/src/metrics.rs),
-# except redis_stream_length (needs redis_exporter, compose profile
-# `observability`; rule stays inactive until the series exists).
-# `up` is the built-in scrape-health series.
+# IPProxyPool Prometheus alert rules (Phase C3, OPT-R4 C9/C11 tuned, OPT-R7 B1/B2 fixed).
+#
+# OPT-R7 B1 修掉两处 PromQL 语义 bug（原注释保留了病因，便于回溯）：
+#   ① TelemetryStreamLagGrowing 对 gauge `redis_stream_length` 用 `increase()`
+#      且阈值 `>0` —— 只要有正常遥测流量（stream 在增长）表达式恒为真，
+#      `for: 10m` 后**永久 firing**。现改为 `delta()` + 绝对 lag 阈值。
+#   ② SupervisorRestarted 缺 `sum by (worker)` —— 聚合后 `worker` 标签消失，
+#      annotation 的 `$labels.worker` 渲染成空，无法定位是哪个 worker。
+#
+# OPT-R7 B2 补三类此前零告警的关键信号：延迟 / 源站熔断 / 遥测丢数。
+# 28 个已渲染指标中，此前仅 3 个被规则消费；现补齐后覆盖 9 个。
+#
+# **指标名口径纪律**：本文件引用的每个指标名都逐个对 `gateway/src/metrics.rs`
+# 的 `# HELP` 核对过（OPT-R7 B2 交付时共 28 个）。CI 目前只验 YAML 语法
+# （`yaml.safe_load`），**验不出 PromQL 拼写错误**——故此处留此注记，
+# 改指标名时必须同步核对。
 groups:
   - name: ipp-gateway
     interval: 30s
     rules:
+      # ---- 错误率 ----
       # 数据面成功率：2xx / 全部分类。分母含 4xx 拦截（坏 Key/无头属预期行为，
       # 压测坏 Key 会拉低成功率，见 annotation）。
       - alert: GatewaySuccessRateLow
@@ -22,28 +34,93 @@ groups:
           summary: "网关 5 分钟成功率 < 99%"
           describe: "2xx 占比 {{ $value | humanizePercentage }}；分母含 4xx 拦截，坏 Key 压测属预期拉低。"
 
+      # OPT-R7 B2 新增：上游 403 封禁比。`proxy_requests_forbidden_total` 按
+      # provider 分标签（metrics.rs:429），此前只上 Grafana 面板、**无告警**。
+      # 403 是熔断的先行指标——配额/IP 封禁会先表现为 403 上升再传导为成功率跌。
+      #
+      # **标签口径限制（如实标注）**：`proxy_requests_total` **只有 status 标签、
+      # 没有 provider 标签**（metrics.rs:404-416），因此算不出真正的
+      # per-provider 封禁比（需要按 provider join 总请求数，当前 exposition 做不到）。
+      # 本规则退化为「该供应商 403 占**全网**流量的比例」——横向比较各供应商
+      # 谁被封禁得最狠仍然有效（Grafana 面板 3 同样受此限制，见 B2 交付注记）。
+      # 若将来 `proxy_requests_total` 增加 provider 标签，应立即改为
+      # `sum by (provider)(rate(proxy_requests_total[10m]))` 作分母。
+      - alert: ProviderForbiddenRatioHigh
+        expr: |
+          sum by (provider) (rate(proxy_requests_forbidden_total[10m]))
+          /
+          clamp_min(sum(rate(proxy_requests_total[10m])), 0.001)
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "供应商 {{ $labels.provider }} 403 占全网流量 > 5%"
+          describe: "10 分钟窗内该供应商 403 占全网请求 {{ $value | humanizePercentage }}；查该供应商配额与封禁策略，必要时下调其权重（见 vendor_arbitrage SLA 套利）。注：分母为全网而非该供应商总量（proxy_requests_total 无 provider 标签），故阈值取 5% 而非 20%。"
+
+      # ---- 延迟（OPT-R7 B2 新增）----
+      # 依赖 D2 的桶扩展：桶顶此前仅 2500ms 而 peer 超时预算就有 5000/3000ms，
+      # >2500ms 全落 +Inf，histogram_quantile 只能外推 —— 慢时 P99 显示好看。
+      # 现桶覆盖到 60s，P99 在 5s~30s 区段有真实桶可落。
+      # 阈值 5000ms 对齐最坏单跳 connect timeout（gateway.rs build_http_peer）。
+      - alert: GatewayLatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_processing_duration_ms_bucket[5m]))
+          ) > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "网关附加延迟 P99 > 5s"
+          describe: "5 分钟窗 P99 = {{ $value | humanizeDuration }}；超过最坏单跳 connect timeout，先查上游节点质量（`free_pool_nodes_total` / `quarantine_nodes`）与重试放大。"
+
+      # ---- 免费池健康 ----
       # 免费池水位：30 分钟窗口最大值仍为 0 即干旱。severity 仅 warning——
       # 免费源本就轮转低谷常态 pool=0（见 FREE_BASELINE），此规则抓超长干旱。
+      #
+      # OPT-R7 B1 修：原式 `max_over_time(free_pool_nodes_total[30m]) == 0` 在
+      # `FREE_ENABLED=0`（**缺省**）时该 gauge 恒为 0 ⇒ 缺省配置下永久 firing。
+      # 现用 `unless` 排除"指标恒为 0 且从未有过非 0 值"的情形难判——
+      # 故改用 `free_pool_source_fetch_ms_count` 作为**启用态代理**：
+      # 免费线开启时抓取 worker 必然产生该计数；关闭时恒为 0。
       - alert: FreePoolDry30m
-        expr: max_over_time(free_pool_nodes_total[30m]) == 0
+        expr: |
+          max_over_time(free_pool_nodes_total[30m]) == 0
+          and on() (increase(free_pool_source_fetch_ms_count[30m]) > 0)
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "免费池连续 30 分钟水位 0"
-          describe: "免费源轮转低谷属正常；超 30 分钟请查源站存活与熔断 free_pool_source_suspended。"
+          describe: "免费源轮转低谷属正常；超 30 分钟请查源站存活与熔断 free_pool_source_suspended。（启用态门槛：免费线确实在跑才判干旱，FREE_ENABLED=0 缺省不误报）"
 
+      # OPT-R7 B2 新增：源站熔断。此前 `free_pool_source_suspended{source}`
+      # 已渲染但**零规则消费**——规则 2 的 annotation 甚至主动让运维去查它。
+      - alert: FreePoolSourceSuspended
+        expr: free_pool_source_suspended == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "免费源 {{ $labels.source }} 持续熔断"
+          describe: "源站连续多轮零产出被 SourceGuard 熔断（15 分钟未恢复）；查源站是否下线/改版，或临时降低该源权重。"
+
+      # ---- 后台 worker 健康（OPT-R7 B1 修：加 sum by(worker)）----
       # 后台 worker 重启（supervisor 捕获 panic/意外返回后自愈）。
       # Windows 本机调试偶发 tokio 退出抖动（见 EXEC），单次重启是自愈证据；
       # OPT-R4 C9：阈值收紧为 15 分钟窗内 >3 次（抖动不再噪，连续崩才报）。
+      # OPT-R7 B1：补 `sum by (worker)` —— 原式对全 worker 求和后再比阈值，
+      # 聚合掉 worker 标签使 annotation 的 `$labels.worker` 渲染为空，
+      # 告警发出来也定位不到是哪个 worker。现按 worker 独立判定。
       - alert: SupervisorRestarted
-        expr: increase(supervisor_restarts_total[15m]) > 3
+        expr: sum by (worker) (increase(supervisor_restarts_total[15m])) > 3
         for: 1m
         labels:
           severity: warning
         annotations:
           summary: "后台 worker 频繁重启 ({{ $labels.worker }})"
-          describe: "15 分钟窗内重启 {{ $value }} 次（>3）；先看对应 worker 日志，网关进程若连带退出查看护日志。"
+          describe: "worker={{ $labels.worker }} 在 15 分钟窗内重启 >3 次；先看该 worker 日志。OPT-R6 V1 起 prober/sweep/prewarmer/telemetry 亦纳入监督，telemetry 为有尽监督（崩溃记一次后停止，不自愈）。"
 
       # 网关抓取失联（内置 up 序列，无需额外指标）。
       - alert: GatewayDown
@@ -55,13 +132,73 @@ groups:
           summary: "网关 /metrics 抓取失联超 2 分钟"
           describe: "先看网关进程与看护日志 log/ipp-watchdog.out，再查 :9091 本机直访。"
 
-      # ---- OPT-R4 C11：已接线（redis_exporter profile-gated，见 compose）。
-      # key 名以网关 telemetry stream 为准（`stream:proxy:telemetry`，见 telemetry.rs）。
-      # exporter 未跑时序列缺失，规则静默（inactive），跑起即自动生效。
-      - alert: TelemetryStreamLagGrowing
-        expr: increase(redis_stream_length{key="stream:proxy:telemetry"}[10m]) > 0
+      # ---- 数据丢失（OPT-R7 B2 新增）----
+      # 遥测丢数：两个计数器此前常驻渲染、注释明写"便于 PromQL 告警"，但**零规则**。
+      # 遥测静默丢数意味着数仓缺行、SLA 套利基于残缺数据做决策，属静默失效。
+      - alert: TelemetryDropped
+        expr: increase(telemetry_dropped_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "遥测落库重试后仍丢弃 {{ $value | printf \"%.0f\" }} 条"
+          describe: "flush 写 Redis Stream 失败且重试一次仍失败（15 分钟窗）；查 Redis 可用性与 `supervisor_restarts_total{worker=\"telemetry\"}`。"
+
+      - alert: TelemetryChannelDropped
+        expr: increase(telemetry_channel_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "遥测通道满/关闭丢弃 {{ $value | printf \"%.0f\" }} 条"
+          describe: "mpsc 通道打满（TELEMETRY_CHANNEL_CAP）导致 `try_send` 失败；数据面吞吐超过后台 flush 能力，调大通道容量或排查下游阻塞。"
+
+      # SOCKS 桥出站失败：此前渲染但零规则。
+      - alert: SocksBridgeErrorRateHigh
+        expr: |
+          sum(rate(socks_bridge_errors_total[10m]))
+          /
+          clamp_min(sum(rate(proxy_requests_total[10m])), 0.001)
+          > 0.1
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "遥测 Stream 积压持续增长"
+          summary: "SOCKS 桥出站失败率 > 10%"
+          describe: "显式 socks 请求的桥接出站失败占比 {{ $value | humanizePercentage }}；查 SOCKS 节点存活（`free_pool_nodes_by_proto{proto=~\"socks4|socks5\"}`）与桥超时配置。"
+
+      # ---- 隔离水位（OPT-R7 B2 新增）----
+      # 隔离表无界增长是 OPT-R6 S2（P0）修复前的真实故障模式：sweep 循环死亡
+      # 会话/隔离表无界增长至 OOM。OPT-R6 已修根因（饱和减法 + supervisor），
+      # 此规则作**回归哨兵**：水位异常升高说明淘汰链路再次失效。
+      - alert: QuarantineNodesHigh
+        expr: quarantine_nodes > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "隔离条目水位 {{ $value | printf \"%.0f\" }} 偏高"
+          describe: "隔离表（domain:ip 组合）持续偏高，说明大量出口被熔断或淘汰链路失效（OPT-R6 S2 修复目标）；查 CB 消费组 `circuit_breaker_group` 的 pending 与 403 比例。"
+
+      # ---- 遥测 Stream 积压（OPT-R7 B1 修）----
+      # 已接线（redis_exporter profile-gated，见 compose）。
+      # key 名以网关 telemetry stream 为准（`stream:proxy:telemetry`，见 telemetry.rs）。
+      # exporter 未跑时序列缺失，规则静默（inactive），跑起即自动生效。
+      #
+      # OPT-R7 B1 修两处：
+      #   ① `redis_stream_length` 是 **gauge**（当前长度），不是 counter ——
+      #      `increase()` 语义上只适用于 counter，对 gauge 求增量是无效的，
+      #      改用 `delta()`（gauge 的正确算子）。
+      #   ② 阈值从 `> 0` 改为绝对长度 > 1000 —— 原式「有过增长」在系统
+      #      **完全健康**时也恒真（正常遥测流量本就在增长 stream），导致永久 firing。
+      #      现判「积压确实很大且持续存在」：消费组正常时 stream 会被 XACK 修剪，
+      #      稳态长度接近消费速率；持续 >1000 说明消费侧（ch_sink）跟不上。
+      - alert: TelemetryStreamBacklogHigh
+        expr: |
+          max_over_time(redis_stream_length{key="stream:proxy:telemetry"}[10m]) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "遥测 Stream 积压持续 > 1000 条"
+          describe: "stream 长度 10 分钟内持续超 1000（消费组 ch_sink_group 跟不上）；查 ClickHouse insert 延迟与 `supervisor_restarts_total{worker=\"ch_sink\"}`。注：MAXLEN~100000 修剪策略下健康稳态长度应远低于此值。"

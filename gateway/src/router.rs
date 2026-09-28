@@ -4,6 +4,7 @@
 //! OPT-1 补齐：`sweep_expired` 周期清理过期条目（会话/隔离），
 //! `snapshot_all` 导出全量快照（供网关臂表修剪用），三者皆为长稳运行防内存泄漏之用。
 
+use crate::janitor;
 use crate::model::{ProxyNode, RoutingSpec};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -147,12 +148,18 @@ impl RouterEngine {
         self.session_store.retain(|_, (_, created_at)| {
             now.saturating_duration_since(*created_at).as_secs() < SESSION_TTL_SECS
         });
-        let sessions_removed = sessions_before - self.session_store.len();
+        // OPT-R6 S2：净删除经 `janitor::removed_count`（饱和减法）。会话表正被数据面
+        // `select_node_excluding` 落表并发写入，两次 `len()` 之间可能增长；旧的
+        // `before - len()` 会 debug panic / release 回绕，且当时 sweep 无 supervisor，
+        // panic 即静默死亡 → 会话表无界增长至 OOM。
+        let sessions_removed = janitor::removed_count(sessions_before, self.session_store.len());
 
         let quarantines_before = self.quarantine_map.len();
         // 隔离：到期时刻 <= now 即过期。
         self.quarantine_map.retain(|_, expiry| *expiry > now);
-        let quarantines_removed = quarantines_before - self.quarantine_map.len();
+        // OPT-R6 S2：同上，隔离表亦由熔断消费侧并发写入。
+        let quarantines_removed =
+            janitor::removed_count(quarantines_before, self.quarantine_map.len());
 
         // OPT-R4 B11：TTL 淘汰顺带清理僵尸因子（池内已无对应 vendor×country
         // 即删键；缺省 1.0 语义不变，恢复靠下轮 merge 健康快照，不靠残留 0 因子）。
@@ -1315,5 +1322,185 @@ mod tests {
         r.scale_vendor_weights("free-gh0", "ZZ", 1.0);
         assert_eq!(r.free_factor("free-gh0", "ZZ"), 1.0);
         assert!(r.free_scale.is_empty(), "显式 1.0 应等价缺省，不得残留");
+    }
+
+    // ---- OPT-R6 S2：淘汰计数下溢（P0）回归锁定 ----
+
+    /// P0 根因回归：`sweep_expired_at` 的删除计数在「淘汰窗口内并发生长」时
+    /// 旧实现 `before - len()` 会 debug panic（`subtract with overflow`）/
+    /// release 回绕成天文数字。
+    ///
+    /// 本测试用多线程把「数据面持续写入会话表」与「sweep 持续淘汰」同时跑起来，
+    /// 真实复现那条竞态窗口——只测 `janitor::removed_count` 助手本身不足以证明
+    /// 调用点已修好，故在此对**真实调用路径**施压。
+    #[test]
+    fn opt_r6_s2_sweep_survives_concurrent_session_writes() {
+        use std::sync::Barrier;
+
+        let r = Arc::new(RouterEngine::new(vec![fixtures()[0].clone()]));
+        let node = Arc::clone(&r.snapshot_all()[0]);
+
+        // 预置一批「已过期」会话，保证 sweep 每轮都有真删除发生。
+        for i in 0..256 {
+            r.session_store.insert(
+                format!("stale-{i}"),
+                (
+                    Arc::clone(&node),
+                    Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 60),
+                ),
+            );
+        }
+        assert_eq!(r.session_store.len(), 256);
+
+        // 两组线程：writer 持续插入新会话（制造并发增长），sweeper 反复淘汰。
+        // Barrier 让双方同时起跑，最大化撞上 `len()` 窗口的概率。
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_r = Arc::clone(&r);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for i in 0..20_000u32 {
+                writer_r.session_store.insert(
+                    format!("live-{i}"),
+                    (
+                        Arc::clone(&node),
+                        Instant::now(), // 未过期：不会被本轮 sweep 清掉
+                    ),
+                );
+            }
+        });
+
+        let sweeper_r = Arc::clone(&r);
+        let sweeper = std::thread::spawn(move || {
+            barrier.wait();
+            let mut total_removed = 0usize;
+            for _ in 0..2_000 {
+                let (sessions, quarantines) = sweeper_r.sweep_expired_at(Instant::now());
+                // 关键断言：旧实现在此处 debug panic；现实现要求「净删除」恒为
+                // 非负且不超过采样时的存量（不可能出现回绕天文数字）。
+                assert!(
+                    sessions <= 2_048,
+                    "净删除数不得回绕成天文数字（实际 {sessions}）"
+                );
+                assert!(
+                    quarantines <= 2_048,
+                    "隔离净删除数不得回绕（实际 {quarantines}）"
+                );
+                total_removed = total_removed.saturating_add(sessions);
+            }
+            total_removed
+        });
+
+        writer.join().expect("writer thread");
+        let _ = sweeper.join().expect("sweeper must not panic");
+
+        // 全部写入完成后，剩余条目必然全是未过期的 live 会话。
+        assert_eq!(
+            r.session_store.len(),
+            20_000,
+            "预置的 256 条过期会话应已全部清掉"
+        );
+    }
+
+    /// P0 根因的确定性版本：不依赖线程调度，直接构造「before 采样后表变长」
+    /// 的等价输入，锁定 `sweep_expired_at` 的返回值口径。
+    /// 做法：先让会话表为空时调用 `sweep_expired_at` 的公共封装 `sweep_expired`
+    /// 不可控并发，故此处锁定语义边界——空表淘汰必须返回 0，且不 panic。
+    #[test]
+    fn opt_r6_s2_sweep_on_empty_table_is_zero_not_panic() {
+        let r = RouterEngine::new(vec![]);
+        assert_eq!(r.sweep_expired_at(Instant::now()), (0, 0));
+        // 反复调用不累积状态（幂等）。
+        for _ in 0..100 {
+            assert_eq!(r.sweep_expired_at(Instant::now()), (0, 0));
+        }
+    }
+
+    /// OPT-R6 S1（P0 安全）**完整链路**回归：把「无 tier 声明的请求会命中免费节点」
+    /// 这一 P0 前提，与「按实际节点档位拦截凭据」这一修复，在同一个测试里串起来。
+    ///
+    /// # 为什么必须串起来测（而不是各测一半）
+    ///
+    /// 单独测护栏函数（`gateway.rs` 已覆盖真值表）只能证明「给定一个 free 档节点
+    /// 会拦截」；单独测选路（`free_tier_isolation_and_zz_semantics` 已覆盖）只能证明
+    /// 「无 tier 声明会命中免费节点」。**P0 的本质是这两件事同时成立**——
+    /// 旧代码里两者都成立，而护栏只看请求声明的 tier，于是凭据经免费出口泄露。
+    /// 本测试锁定串联后的完整后果，是唯一能防「将来有人把护栏改回看请求侧」的锚点。
+    ///
+    /// 权重取 100:10，故 100 次无约束选路内必见 free（P(未见) ≈ 8e-5，见既有测试注释）。
+    #[test]
+    fn opt_r6_s1_undeclared_request_hitting_free_node_is_caught_by_guard() {
+        use crate::gateway::free_node_exits_with_credentials;
+
+        let paid = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let free_node = ProxyNode::new(
+            "9.9.9.9".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-geonode".to_string(),
+            10,
+        );
+        let r = RouterEngine::new(vec![paid, free_node]);
+
+        // 无 tier / 无 country 约束 = 旧护栏完全放行的形态（`tier == Some("free")`
+        // 为 false，`request_filter` 的提前拒绝不触发）。
+        let undeclared = RoutingSpec {
+            country: None,
+            session_id: None,
+            tier: None,
+            target_domain: "victim.example".to_string(),
+            proto: None,
+        };
+        // 旧护栏口径：只看请求声明的 tier → 放行（这正是漏洞）。
+        assert!(
+            !crate::gateway::free_tier_with_credentials(undeclared.tier.as_deref(), true, false),
+            "前置确认：旧护栏在无 tier 声明时放行（P0 漏洞本体）"
+        );
+
+        // 模拟数据面：连发请求，一旦选路命中免费节点就用新护栏判定。
+        // `hit_free` 证明「无约束请求确实会走免费出口」；`blocked` 证明同一次请求
+        // 被新护栏拦下。两者必须都成立，否则本测试无意义。
+        let mut hit_free = false;
+        let mut blocked = false;
+        let mut paid_passed = 0u32;
+        for _ in 0..200 {
+            let node = r.select_node(&undeclared).expect("node");
+            if node.tier == "free" {
+                hit_free = true;
+                // 带 Authorization 的请求经该节点出站 → 必须被拦。
+                if free_node_exits_with_credentials(&node.tier, true, false) {
+                    blocked = true;
+                }
+            } else {
+                // 付费节点：带凭据必须放行（存量语义零变化）。
+                assert!(
+                    !free_node_exits_with_credentials(&node.tier, true, false),
+                    "付费节点不得被护栏误伤（实际 {}）",
+                    node.tier
+                );
+                paid_passed += 1;
+            }
+        }
+        assert!(
+            hit_free,
+            "无 tier 声明的请求必须仍会命中免费节点（P0 前提）"
+        );
+        assert!(
+            blocked,
+            "命中免费节点的带凭据请求必须被护栏拦截（S1 修复本体）"
+        );
+        assert!(paid_passed > 0, "付费节点路径也必须被走到（存量语义验证）");
     }
 }

@@ -9,10 +9,15 @@
 /gateway/target/
 **/*.rs.bk
 
-# --- 运行输出（log/ 下 .py 脚本是正式工具需提交；进程 .out/.err/.log 不提交） ---
+# --- 运行输出（log/ 下 .py 脚本是正式工具需提交；进程输出不提交） ---
+# OPT-R7 D2 注记：此前只忽略 .out/.err/.log，但 `log/launch_detached.py` 与
+# `tools/ipp.ps1` 的 mock/看护启动器会写 `log/mock-out-<port>.txt` 这类
+# **.txt** 输出（见 EXEC_LOG 步骤 32：起 mock 时污染了 6 个未跟踪文件）。
+# 故补 `log/*.txt`——log/ 下唯一该入库的文本是 .py/.ps1 等工具本体，不受影响。
 log/*.out
 log/*.err
 log/*.log
+log/*.txt
 *.log
 
 # --- Python ---

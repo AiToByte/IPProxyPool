@@ -1,6 +1,16 @@
 # IPProxyPool live tests (Phase C5): manual only, needs real deps.
-# Runs the `-- --ignored` integration tests (Redis + ClickHouse online,
-# asserts PONG/Ok first, fails on any SKIP line per project convention).
+# Runs the `-- --ignored` integration tests (Redis + ClickHouse online).
+#
+# OPT-R6 S3（P0 门禁修复）：本 workflow 此前**结构性不可能通过**，且 SKIP 门未实现。
+#   ① ClickHouse service 未挂 `deploy/clickhouse/001_schema.sql`，而全仓 Rust 源码
+#      无任何 `CREATE TABLE`（表只由 compose 的 `docker-entrypoint-initdb.d` 创建）
+#      ⇒ `ch_sink.rs` 的 `assert_eq!(landed, 1)` 与 `analytics.rs` 的 insert 必失败。
+#      修复：挂载 schema 到 CH 的 initdb 目录。
+#   ② 文件头宣称「fails on any SKIP line」，但步骤里**无任何断言**；而 4 个文件共
+#      10 处 `eprintln!("SKIP ..."); return;` ⇒ 依赖全挂也报绿。
+#      修复：测试输出 tee 到文件，随后 grep `^SKIP` 命中即非零退出。
+#   ③ ClickHouse service 无 healthcheck（redis 有），CH 就绪通常需 10~20s，
+#      测试立即开跑 ⇒ 天然 flaky。修复：补 healthcheck。
 name: live
 
 on:
@@ -9,6 +19,7 @@ on:
 jobs:
   live:
     runs-on: ubuntu-latest
+    # 依赖真实 CH，冷编译较慢；不设 timeout 以免误杀（门禁失败会自然红）。
     services:
       redis:
         image: redis:7-alpine
@@ -26,11 +37,66 @@ jobs:
           CLICKHOUSE_USER: proxy
           CLICKHOUSE_PASSWORD: "123456"
           CLICKHOUSE_DB: proxy
+        # OPT-R6 S3：挂载 schema 到 initdb 目录——这是 `assert_eq!(landed, 1)`
+        # 能成立的前提（与 `docker-compose.yml` 的 clickhouse-data 挂载同源）。
+        # 另补 healthcheck：CH 冷启动需 10~20s，无探针则测试必在表建好前开跑。
+        # OPT-R8 A5：口令经 `CLICKHOUSE_PASSWORD` 容器环境变量传入，不进 argv
+        # （`--health-cmd` 的字面量会出现在 `docker inspect` 与进程命令行里）。
+        options: >-
+          --health-cmd "clickhouse-client --user proxy --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"
+          --health-interval 5s
+          --health-retries 20
+          --health-start-period 10s
+        volumes:
+          - ${{ github.workspace }}/deploy/clickhouse/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
     defaults:
       run:
         working-directory: gateway
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: live integration tests (no SKIP allowed)
-        run: cargo test --workspace -- --ignored --nocapture
+      - name: verify dependencies reachable (no SKIP allowed)
+        # 依赖可达性前置断言：PONG/Ok 拿不到就直接红，不进入 cargo test。
+        # （测试体内的 SKIP 门在下一步，这里是更早的一道、更易诊断。）
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG; then break; fi
+            [ "$i" = 30 ] && { echo "SKIP-PRECHECK redis never became ready"; exit 1; }
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if curl -sf -u 'proxy:123456' 'http://127.0.0.1:8123/?query=SELECT%201' | grep -q '^1$'; then break; fi
+            [ "$i" = 30 ] && { echo "SKIP-PRECHECK clickhouse never became ready"; exit 1; }
+            sleep 2
+          done
+          # 表必须存在：schema 挂载失败会在这里被抓住，而不是让 cargo test 报一个
+          # 语义不明的 assert 失败。
+          curl -sf -u 'proxy:123456' \
+            'http://127.0.0.1:8123/?query=EXISTS%20TABLE%20proxy.proxy_telemetry_log' | grep -qx '1' \
+            || { echo "SKIP-PRECHECK table proxy.proxy_telemetry_log missing (schema not applied)"; exit 1; }
+          echo "deps ready"
+      - name: live integration tests
+        # `tee` 保留完整输出（供 SKIP 门 grep，同时失败时 artifact 可查）。
+        # `pipefail` 保证 cargo test 自身的非零退出不被 tee 吞掉。
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --ignored --nocapture 2>&1 | tee live-output.txt
+      - name: SKIP gate (any SKIP line fails the run)
+        # OPT-R6 S3：把「no SKIP allowed」从注释变成真正的门。
+        # 依赖不可达时测试体内会 `eprintln!("SKIP ..."); return;` 静默通过，
+        # 没有这道门则「Redis/CH 全挂」= 绿灯。锚定行首 `SKIP` 以免误伤
+        # 正常测试输出里恰好含该单词的行；`SKIP-PRECHECK` 已在上一道门拦截。
+        run: |
+          if grep -qE '^SKIP' live-output.txt; then
+            echo "::error::live tests reported SKIP (dependency unreachable) — run is NOT a valid pass"
+            grep -nE '^SKIP' live-output.txt
+            exit 1
+          fi
+          echo "no SKIP lines — all live tests really executed"
+      - name: upload live output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-output
+          path: gateway/live-output.txt

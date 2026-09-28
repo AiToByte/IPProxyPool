@@ -11,7 +11,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Histogram upper bounds in ms (`+Inf` is implicit as `_count`).
-pub const DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500];
+///
+/// OPT-R7 D2：尾部桶扩展到与 `observe` 的 60s 截断（`duration.as_millis().min(60_000)`）
+/// 对齐。此前桶顶仅 2500ms，而网关 peer 超时预算是 1500/5000/3000ms
+/// （`gateway.rs` 的 `build_http_peer`），叠加重试（失败集上限 16）后单请求耗时
+/// **经常超过 2500ms**——>2500ms 的观测全部落进 `+Inf`，各 `le` 桶不动。
+///
+/// 后果是 `histogram_quantile(0.99, ...)` 在 >1% 样本超 2500ms 时，会在
+/// `le=2500` 与 `+Inf` 之间外推，返回无意义值甚至 `+Inf`——**慢的时候 P99 反而
+/// 显示得好看**，是最坏的失败方向（面板掩盖劣化而非暴露劣化）。
+///
+/// 扩展后 P99 在 5s~30s 区段仍有真实桶可落，无需外推。
+///
+/// **下界一律不移动**（仍从 1ms 起）：Prometheus 直方图的桶下界语义是「该桶覆盖
+/// [prev_le, le]」，移动下界会让存量已累积的直方图在换版后语义漂移
+/// （旧序列的历史数据不可比）。只加尾部桶是向后兼容的加法。
+pub const DURATION_BUCKETS_MS: [u64; 14] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000,
+];
 /// Metrics HTTP endpoint (matches the Prometheus scrape target).
 pub const METRICS_ADDR: &str = "127.0.0.1:9091";
 /// R2-8 `/metrics` 并发上限（零新依赖：超限即关连接；Prom 抓取低频，64 绰绰有余）。
@@ -809,10 +826,14 @@ mod tests {
     fn histogram_buckets_render_monotonic() {
         // R2-6：混合延迟 + 超界值下渲染桶恒单调（单原子写 + 前缀累加的直接收益）；
         // 超最大桶只进 +Inf/count，不污染各 le 行。
+        // OPT-R7 D2：桶数由 10 扩到 14，原断言里的 `9999`（当时超界）现落在
+        // `le=10000` 桶内，故「超界」样本改用 `60001`（>60s 截断上界）。
         let m = MetricsRegistry::new();
         for ms in [0, 1, 3, 30, 1200, 2500, 9999, 30, 3] {
             m.observe(200, None, 0, Duration::from_millis(ms));
         }
+        // 追加一条超 60s 截断的样本：只进 count/+Inf，各 le 桶不动。
+        m.observe(200, None, 0, Duration::from_millis(600_000));
         let text = m.render();
         let mut last = 0u64;
         let mut seen = 0usize;
@@ -827,9 +848,123 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, DURATION_BUCKETS_MS.len() + 1, "10 le + Inf");
-        assert!(text.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 9"));
-        assert!(text.contains("gateway_processing_duration_ms_count 9"));
+        assert_eq!(seen, DURATION_BUCKETS_MS.len() + 1, "14 le + Inf");
+        assert!(text.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 10"));
+        assert!(text.contains("gateway_processing_duration_ms_count 10"));
+    }
+
+    /// OPT-R7 D2 专项：桶边界语义。扩桶是为了让慢时段 P99 落在**真实桶**内，
+    /// 因此必须逐个边界验证「样本落在正确的桶」，否则扩桶本身可能引入错位。
+    #[test]
+    fn opt_r7_d2_bucket_boundaries_place_samples_correctly() {
+        // 桶下界必须严格单调递增且不移动（Prometheus 直方图桶下界语义：
+        // 第 i 个桶覆盖 (prev_le, le]；移动下界会让存量直方图历史数据不可比）。
+        assert!(
+            DURATION_BUCKETS_MS.windows(2).all(|w| w[0] < w[1]),
+            "桶边界必须严格递增：{:?}",
+            DURATION_BUCKETS_MS
+        );
+        // 前 10 个桶（下界）与扩桶前完全一致——扩桶是**只加尾部**的向后兼容加法。
+        assert_eq!(
+            &DURATION_BUCKETS_MS[..10],
+            &[1u64, 5, 10, 25, 50, 100, 250, 500, 1000, 2500],
+            "既有下界不得移动，否则存量直方图语义漂移"
+        );
+        // 尾部桶与 `observe` 的 60s 截断对齐：最大桶恰为 60_000。
+        assert_eq!(
+            DURATION_BUCKETS_MS[DURATION_BUCKETS_MS.len() - 1],
+            60_000,
+            "最大桶必须与 observe() 的 60s 截断一致"
+        );
+
+        // 逐边界验证：恰好等于桶界的样本落进该桶（`<=` 语义），渲染值正确。
+        for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
+            let m = MetricsRegistry::new();
+            m.observe(200, None, 0, Duration::from_millis(*bound));
+            let text = m.render();
+            // 该样本必须出现在 le=bound 这一行（累积值 1）。
+            let needle = format!("gateway_processing_duration_ms_bucket{{le=\"{bound}\"}} 1");
+            assert!(
+                text.contains(&needle),
+                "le={bound} 应累计到 1，实际渲染缺该行"
+            );
+            // 且不落到更小的桶上：更大 le 的行也都是 1（累积），更小 le 的行应为 0。
+            for smaller in &DURATION_BUCKETS_MS[..i] {
+                let line = format!("gateway_processing_duration_ms_bucket{{le=\"{smaller}\"}} 0");
+                assert!(
+                    text.contains(&line),
+                    "le={smaller} 不应累计（样本 {bound} 属 le={bound} 桶）"
+                );
+            }
+        }
+    }
+
+    /// OPT-R7 D2 专项：慢时段 P99 不再外推。
+    /// 此前桶顶 2500ms，而超时预算就有 5000/3000ms——>2500ms 全落 `+Inf`，
+    /// `histogram_quantile` 只能外推。现桶覆盖到 60s，慢样本有真实桶可落。
+    #[test]
+    fn opt_r7_d2_slow_samples_land_in_real_buckets_not_inf() {
+        // 3000ms 属 peer 超时预算内的慢请求：必须落在 le=5000 桶，不能是 +Inf。
+        let m = MetricsRegistry::new();
+        m.observe(200, None, 0, Duration::from_millis(3_000));
+        let text = m.render();
+        assert!(
+            text.contains("gateway_processing_duration_ms_bucket{le=\"2500\"} 0"),
+            "3000ms 不应计入 le=2500（>2500）"
+        );
+        assert!(
+            text.contains("gateway_processing_duration_ms_bucket{le=\"5000\"} 1"),
+            "3000ms 必须计入 le=5000 真实桶"
+        );
+        // `+Inf` 行是**累积**值，等于 `_count`（Prometheus 直方图语义），
+        // 样本落在 le=5000 时它必然也是 1——这不是「只进了 +Inf」。
+        // 真正要验证的是：样本在**最大桶之前**就落进了真实桶（上面的 le=5000）。
+        assert!(
+            text.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 1"),
+            "+Inf 为累积值，应等于 count"
+        );
+        assert!(
+            text.contains("gateway_processing_duration_ms_count 1"),
+            "count 应为 1"
+        );
+
+        // 20s 级慢样本：落在 le=30000 真实桶，不需外推。
+        let m2 = MetricsRegistry::new();
+        m2.observe(200, None, 0, Duration::from_millis(20_000));
+        let t2 = m2.render();
+        assert!(
+            t2.contains("gateway_processing_duration_ms_bucket{le=\"30000\"} 1"),
+            "20s 必须计入 le=30000 真实桶"
+        );
+        // +Inf 是累积值（== count），非「未落桶」指示器。
+        assert!(
+            t2.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 1"),
+            "+Inf 为累积值，应等于 count"
+        );
+
+        // 超过 60s 截断的样本：既有口径为「截断到 60000 再入桶」，故 90s 截断后
+        // 等于 60000，恰好命中 le=60000 桶（`<=` 边界语义）——不改此口径，
+        // 只锁定它，避免将来误改截断值导致 sum 与桶不自洽。
+        let m3 = MetricsRegistry::new();
+        m3.observe(200, None, 0, Duration::from_millis(90_000));
+        let t3 = m3.render();
+        assert!(
+            t3.contains("gateway_processing_duration_ms_bucket{le=\"60000\"} 1"),
+            "90s 经 60s 截断后应命中 le=60000 桶"
+        );
+        assert!(
+            t3.contains("gateway_processing_duration_ms_bucket{le=\"+Inf\"} 1"),
+            "+Inf 为累积值，应等于 count"
+        );
+        assert!(
+            t3.contains("gateway_processing_duration_ms_count 1"),
+            "截断样本仍须计入 count"
+        );
+        // sum 记的是截断值而非原始 90000（既有 OPT-R4 A4 语义，锁定不回归）。
+        assert!(
+            t3.contains("gateway_processing_duration_ms_sum 60000"),
+            "sum 须记截断值 60000，而非原始 90000"
+        );
     }
 
     #[test]

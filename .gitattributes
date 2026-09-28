@@ -1,2 +1,40 @@
-# 统一换行符：入库 LF，检出按平台处理，消灭 LF/CRLF 抖动。
+# 统一换行符：入库 LF，检出按平台处理，消 LF/CRLF 抖动。
 * text=auto
+
+# 二进制资产：不做任何文本转换。
+*.mmdb binary
+*.db binary
+*.pcap binary
+
+# ---------------------------------------------------------------------------
+# OPT-R7 D1：PowerShell 脚本的 UTF-8 BOM —— 记录一次**无法用 git 配置解决**的实测
+# ---------------------------------------------------------------------------
+# 目标：让 `tools/*.ps1` 的 UTF-8 BOM 随提交入库，避免 clone 后 PS 5.1 解析中文注释
+# 出错（事故背景见 `docs/FREE_BASELINE.md`、`docs/SYSTEM-ARCHITECTURE.md`）。
+#
+# 实测结论（git 2.52，Windows，core.autocrlf=true）：**git 无论如何配置都会剥离
+# UTF-8 BOM**。逐一验证过的组合与结果：
+#
+#   ① `*.ps1 text eol=crlf`                        → blob 首 3 字节 3C 23 52（BOM 丢）
+#   ② `*.ps1 -text` + `*.ps1 binary`               → 同上（BOM 丢）
+#   ③ `*.ps1 text eol=crlf working-tree-encoding=UTF-8` → 同上（BOM 丢）
+#   ④ `core.autocrlf=false` + `-text`              → 同上（BOM 丢）
+#   ⑤ `git hash-object -w --no-filters`            → 同上（BOM 丢）
+#
+# 即 BOM 剥离是 git 的**内建行为**（UTF-8 BOM 探测），不由任何 attribute 控制。
+# **注：** 早先在本文件里写的 `working-tree-encoding` 方案是「读文档想当然」的产物
+# —— 实测后已移除，避免后人照抄一个无效配置还以为已修好。
+#
+# 现行处置（两道防线，见 OPT-R7 计划 D1）：
+#   1. **CI 断言**：`.github/workflows/ci.yml` 的 static-checks job 校验
+#      `tools/*.ps1` 的**工作区副本**带 BOM（clone 后立即能发现缺失并提示
+#      `Set-Content -Encoding UTF8` 重新保存）。断言逻辑在 `tools/check_ps1_bom.py`。
+#   2. **文档约定**：`CONTRIBUTING.md` 与 `docs/USER-MANUAL.md` 记录「.ps1 一律
+#      UTF-8＋BOM」规范；编辑这些文件时 IDE 需选 "UTF-8 with BOM"。
+#
+# 根本解法（**未采纳**，如需请另立提案）：把 .ps1 的中文注释改为 ASCII 英文，
+# 从根上摆脱对 BOM 的依赖；或改用 PowerShell 7（默认读 UTF-8）作为唯一执行环境。
+# 前者与仓库既有的中文注释风格冲突，后者抬高运行环境门槛，故本轮均未采用。
+#
+# `.ps1` 检出侧固定 CRLF（与 Windows PowerShell 5.1 预期一致）：
+*.ps1 eol=crlf

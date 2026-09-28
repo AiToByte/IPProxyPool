@@ -33,10 +33,25 @@ services:
       CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-123456}"
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-proxy}
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      # OPT-R7 C1：探针从 `wget --spider` 改为 `clickhouse-client --query "SELECT 1"`。
+      #
+      # 根因（此前是 P1 阻断项）：项目文档自承该 wget 探针不可靠
+      # （见 docs/USER_MANUAL.md「CH 容器 unhealthy？」条、docs/HANDS-ON.md），
+      # 而本机 `docker ps` 长期显示 `ipproxy-clickhouse (unhealthy)`。
+      # 由于 gateway 服务 `depends_on: clickhouse: condition: service_healthy`，
+      # 该探针失败 ⇒ **`docker compose --profile gateway up` 下网关永不启动**。
+      #
+      # `clickhouse-client` 在本镜像内已随服务端安装，用它做真实 SQL 往返探针，
+      # 顺带验证账号密码（比 wget 只探端口更严）。凭据取环境变量，不硬编码。
+      test:
+        - CMD-SHELL
+        - clickhouse-client --user "$${CLICKHOUSE_USER:-proxy}" --password "$${CLICKHOUSE_PASSWORD:-123456}" --query "SELECT 1" || exit 1
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 20
+      # OPT-R7 C1：CH 冷启动需 10~20s，建表/加载元数据更久；start_period 内
+      # 探针失败不计入 retries，避免启动期被误判 unhealthy。
+      start_period: 20s
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -48,7 +63,15 @@ services:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       # C3 告警规则（rules 原生能力，无需额外 feature flag）。
       - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
-      # OPT-R4 C9：Alertmanager 接线（文件已备；取消注释＋重载 prom 即投递）。
+      # OPT-R7 C2：补 TSDB 持久化卷。此前 prometheus 只挂了两个只读配置文件，
+      # 数据全在容器可写层 ⇒ **`docker compose up -d` 的任何一次 recreate/down-up
+      # 都会清空全部历史指标**。直方图（gateway_processing_duration_ms_bucket、
+      # free_pool_fwd_latency_ms_bucket）恰恰需要跨重启累计才能算 P99/均值——
+      # 这是一个「以为有 observability，实际每次重启归零」的静默失效。
+      - prometheus-data:/prometheus
+      # OPT-R4 C9：Alertmanager 接线（文件已备；取消注释＋**重启** prom 即投递）。
+      # 注：Prometheus 默认禁用 `/-/reload`（需启动参数 --web.enable-lifecycle），
+      # 故改规则/接线后**必须 restart prom 容器**，单纯 reload 无效。
       # - ./deploy/alertmanager.yml:/etc/prometheus/alertmanager.yml:ro
 
   grafana:
@@ -179,3 +202,5 @@ volumes:
   clickhouse-data:
   grafana-data:
   alertmanager-data:
+  # OPT-R7 C2：Prometheus TSDB 持久化（此前缺失 ⇒ 每次 recreate 指标归零）。
+  prometheus-data:

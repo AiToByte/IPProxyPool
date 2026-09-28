@@ -16,6 +16,7 @@ mod fingerprint;
 mod free_pool;
 mod gateway;
 mod geo;
+mod janitor;
 mod metrics;
 mod model;
 mod pool;
@@ -313,9 +314,23 @@ async fn setup_gateway() -> Server {
     // R2-8：预热间隔 env 化（`PREWARM_INTERVAL_SECS`，默认 30s）。
     let bandit_engine = Arc::new(LinUCBEngine::new(DEFAULT_ALPHA));
     let bandit_arms = Arc::new(DashMap::new());
-    let prewarmer = ConnectionPrewarmer::new(router.clone())
-        .with_interval(env_secs("PREWARM_INTERVAL_SECS", 30));
-    tokio::spawn(prewarmer.run());
+    // OPT-R6 V1：prewarmer 此前是裸 spawn——panic 会让预热循环静默死亡，
+    // 节点首包延迟回升（无即时指标暴露）。包进 supervise。
+    // `ConnectionPrewarmer::run(self)` 消耗 self，故每次重启需重建实例——
+    // router 是 `Arc` clone 零成本，预热器本身无状态，重建无副作用。
+    let prewarm_router = router.clone();
+    let prewarm_interval = env_secs("PREWARM_INTERVAL_SECS", 30);
+    let prewarm_metrics = metrics.clone();
+    tokio::spawn(supervise_until(
+        "prewarmer",
+        prewarm_metrics,
+        move || {
+            let prewarmer = ConnectionPrewarmer::new(Arc::clone(&prewarm_router))
+                .with_interval(prewarm_interval);
+            prewarmer.run()
+        },
+        shutdown_tx.subscribe(),
+    ));
 
     // 3c. P3 exit-IP 画像库（R3-4：装配＋状态日志移出 FREE 块，不开 FREE 也可见库状态，
     // 避免静默 misconfig；`with_geo` 仍只在 FREE 分支内 attach，行为不变）。
@@ -414,7 +429,33 @@ async fn setup_gateway() -> Server {
             STREAM_KEY.to_string(),
             telemetry_dropped.clone(),
         );
-        tokio::spawn(tele_worker.run());
+        // OPT-R6 V1：telemetry 此前是裸 spawn。**有意不复用 `supervise_until`**：
+        // `TelemetryWorker` 持有 `mpsc::Receiver`，它既非 `Clone` 又**一次性**——
+        // 崩溃后流已被消费/关闭，重建 worker 拿不到第二个 Receiver，重启无语义。
+        // 若强行套用 `supervise_until` 只会得到一个「记一次重启计数后反复
+        // 拿不到数据」的空转循环，反而更坏。
+        //
+        // 因此本处采用**有尽监督**：崩溃/退出时记一次
+        // `supervisor_restarts_total{worker="telemetry"}`（可观测、不静默），
+        // 然后就此停止，不假装能自愈。遥测丢弃另有
+        // `telemetry_dropped_total`/`telemetry_channel_dropped_total` 常驻计数，
+        // 数据丢失本身始终可观测。
+        //
+        // `run(self)` 返回 `()`（内部死循环），因此「正常退出」等价于「异常退出」；
+        // 真正的崩溃由 JoinHandle 捕获。
+        let tele_metrics = metrics.clone();
+        let tele_handle = tokio::spawn(tele_worker.run());
+        tokio::spawn(async move {
+            match tele_handle.await {
+                Ok(()) => log::error!(
+                    "[Telemetry] worker exited unexpectedly, not restarting (one-shot receiver)"
+                ),
+                Err(e) => log::error!(
+                    "[Telemetry] worker panicked ({e:?}), not restarting (one-shot receiver)"
+                ),
+            }
+            tele_metrics.note_supervisor_restart("telemetry");
+        });
 
         // Passive circuit breaker consumer (R2-8: supervisor 包重启计数 + backoff)。
         let cb_conn = conn.clone();
@@ -485,87 +526,114 @@ async fn setup_gateway() -> Server {
     // R2-8：探测间隔 env 化（`PROBE_INTERVAL_SECS`，默认 60s）。
     let probe_router = router.clone();
     let probe_interval = env_secs("PROBE_INTERVAL_SECS", 60);
+    // OPT-R6 V1：prober 此前是裸 spawn——panic（如节点字段意外导致 unwrap）会让
+    // 整个探测循环静默死亡且零指标，池健康度从此不可知。包进 supervise 后
+    // panic 退避重启并记 `supervisor_restarts_total{worker="prober"}`。
+    // Client 缓存与信号量**下沉进闭包内**：supervise 的 `make` 必须可重复调用，
+    // 若留在闭包外，重启会复用同一批 Client（Client 内部连接池可能已随断连
+    // 不可用，重启语义失真）。
+    let probe_metrics = metrics.clone();
+    // 订阅在 `async move` 块**外**取得：块内若用 `shutdown_tx.clone().subscribe()`，
+    // 闭包会连带捕获 `shutdown_tx` 本身，与后续 sweep/arbitrage 处的借用冲突
+    // （`shutdown_tx` 须保留到末尾 signal watcher 独占）。
+    let probe_stop_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         tokio::time::sleep(startup_jitter()).await;
         log::info!("[Prober] staggered start (R2-7 jitter)");
-        let prober = Arc::new(CanaryProber::new());
-        let semaphore = Arc::new(Semaphore::new(prober::PROBE_MAX_CONCURRENT));
-        let mut ticker = tokio::time::interval(probe_interval);
-        loop {
-            ticker.tick().await;
-            // 闲置 Client 随 60s 滴答淘汰（R2-7；账密 rotation 后明文 key 不常驻）。
-            let evicted = prober.evict_idle_clients();
-            if evicted > 0 {
-                log::info!("[Prober] evicted {evicted} idle clients");
-            }
-            // NEXT-A3：三路并取（默认 http＋显式 socks5/socks4，沿 pool.rs 预热口径；
-            // 默认隔离下 socks 对 default-spec 不可见，不并取即漏探 socks 节点存活）。
-            let mut candidates = probe_router.get_healthy_candidates(&RoutingSpec::default());
-            for proto in [
-                crate::model::EgressProto::Socks5,
-                crate::model::EgressProto::Socks4,
-            ] {
-                let spec = RoutingSpec {
-                    proto: Some(proto),
-                    ..Default::default()
-                };
-                candidates.extend(probe_router.get_healthy_candidates(&spec));
-            }
-            // OPT-5：复用 Client 池大小随滴答打 debug（稳定即无建链抖动）。
-            log::debug!(
-                "[Prober] tick start nodes={} clients={}",
-                candidates.len(),
-                prober.client_count()
-            );
-            let mut set = JoinSet::new();
-            for node in candidates {
-                let prober = prober.clone();
-                let sem = semaphore.clone();
-                set.spawn(async move {
-                    // A3：对齐 pool.rs:92 ——信号量关闭（acquire Err）直接跳过本次探测，
-                    // 记 Dead（既有 warn 口径），不执行 probe_node（关闭后不再全并发裸奔）。
-                    let _permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            log::debug!(
-                                "[Prober] semaphore closed, skipped probe for {}:{}",
-                                node.ip,
-                                node.port
-                            );
-                            return (node, skipped_probe_result());
+        supervise_until(
+            "prober",
+            probe_metrics,
+            move || {
+                let probe_router = probe_router.clone();
+                async move {
+                    let prober = Arc::new(CanaryProber::new());
+                    let semaphore = Arc::new(Semaphore::new(prober::PROBE_MAX_CONCURRENT));
+                    let mut ticker = tokio::time::interval(probe_interval);
+                    loop {
+                        ticker.tick().await;
+                        // 闲置 Client 随 60s 滴答淘汰（R2-7；账密 rotation 后明文 key 不常驻）。
+                        let evicted = prober.evict_idle_clients();
+                        if evicted > 0 {
+                            log::info!("[Prober] evicted {evicted} idle clients");
                         }
-                    };
-                    let result = prober.probe_node(&node).await;
-                    (node, result)
-                });
-            }
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok((
-                        node,
-                        prober::ProbeResult::Healthy {
-                            latency_ms,
-                            exit_ip,
-                        },
-                    )) => {
-                        log::info!(
-                            "[Prober] {}:{} healthy via {exit_ip} ({latency_ms}ms)",
-                            node.ip,
-                            node.port
+                        // NEXT-A3：三路并取（默认 http＋显式 socks5/socks4，沿 pool.rs 预热口径；
+                        // 默认隔离下 socks 对 default-spec 不可见，不并取即漏探 socks 节点存活）。
+                        let mut candidates =
+                            probe_router.get_healthy_candidates(&RoutingSpec::default());
+                        for proto in [
+                            crate::model::EgressProto::Socks5,
+                            crate::model::EgressProto::Socks4,
+                        ] {
+                            let spec = RoutingSpec {
+                                proto: Some(proto),
+                                ..Default::default()
+                            };
+                            candidates.extend(probe_router.get_healthy_candidates(&spec));
+                        }
+                        // OPT-5：复用 Client 池大小随滴答打 debug（稳定即无建链抖动）。
+                        log::debug!(
+                            "[Prober] tick start nodes={} clients={}",
+                            candidates.len(),
+                            prober.client_count()
                         );
-                    }
-                    Ok((node, prober::ProbeResult::Degraded { reason })) => {
-                        log::warn!("[Prober] {}:{} degraded: {reason}", node.ip, node.port);
-                    }
-                    Ok((node, prober::ProbeResult::Dead { error })) => {
-                        log::warn!("[Prober] {}:{} dead: {error}", node.ip, node.port);
-                    }
-                    Err(e) => {
-                        log::warn!("[Prober] probe task join failed: {e:?}");
+                        let mut set = JoinSet::new();
+                        for node in candidates {
+                            let prober = prober.clone();
+                            let sem = semaphore.clone();
+                            set.spawn(async move {
+                                // A3：对齐 pool.rs:92 ——信号量关闭（acquire Err）直接跳过本次探测，
+                                // 记 Dead（既有 warn 口径），不执行 probe_node（关闭后不再全并发裸奔）。
+                                let _permit = match sem.acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        log::debug!(
+                                            "[Prober] semaphore closed, skipped probe for {}:{}",
+                                            node.ip,
+                                            node.port
+                                        );
+                                        return (node, skipped_probe_result());
+                                    }
+                                };
+                                let result = prober.probe_node(&node).await;
+                                (node, result)
+                            });
+                        }
+                        while let Some(joined) = set.join_next().await {
+                            match joined {
+                                Ok((
+                                    node,
+                                    prober::ProbeResult::Healthy {
+                                        latency_ms,
+                                        exit_ip,
+                                    },
+                                )) => {
+                                    log::info!(
+                                        "[Prober] {}:{} healthy via {exit_ip} ({latency_ms}ms)",
+                                        node.ip,
+                                        node.port
+                                    );
+                                }
+                                Ok((node, prober::ProbeResult::Degraded { reason })) => {
+                                    log::warn!(
+                                        "[Prober] {}:{} degraded: {reason}",
+                                        node.ip,
+                                        node.port
+                                    );
+                                }
+                                Ok((node, prober::ProbeResult::Dead { error })) => {
+                                    log::warn!("[Prober] {}:{} dead: {error}", node.ip, node.port);
+                                }
+                                Err(e) => {
+                                    log::warn!("[Prober] probe task join failed: {e:?}");
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        }
+            },
+            probe_stop_rx,
+        )
+        .await;
     });
 
     // 4b. GW-4 vendor SLA arbitrage (lazy CH: query errors hold weights).
@@ -649,23 +717,49 @@ async fn setup_gateway() -> Server {
             .unwrap_or(10 * 1024 * 1024),
     ));
     let sweep_bridge = socks_bridge.clone();
+    // OPT-R6 V1：sweep 此前是裸 spawn——这正是 S2（P0）下溢缺陷的放大器：
+    // debug 下 `before - len()` 的 panic 会静默杀死整个淘汰循环（JoinHandle 被
+    // 丢弃、无日志、无指标），此后会话表/隔离表**无界增长直至 OOM**。
+    // S2 已用饱和减法消除 panic 根因，V1 再补监督兜底——两层防护：
+    // 即使将来引入新的 panic 源，淘汰循环也会退避重启而非永久死亡。
+    // supervise 的 `make` 是 `Fn`（非 `FnOnce`），故两份 `Arc` 各克隆一次：
+    // 一份交给 supervisor 记指标，一份被闭包捕获供每轮重建使用。
+    let sweep_supervisor_metrics = sweep_metrics.clone();
+    // 订阅在闭包外取得：`shutdown_tx` 本身要留给末尾的 signal watcher 独占，
+    // 不能被本闭包捕获（prober 用的是 `clone().subscribe()` 的同口径写法）。
+    let sweep_stop_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         tokio::time::sleep(startup_jitter()).await;
         log::info!("[Sweep] staggered start (R2-7 jitter)");
-        let mut ticker = tokio::time::interval(sweep_interval);
-        loop {
-            ticker.tick().await;
-            let (sessions, quarantines) = sweep_router.sweep_expired();
-            // NEXT-A4：隔离水位同步（过期清理后读 len，gauge 语义）。
-            sweep_metrics.set_quarantine_nodes(sweep_router.quarantine_len() as u64);
-            let arms = gateway::prune_stale_arms(&sweep_arms, &sweep_router);
-            let bridged = sweep_bridge.evict_idle();
-            if sessions + quarantines + arms + bridged > 0 {
-                log::info!(
-                    "[Sweep] cleared sessions={sessions} quarantines={quarantines} arms={arms} bridge={bridged}"
-                );
-            }
-        }
+        supervise_until(
+            "sweep",
+            sweep_supervisor_metrics,
+            move || {
+                let sweep_router = sweep_router.clone();
+                let sweep_arms = sweep_arms.clone();
+                let sweep_bridge = sweep_bridge.clone();
+                let sweep_metrics = sweep_metrics.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(sweep_interval);
+                    loop {
+                        ticker.tick().await;
+                        let (sessions, quarantines) = sweep_router.sweep_expired();
+                        // NEXT-A4：隔离水位同步（过期清理后读 len，gauge 语义）。
+                        sweep_metrics
+                            .set_quarantine_nodes(sweep_router.quarantine_len() as u64);
+                        let arms = gateway::prune_stale_arms(&sweep_arms, &sweep_router);
+                        let bridged = sweep_bridge.evict_idle();
+                        if sessions + quarantines + arms + bridged > 0 {
+                            log::info!(
+                                "[Sweep] cleared sessions={sessions} quarantines={quarantines} arms={arms} bridge={bridged}"
+                            );
+                        }
+                    }
+                }
+            },
+            sweep_stop_rx,
+        )
+        .await;
     });
 
     // OPT-R4 S5: signal watcher holds the only shutdown Sender alive.
@@ -884,6 +978,132 @@ mod tests {
             .expect("supervise task panicked");
         let n = runs.load(Ordering::Relaxed);
         // 停后不再拉：静置 1.5s（>首轮 backoff 1s）计数冻结。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(runs.load(Ordering::Relaxed), n, "no respawn after stop");
+    }
+
+    // ---- OPT-R6 V1：supervisor 覆盖补齐（P1）回归锁定 ----
+
+    /// V1 核心语义：包进 supervise 的后台循环**崩溃后会被重启**。
+    ///
+    /// 本项覆盖 V1 新接入的三条循环（prewarmer/prober/sweep）所依赖的机制：
+    /// worker panic → JoinHandle 返回 `Err` → supervisor 退避重启 → 指标计数。
+    /// 修复前这三条是裸 spawn，panic 等于该功能永久静默死亡。
+    #[tokio::test]
+    async fn opt_r6_v1_supervisor_restarts_panicking_worker() {
+        use crate::metrics::MetricsRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        let h = tokio::spawn(supervise_until(
+            "opt-r6-v1-prober",
+            metrics.clone(),
+            move || {
+                let runs2 = runs2.clone();
+                async move {
+                    runs2.fetch_add(1, Ordering::Relaxed);
+                    // 模拟 V1 关心的场景：worker 内部 panic（旧实现下这条裸 spawn
+                    // 会随 panic 静默死亡）。
+                    panic!("simulated worker panic");
+                }
+            },
+            rx,
+        ));
+
+        // 等两次重启发生（首轮 + 至少一次 backoff 后重启）。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runs.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let n = runs.load(Ordering::Relaxed);
+        assert!(
+            n >= 2,
+            "panic 后必须被 supervisor 重启（实际重启到第 {n} 次）"
+        );
+
+        tx.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(60), h)
+            .await
+            .expect("stop must join promptly")
+            .expect("supervise task itself must not panic");
+    }
+
+    /// V1 telemetry 的**有尽监督**语义：`Receiver` 一次性，崩溃后不重启，
+    /// 但必须**记一次指标**（否则就是静默死亡——正是 V1 要消灭的行为）。
+    #[tokio::test]
+    async fn opt_r6_v1_telemetry_finite_supervision_counts_but_does_not_restart() {
+        use crate::metrics::MetricsRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let metrics = Arc::new(MetricsRegistry::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        // 复刻 main.rs 中 telemetry 的有尽监督包装：spawn worker → await JoinHandle
+        // → 无论 Ok/Err 都记一次重启计数，且**不再拉起第二轮**。
+        let render_metrics = metrics.clone();
+        let wrapped = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                runs2.fetch_add(1, Ordering::Relaxed);
+                panic!("simulated telemetry panic");
+            });
+            match handle.await {
+                Ok(()) => log::error!("[Telemetry] worker exited unexpectedly"),
+                Err(e) => log::error!("[Telemetry] worker panicked ({e:?})"),
+            }
+            render_metrics.note_supervisor_restart("telemetry");
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), wrapped)
+            .await
+            .expect("finite supervision must return promptly")
+            .expect("wrapper must not panic");
+        // 只跑了一轮（无重启）。
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "telemetry 不得重启");
+        // 但指标已记——可观测，不静默。
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"supervisor_restarts_total{worker="telemetry"} 1"#),
+            "telemetry 崩溃必须记 supervisor_restarts_total（渲染中未见）"
+        );
+    }
+
+    /// V1 接入后 stop 语义不回归：stop 置位后 prober/sweep/prewarmer 立刻停止拉起，
+    /// 不会在优雅退出窗口里继续 churn。
+    #[tokio::test]
+    async fn opt_r6_v1_stop_prevents_further_restarts() {
+        use crate::metrics::MetricsRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        let h = tokio::spawn(supervise_until(
+            "opt-r6-v1-sweep",
+            metrics,
+            move || {
+                let runs2 = runs2.clone();
+                async move {
+                    runs2.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            rx,
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runs.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(runs.load(Ordering::Relaxed) >= 1, "worker must run first");
+        tx.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(60), h)
+            .await
+            .expect("stop must join promptly")
+            .expect("supervise task panicked");
+        let n = runs.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(runs.load(Ordering::Relaxed), n, "no respawn after stop");
     }

@@ -1,7 +1,7 @@
 # 任务总体执行规划: GW-R1 企业级IP代理池网关落地
 
 > 创建/更新时间: 2026-09-19 12:00
-> 当前状态: 步骤 10 FreePool v2 已完成（Task 1~13 全✅，107 单测+4 真 live+四门绿+ELITE 0/1 两档 curl 全回归，见 EXEC_LOG 步骤 10 条；网关 PID:26632 在线）；GW-R2剩余待真 Key / Linux 节点
+> 当前状态: 步骤 33 OPT-R8 凭据与运维脚本加固已完成（凭据出 argv 收敛／backup 两道闸实测／watchdog 去 mock 化四场景／free_test 四态判定六场景／restore 真恢复实现待演练；226 单测+四门绿）；步骤 1~33 已完成（步骤 32 附：CH 迁移已执行验证）
 > 跟踪表: `plan/2026年9月19日-GW-R1实施计划.md`（动态更新，状态以该文件为准）+ `plan/2026年9月21日-FreePool实施计划-v2.md`（FreePool 第二线，supersede v1）
 > 优化表: `plan/2026年9月19日-OPT-R1优化方案.md`（已收官） + `plan/2026年9月21日-OPT-R2优化方案.md`（本轮）
 
@@ -36,6 +36,9 @@
 - [x] **步骤 28**: OPT-R5 优化（S 稳定性根治/E 代理能力/O 运维收尾，24 项）方案见`plan/2026年9月25日-OPT-R5优化方案.md` ✅ 已完成（209 单测＋live 4＋bandit 12＋四门绿＋回归全绿；E7 spike 后暂缓；证据见 EXEC_LOG 步骤 28-S/E/O/V 条）
 - [x] **步骤 29**: DOC-S2 文档五件套（架构/功能/数据流/用户使用/相关开源）方案见`plan/2026年9月26日-DOC-S2文档五件套实施计划.md` ✅ 已完成（5 双语文档＋互链＋口径核对；证据见 EXEC_LOG 步骤 29 条）
 - [x] **步骤 30**: 亲手操作指南落库（`docs/HANDS-ON.md` 双语＋README 索引） ✅ 已完成（命令逐条实测口径，证据见 EXEC_LOG 步骤 30 条）
+- [x] **步骤 31**: OPT-R6 止血优化（3×P0：free 凭据护栏改节点侧判定／淘汰计数下溢根治／live 门禁修好；P1：4 条裸 spawn 进 supervise）方案见`plan/2026年9月28日-OPT-R6止血优化方案.md` ✅ 已完成（223 单测＋四门绿＋release bandit<200ns；S2 红测有效性经回退实证；S1 端到端已验 D3 语义/显式 free 403/付费零变化，完整绕过场景由集成单测锁定；证据见 EXEC_LOG 步骤 31 条）
+- [x] **步骤 32**: OPT-R7 可观测性与部署加固（A：CH 排序键＋跳过索引＋迁移脚本；B：告警语义修复＋三类补齐；C：CH 探针／Prom 卷／receiver；D：PS1 BOM＋直方图桶扩展）方案见`plan/2026年9月28日-OPT-R7可观测性与部署加固方案.md` ✅ 已完成（226 单测＋四门绿＋release bandit<200ns；CH 剪枝 5/5→1/5 实测、CH 容器 unhealthy→healthy 实测、12 条告警 health=ok 实测；D1 的 .gitattributes 方案经实测证伪已改 CI 断言；**002_reorder.sql 已实际执行并验证：备份 3981 → v2 表 3981 → RENAME 后新旧备份三表 3981 对账一致、provider×status 分布逐行一致、SLA 查询正常、索引就位（_old 与 _backup 保留作回滚保险）**；证据见 EXEC_LOG 步骤 32 条）
+- [x] **步骤 33**: OPT-R8 凭据与运维脚本加固（A：密码不出 argv 5 项；B：脚本健壮性 4 项——backup 校验／watchdog 去 mock 化／free_test 加 UNKNOWN／restore 真恢复）方案见`plan/2026年9月28日-OPT-R8凭据与运维脚本加固方案.md` ✅ 已完成（226 单测＋四门绿＋release bandit<200ns；B1 双向实测（错误项目名被两道闸拦截且未创建空卷）、B2 四场景、B3 六场景、B4 dry-run 全流程；A5 新增 creds CI 断言双向实测；A1 因 Redis 无 env 替代降级为只做 healthcheck 侧并如实标注；restore -Execute 真恢复属破坏性未演练已登记；证据见 EXEC_LOG 步骤 33 条）
 
 
 ## 关键决策与约束

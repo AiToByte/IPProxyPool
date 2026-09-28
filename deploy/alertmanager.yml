@@ -1,7 +1,56 @@
-# IPProxyPool Alertmanager skeleton (OPT-R4 C9).
-# 现状：空接收器占位（告警先在 Prometheus UI/API 可见；生产需填 webhook/
-# 邮箱后，在 prometheus.yml 取消 alertmanagers 段注释并重载）。
-# 验证：python yaml 解析（CI）；全量联调待 Alertmanager 落地后补 firing 演练。
+# IPProxyPool Alertmanager 配置（OPT-R4 C9 骨架，OPT-R7 C3 补齐投递能力）
+#
+# ----------------------------------------------------------------------------
+# 为什么要改（此前是 P1 阻断项）
+# ----------------------------------------------------------------------------
+# 原文注释自承「空接收器占位（告警先在 Prometheus UI/API 可见）」。问题在于：
+# **只要 receiver 是 `empty`，Prometheus 里所有 firing 告警都进得去、出不来**——
+# 规则写得再对也等于零。OPT-R7 B1/B2 刚补齐 12 条规则（含延迟/熔断/丢数），
+# 若投递链路仍是空的，这些规则只会在 UI 上静静发亮。
+#
+# ----------------------------------------------------------------------------
+# 怎么接（三种方式，按运维环境选一；本文件不硬编码任何凭据）
+# ----------------------------------------------------------------------------
+# 1) Webhook（最通用，钉钉/企业微信/自建网关都走它）：
+#    取消下面 `webhook_configs` 的注释，把 URL 换成你的地址。
+#    URL 若含 token，用环境变量注入（见文末「凭据注入」）。
+# 2) 邮件（SMTP）：
+#    取消 `email_configs` 的注释并填 `smtp_smarthost` / `smtp_auth`。
+#    密码同样走环境变量。
+# 3) 保持 `empty`（本地/开发默认）：
+#    不取消任何注释即可，行为与之前完全一致——告警在 Prometheus UI 可见可查，
+#    只是不外发。**开发环境建议保持现状，避免误报到真实渠道。**
+#
+# ----------------------------------------------------------------------------
+# 路由设计说明
+# ----------------------------------------------------------------------------
+# - `group_by: ["alertname"]`：同名告警聚合，避免同一问题刷屏几十条。
+# - `group_wait: 30s`：同类告警 30 秒内聚成一条再发，抑制瞬时抖动。
+# - `group_interval: 5m` / `repeat_interval: 4h`：5 分钟内不重发同组，
+#   未恢复则每 4 小时提醒一次（避免长期故障被刷屏淹没）。
+# - `inhibit_rules`：critical 触发时抑制同 alertname 的 warning。
+#   此前为空数组——网关整体失联（`GatewayDown` critical）时，
+#   延迟/成功率等 warning 会同时 firing，把真正的根因淹没在噪声里。
+#   故补一条同 alertname 的抑制规则（不跨 alertname 抑制：
+#   延迟高与成功率低是不同现象，都应保留可见）。
+# ----------------------------------------------------------------------------
+# 验证
+# ----------------------------------------------------------------------------
+# - CI：python yaml 语法解析（`ci.yml` 的 static-checks job）。
+# - 本地：docker compose --profile observability up -d alertmanager
+#   → curl http://127.0.0.1:9093/-/ready
+#   → amtool check-config deploy/alertmanager.yml（若本机有 amtool）
+# - 端到端 firing 演练：把 `receiver` 改为已启用的 webhook 后，
+#   在 Prometheus UI 手动 silence 一条再解除，观察是否收到通知。
+# ----------------------------------------------------------------------------
+# 凭据注入（重要）
+# ----------------------------------------------------------------------------
+# Alertmanager 自身**不支持**在 YAML 里展开环境变量，故两种做法：
+#   a) 用 compose 的 env_file + 入口脚本生成运行时配置（推荐，配置不入仓）：
+#      即在 deploy/alertmanager.yml 留占位，由脚本 sed 替换后挂载。
+#   b) 走 URL 里不含密钥的内部端点（如企业微信群机器人 + 网关侧鉴权代理）。
+# **绝不要把带 token 的 URL 直接提交进仓库**（见 docs/OPEN-SOURCE.md 密钥红线）。
+# ----------------------------------------------------------------------------
 global:
   resolve_timeout: 5m
 
@@ -10,9 +59,37 @@ route:
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
+  # OPT-R7 C3：默认仍走 `empty`（开发不误报）；生产把下面已备好的
+  # `webhook_configs` 之一启用后，把这里改成对应 receiver 名。
   receiver: "empty"
 
 receivers:
+  # 开发/本地默认：接收即丢弃（告警仍可在 Prometheus UI / API 查到）。
   - name: "empty"
 
-inhibit_rules: []
+  # ---- 生产投递：取消注释其一，并同步把 route.receiver 改为同名 ----
+  #
+  # - name: "webhook"
+  #   webhook_configs:
+  #     - url: "http://<your-gateway>/alerts"   # 勿把含 token 的 URL 提交进仓
+  #       send_resolved: true                     # 恢复时也通知，避免"只看到故障"
+  #
+  # - name: "email"
+  #   email_configs:
+  #     - to: "<your-oncall@example.com>"
+  #       from: "alertmanager@example.com"
+  #       smarthost: "smtp.example.com:587"
+  #       auth_username: "alertmanager"
+  #       auth_password: "<smtp-password>"        # 勿提交进仓；用 env_file 注入
+  #       send_resolved: true
+
+# OPT-R7 C3：补抑制规则（此前为空数组）。
+# 网关整体失联时，`GatewayDown`（critical）应压制同一 alertname 的 warning，
+# 避免根因被派生噪声淹没。只在 alertname 相同才抑制——不同现象（延迟高 /
+# 成功率低 / 丢数）仍各自可见。
+inhibit_rules:
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["alertname"]

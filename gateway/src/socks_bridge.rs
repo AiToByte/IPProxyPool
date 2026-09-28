@@ -4,6 +4,7 @@
 //! 不 fork——桥用 reqwest `socks` feature 出站，合成响应回下游）。
 //! Client 按 `node.addr` 缓存复用（沿 prober OPT-5 模式＋TTL 淘汰；`Client` 克隆廉价内部 `Arc`）。
 
+use crate::janitor;
 use crate::model::{EgressProto, ProxyNode};
 use crate::prober::CanaryProber;
 use dashmap::DashMap;
@@ -271,7 +272,9 @@ impl SocksBridge {
         let before = self.clients.len();
         self.clients
             .retain(|_, c| Instant::now().saturating_duration_since(c.last_used) < BRIDGE_IDLE_TTL);
-        before - self.clients.len()
+        // OPT-R6 S2：Client 缓存正被数据面 `client_for` 并发写入（首次用到某 socks
+        // 节点时建缓存），旧的 `before - len()` 会 debug panic / release 回绕。
+        janitor::removed_count(before, self.clients.len())
     }
 }
 

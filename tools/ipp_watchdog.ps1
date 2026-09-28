@@ -65,21 +65,68 @@ if (-not $env:CLICKHOUSE_PASSWORD) { $env:CLICKHOUSE_PASSWORD = "123456" }
 if (-not $env:CLICKHOUSE_DB) { $env:CLICKHOUSE_DB = "proxy" }
 Write-Log "watchdog started (cwd=$(Get-Location))"
 
+function Test-PortOwner {
+    # OPT-R8 B2：判定「监听 :8916 的是不是我方网关」。
+    #
+    # 旧实现只认「200 + 响应体含 mock-」，而 `docs/OPERATION.md` 的真 Key 灰度
+    # 流程第 2 步要求把 `mock-x` 换成真实 `ip:port` —— 换完后响应体永不含
+    # `mock-`，`Test-GatewayIdentity` 恒返回 `404-foreign`，看护每 3 轮（约 90s）
+    # 重拉一次进程，**无限重拉**（生产部署下即自杀式看护）。
+    #
+    # 改为客观事实判据：比对监听进程的可执行文件路径是否落在本仓 `target` 下。
+    # 该判据与响应体内容**无关**，对 mock 与真供应商一视同仁。
+    # 返回 $true=我方进程在监听；$false=未监听或非我方进程。
+    #
+    # 注记：按 PID 找进程所有者用 `Get-NetTCPConnection`——但该 cmdlet 在
+    # Win11 上有卡死 20s+ 的实测记录（见 EXEC 步骤 2 教训），故此处改用
+    # `netstat -ano` 文本解析（快且无副作用）。
+    $lines = netstat -ano 2>$null | Select-String "LISTENING" | Select-String ":8916\s"
+    if (-not $lines) { return $false }
+    $pids = @()
+    foreach ($l in $lines) {
+        $parts = ($l -split "\s+") | Where-Object { $_ -ne "" }
+        if ($parts.Count -ge 1) {
+            $last = $parts[$parts.Count - 1]
+            if ($last -match '^\d+$') { $pids += [int]$last }
+        }
+    }
+    if ($pids.Count -eq 0) { return $false }
+    foreach ($procId in $pids) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $exe = $p.ExecutablePath
+        $cmd = $p.CommandLine
+        $isOurs = ($exe -and $exe -like "*IPProxyPool*pingora-proxy-gateway.exe") -or
+                  ($cmd -and $cmd -like "*IPProxyPool*pingora-proxy-gateway*")
+        if ($isOurs) { return $true }
+        Write-Log "port 8916 held by foreign pid=$procId exe=$exe"
+    }
+    return $false
+}
+
 function Test-GatewayIdentity {
-    # 2026-09-24 起网关迁 8916（:8080 让给 cvat traefik）；只认“200＋mock 包体”。
-    # 写法注记：直列式（本机 PS5.1 无 BOM＋LF＋中文文件曾报 try/catch 版
-    # UnexpectedToken，根因为缺 BOM 致误解析，见 EXEC；全仓 .ps1 已补 BOM，
-    # 此处保持可解析的直列形态不再改回，语义等价）。
-    # D3：网关探针带开发 Key（无头 403 即判非我方，不会误杀；metrics 探针无门不动）。
+    # OPT-R8 B2：两级判据，缺一不可。
+    #   1) 端口归属：我方网关进程是否在监听 :8916（客观事实，见 Test-PortOwner）。
+    #   2) HTTP 探活：带 D3 开发 Key 探测（无头 403 即判非我方，不会误杀）。
+    #
+    # `mock-` 前缀**降级为日志指纹**，不再作为存活判据——真供应商部署的响应体
+    # 天然不含 mock，用它做判据会导致无限重拉（旧实现的根本缺陷）。
+    # 返回：200=健康；其他=不健康（附原因，仅用于日志）。
+    if (-not (Test-PortOwner)) {
+        return "no-owner"
+    }
     $code = curl.exe --max-time 5 -s -o NUL -w "%{http_code}" -H "X-Api-Key: default_key" http://127.0.0.1:8916/
     if ($code -ne "200") {
         return $code
     }
+    # 日志指纹：mock 环境记 mock-，真供应商记非 mock（仅记录，不影响判定）。
     $body = curl.exe --max-time 5 -s -H "X-Api-Key: default_key" http://127.0.0.1:8916/
     if ($body -like "*mock-*") {
-        return "200"
+        Write-Log "identity ok (egress fingerprint: mock)"
+    } else {
+        Write-Log "identity ok (non-mock egress — real vendor pool or custom upstream)"
     }
-    return "404-foreign"
+    return "200"
 }
 
 function Start-Detached-Gateway {

@@ -45,13 +45,29 @@ jobs:
           Invoke-ScriptAnalyzer -Path tools -Recurse -Severity Error -EnableExit
       - name: Python scripts compile
         run: python3 -m compileall -q tools log/mock_upstream.py log/probe_free.py log/launch_detached.py deploy/geoip_update.py
+      - name: PowerShell scripts carry UTF-8 BOM (OPT-R7 D1)
+        # git 会剥离 UTF-8 BOM 且不受 .gitattributes 控制（实测记录见
+        # .gitattributes 的 OPT-R7 D1 段），故只能靠 CI 断言守住工作区副本。
+        # 缺 BOM 时 Windows PowerShell 5.1 会按 GBK 代码页解析中文注释 →
+        # 乱码乃至解析失败（事故背景见 docs/FREE_BASELINE.md）。
+        run: python3 tools/check_ps1_bom.py
+      - name: No plaintext credentials in process argv (OPT-R8 A5)
+        # 凭据进 argv 会被同机任意用户读到（Get-CimInstance Win32_Process /
+        # /proc/<pid>/cmdline）。正确做法是环境变量（REDISCLI_AUTH /
+        # CLICKHOUSE_PASSWORD）或请求头（X-ClickHouse-Key）。
+        run: python3 tools/check_no_plaintext_creds.py
+      # OPT-R7 B2：规则/配置解析显式指定 UTF-8。仓库的 YAML/JSON 均含中文注释，
+      # 而 Python 的 `open()` 默认跟随**系统 locale 编码**——在非 UTF-8 locale
+      # （如 Windows 上的 GBK）会抛 UnicodeDecodeError。本机实测即如此：
+      # 未加 `encoding="utf-8"` 时三条检查全挂在解码上。
+      # 加 `encoding="utf-8"` 后与 locale 无关，跨平台稳定。
       - name: Prometheus rules syntax
-        run: python3 -c "import yaml,sys; d=yaml.safe_load(open('deploy/prometheus/rules.yml')); assert d['groups'], 'no rule groups'"
+        run: python3 -c "import yaml; d=yaml.safe_load(open('deploy/prometheus/rules.yml', encoding='utf-8')); assert d['groups'], 'no rule groups'"
       - name: Alertmanager config syntax
-        run: python3 -c "import yaml; yaml.safe_load(open('deploy/alertmanager.yml'))"
+        run: python3 -c "import yaml; yaml.safe_load(open('deploy/alertmanager.yml', encoding='utf-8'))"
       - name: Dashboards + compose valid
         run: |
-          python3 -c "import json,glob; [json.load(open(p)) for p in glob.glob('deploy/grafana/**/*.json', recursive=True)]"
+          python3 -c "import json,glob; [json.load(open(p, encoding='utf-8')) for p in glob.glob('deploy/grafana/**/*.json', recursive=True)]"
           docker compose config --quiet
       - name: Gateway D3 defaults (127.0.0.1:8916 + REQUIRE_API_KEY=1)
         # D3 缺省双断言：监听缺省收回环＋API Key 门缺省开启（PORT-8916/D3；

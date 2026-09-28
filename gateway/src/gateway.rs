@@ -100,6 +100,70 @@ pub fn free_tier_with_credentials(
 ) -> bool {
     tier == Some("free") && (has_authorization || has_cookie)
 }
+
+/// 下游凭据载体探测：`Authorization`（Bearer／支付 token）。
+///
+/// `HeaderMap::get` 大小写不敏感，故 `authorization`／`Authorization`／全大写
+/// 等形态全覆盖。抽成自由函数供 `request_filter`（显式 `tier=free` 提前拒绝）
+/// 与 `upstream_peer`（OPT-R6 S1 实际节点档位兜底）共用，避免两处探测口径漂移。
+#[inline]
+pub fn has_authorization(session: &Session) -> bool {
+    session
+        .req_header()
+        .headers
+        .contains_key(http::header::AUTHORIZATION)
+}
+
+/// 下游凭据载体探测：`Cookie`（会话／支付状态）。口径同 [`has_authorization`]。
+#[inline]
+pub fn has_cookie(session: &Session) -> bool {
+    session
+        .req_header()
+        .headers
+        .contains_key(http::header::COOKIE)
+}
+
+/// OPT-R6 S1（P0 安全）：**按实际选中节点的档位**判定凭据外泄风险。
+///
+/// # 为什么 `free_tier_with_credentials` 不够（OPT-R6 S1 根因）
+///
+/// 旧护栏只看「请求声明的 tier」（`X-Proxy-Tier` 头），而选路 `RouterEngine::matches`
+/// 在 `spec.tier == None` 时**直接跳过档位检查**（`router.rs`）——即无 tier 约束的请求
+/// 按权重命中节点时，**完全可能命中免费节点**。于是存在一条绕过路径：
+///
+/// ```text
+/// 请求带 Authorization: Bearer <token>（或 Cookie）
+/// 但不发 X-Proxy-Tier 头（spec.tier = None）
+///   → 旧护栏 tier != Some("free") → 放行
+///   → 选路按权重命中一个匿名免费出口
+///   → 凭据随请求出站，泄露给陌生第三方
+/// ```
+///
+/// 选路是加权随机的，客户端**无法控制**命中结果，因此也不能靠「我声明 res 就一定
+/// 走付费节点」来自证安全。**唯一正确的判定依据是实际将要出站的节点档位。**
+///
+/// # 本函数的定位
+///
+/// 在**选路之后、出站之前**调用（`upstream_peer` 与 `serve_via_socks` 两条出站路径），
+/// 用实际选中的 `ProxyNode` 判定。显式 `tier=free` 的提前拒绝仍由
+/// `free_tier_with_credentials` 保留（省一次选路），本函数是**兜底那道闸**。
+///
+/// # 参数口径
+///
+/// `node_tier` 取自 `ProxyNode::tier`——`ProxyNode::new` 入口已归一为小写长名
+/// （见 `model::canonical_tier`，`free` 无短名故归一前后同为 `"free"`）。
+/// 比较用 `eq_ignore_ascii_case` 而非 `canonical_tier`：后者会为每次调用分配
+/// `String`，而本函数在**每请求的出站路径**上执行；且归一是幂等的，
+/// 大小写不敏感比较与「归一后严格比较」对 `free` 档**完全等价**，
+/// 同时对非归一输入（未来新增档位）保持防御性。
+#[inline]
+pub fn free_node_exits_with_credentials(
+    node_tier: &str,
+    has_authorization: bool,
+    has_cookie: bool,
+) -> bool {
+    node_tier.eq_ignore_ascii_case("free") && (has_authorization || has_cookie)
+}
 /// R2-6：取本请求的 bandit 上下文——`upstream_peer` 已算好则复用（选学一致，
 /// 省一次 `extract_context` 含时钟 syscall），否则现算（粘滞路径/直调兼容）。
 pub fn resolve_bandit_context(ctx: &ProxyContext, engine: &LinUCBEngine, domain: &str) -> VectorD {
@@ -372,6 +436,26 @@ impl SmartProxyGateway {
             if should_skip_bridge_node(ctx, &node) {
                 continue;
             }
+            // OPT-R6 S1（P0 安全）：SOCKS 出站路径的凭据护栏，判定依据同为
+            // **实际选中节点**的档位。放在逐跳循环内而非函数入口，是因为重试会
+            // 换节点——每跳都要按该跳真实命中的档位重新判定。
+            // 与 `upstream_peer` 共用 `free_node_exits_with_credentials`／头探测，
+            // 两条出站路径口径一致，不存在「HTTP 拦了 SOCKS 漏了」的缺口。
+            if free_node_exits_with_credentials(
+                &node.tier,
+                has_authorization(session),
+                has_cookie(session),
+            ) {
+                log::warn!(
+                    "[CredentialGuard] rejecting credentialed SOCKS request routed to free node {} (tier={})",
+                    node.addr,
+                    node.tier
+                );
+                return Err(Error::explain(
+                    pingora_core::ErrorType::HTTPStatus(403),
+                    "Credentialed request rejected: selected egress node is anonymous (free tier)",
+                ));
+            }
             ctx.current_node = Some(Arc::clone(&node));
             ctx.transferred_bytes = 0; // OPT-3：只计最后 attempt
             let breq = BridgeRequest {
@@ -533,13 +617,13 @@ impl ProxyHttp for SmartProxyGateway {
 
         // D1：free 匿名出口拒收下游凭据头（403，不占租户配额；网关自己的
         // X-API-Key 不在此列，见 free_tier_with_credentials 注释）。
-        // HeaderMap::get 大小写不敏感，`authorization`/`cookie` 全形态覆盖。
-        let has_authorization = session.req_header().headers.contains_key("authorization");
-        let has_cookie = session.req_header().headers.contains_key("cookie");
+        // OPT-R6 S1：探测口径抽到 `has_authorization`/`has_cookie` 自由函数，
+        // 与 `upstream_peer` 的实际节点档位兜底共用同一实现（HeaderMap 大小写
+        // 不敏感，`authorization`/`cookie` 全形态覆盖）。
         if free_tier_with_credentials(
             ctx.routing_spec.tier.as_deref(),
-            has_authorization,
-            has_cookie,
+            has_authorization(session),
+            has_cookie(session),
         ) {
             session.respond_error(403).await?;
             return Ok(true);
@@ -591,6 +675,29 @@ impl ProxyHttp for SmartProxyGateway {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("default.target")
             .to_string();
+        // OPT-R6 S1（P0 安全）：**按实际选中节点**的档位兜底校验下游凭据头。
+        // 旧护栏只看请求声明的 `X-Proxy-Tier`，而无 tier 声明的请求按权重选路
+        // 时本就可能命中免费节点 → 带 `Authorization`/`Cookie` 的请求可经匿名
+        // 免费出口出站、泄露凭据给陌生第三方。此处是选路后、出站前的最后闸门：
+        // 命中免费节点且携带凭据 → 403。付费节点命中零变化。
+        // 显式 `tier=free` 的提前拒绝仍在 `request_filter`（省一次选路）。
+        if free_node_exits_with_credentials(
+            &node.tier,
+            has_authorization(session),
+            has_cookie(session),
+        ) {
+            log::warn!(
+                "[CredentialGuard] rejecting credentialed request routed to free node {} (tier={})",
+                node.addr,
+                node.tier
+            );
+            // 与本函数 503 分支同模式：`Err(HTTPStatus)` 让 Pingora 直接回错误响应，
+            // `ctx.current_node` 刻意不落（无出站、无计量归属，遥测走 error 路径）。
+            return Err(Error::explain(
+                pingora_core::ErrorType::HTTPStatus(403),
+                "Credentialed request rejected: selected egress node is anonymous (free tier)",
+            ));
+        }
         // P2：peer 装配经守卫函数（socks 节点硬失败，正常走不到——见函数注释）。
         let peer = build_http_peer(&node, &target_host)?;
         // R2-6：`current_node` 落 ctx（`Arc` 句柄本身零成本 move）。
@@ -918,6 +1025,101 @@ mod tests {
         assert!(!free_tier_with_credentials(Some("res"), true, true));
         assert!(!free_tier_with_credentials(Some("dc"), true, true));
         assert!(!free_tier_with_credentials(None, true, true));
+    }
+
+    // ---- OPT-R6 S1：free 凭据护栏（P0 安全）回归锁定 ----
+
+    /// P0 根因回归：请求**未声明** `X-Proxy-Tier`（旧护栏 `tier=None` 必放行），
+    /// 但选路实际命中匿名免费节点时，携带下游凭据必须被拒。
+    ///
+    /// 旧实现的绕过路径（本组断言在旧代码下全部反转为 `false`，即漏洞存在）：
+    /// `free_tier_with_credentials(None, true, false) == false`（放行）
+    ///   → 无 tier 约束的选路按权重命中 free 节点
+    ///   → 凭据经陌生免费出口泄露。
+    #[test]
+    fn opt_r6_s1_undeclared_tier_hitting_free_node_is_rejected() {
+        // 绕过路径本体：无 tier 声明 + 带 Authorization → 旧护栏放行。
+        assert!(
+            !free_tier_with_credentials(None, true, false),
+            "前置确认：旧护栏在无 tier 声明时确实放行（这正是漏洞所在）"
+        );
+        // 修法：按实际命中节点档位判定 → 拦截。
+        assert!(free_node_exits_with_credentials("free", true, false));
+        assert!(free_node_exits_with_credentials("free", false, true));
+        assert!(free_node_exits_with_credentials("free", true, true));
+    }
+
+    /// 匿名流量走免费节点必须放行——护栏不能误伤免费线的正常匿名用途
+    /// （否则等于把整个第二供应线关掉）。
+    #[test]
+    fn opt_r6_s1_anonymous_traffic_on_free_node_passes() {
+        assert!(!free_node_exits_with_credentials("free", false, false));
+    }
+
+    /// 命中付费节点一律放行（存量语义零变化，含 res/dc 短名归一后的长名形态）。
+    #[test]
+    fn opt_r6_s1_paid_node_never_rejected() {
+        for tier in ["residential", "datacenter", "price", "cost", ""] {
+            assert!(
+                !free_node_exits_with_credentials(tier, true, true),
+                "付费/未知档 `{tier}` 携带凭据必须放行"
+            );
+        }
+    }
+
+    /// 档位大小写不敏感（`ProxyNode::new` 入口已归一，但防御性保留：
+    /// 大小写不敏感比较对 `free` 与「归一后严格比较」完全等价）。
+    #[test]
+    fn opt_r6_s1_tier_case_insensitive() {
+        assert!(free_node_exits_with_credentials("FREE", true, false));
+        assert!(free_node_exits_with_credentials("Free", false, true));
+        assert!(!free_node_exits_with_credentials(
+            "RESIDENTIAL",
+            true,
+            false
+        ));
+    }
+
+    /// 存量语义不回归：显式 `tier=free` 的**提前**拒绝（省一次选路）仍生效，
+    /// 且与新的节点侧兜底判定不冲突。
+    #[test]
+    fn opt_r6_s1_explicit_free_tier_still_rejected_early() {
+        // 显式 free + 凭据 → 提前拒绝（request_filter 路径，未选路）。
+        assert!(free_tier_with_credentials(Some("free"), true, false));
+        // 显式 free + 匿名 → 放行，后续由节点侧判定兜底。
+        assert!(!free_tier_with_credentials(Some("free"), false, false));
+        // 显式非 free + 凭据 → 提前放行，但若实际命中免费节点，节点侧仍会拦。
+        assert!(!free_tier_with_credentials(
+            Some("residential"),
+            true,
+            false
+        ));
+        assert!(free_node_exits_with_credentials("free", true, false));
+    }
+
+    /// 覆盖盲区的**诚实记录**：`upstream_peer` 与 `serve_via_socks` 两个 Pingora
+    /// 钩子本体无法单测（`pingora_proxy::Session` 无法在单测中构造），故它们的
+    /// 「护栏确实被调用」只能靠代码走查 + curl 端到端回归保证。
+    ///
+    /// 本测试锁定的是**可测部分**：判定函数的完整真值表（节点侧护栏的全部语义）。
+    /// 若将来有人改动判定口径，此测试会红；钩子接线则由 lint/走查/端到端覆盖。
+    #[test]
+    fn opt_r6_s1_guard_truth_table_is_complete() {
+        // 全部 2^3 组合（node_tier 固定 free 与 residential）× 4 档。
+        for has_auth in [false, true] {
+            for has_cookie in [false, true] {
+                let creds = has_auth || has_cookie;
+                assert_eq!(
+                    free_node_exits_with_credentials("free", has_auth, has_cookie),
+                    creds,
+                    "free 节点：有凭据必拦、无凭据必放行"
+                );
+                assert!(
+                    !free_node_exits_with_credentials("residential", has_auth, has_cookie),
+                    "付费节点：一律放行"
+                );
+            }
+        }
     }
 
     #[test]
