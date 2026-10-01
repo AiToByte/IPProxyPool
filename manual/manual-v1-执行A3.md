@@ -1,3 +1,21 @@
+> **[已废弃 / DEPRECATED] — 请勿据此部署**
+>
+> 本文件是 **v1 阶段的设计草稿**，内容已严重过时，且**从未被仓库任何文档链接**。
+> 已确认的三处失实（不要照抄）：
+> - 端口写 `0.0.0.0:8080` —— 实际自 OPT-R5 起默认 `:8916`（避让 traefik 争用）。
+> - 声称 P99 <5ms —— 实测 dev 基线约 **65ms**（Windows debug 参考值，非生产承诺）。
+> - 端口/鉴权/组件清单早于多轮架构迭代（CH 迁移、supervisor、free_pool 等）。
+>
+> **当前有效文档**：
+> - 运维：[`docs/OPERATION.md`](../docs/OPERATION.md)
+> - 功能：[`docs/FEATURES.md`](../docs/FEATURES.md)
+> - 使用：[`docs/USAGE.md`](../docs/USAGE.md)
+> - 架构：[`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)
+> - 质量基线：[`docs/QUALITY_BASELINE.md`](../docs/QUALITY_BASELINE.md)
+>
+> 保留本文件仅为记录设计演进轨迹。**执行摘要见
+> [`manual/README.md`](README.md)。**
+
 开始第三阶段
 
 

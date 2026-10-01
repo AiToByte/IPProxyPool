@@ -89,10 +89,27 @@ public class ipp_sdk_java {
             return get(url, null, 1, out);
         }
 
+        /**
+         * 经网关 GET 公网 URL。返回响应体字节；HTTP 状态写入 {@code out[0]}。
+         * 503 延迟 1s 重试一次。
+         *
+         * <p><b>错误契约（OPT-R10 C1，与 Python/Node/Go/.NET SDK 一致）</b>：
+         * <ul>
+         * <li><b>编程错误</b>（调用方把 url 用错了）⇒ 抛
+         *     {@link IllegalArgumentException}。当前一种：scheme 非 http
+         *     （网关不做 CONNECT 隧道，见 docs/SPIKE_R2.md 的 E7 结论）。不重试
+         *     ——重试一个永远不可能成功的请求只是浪费配额。</li>
+         * <li><b>网络/网关失败</b>（连接失败、超时、503 重试耗尽）⇒
+         *     {@code throws} 之外正常返回，{@code out[0] == 0} 且返回体是诊断
+         *     信息。可预期的瞬时故障，退避/重试策略由调用方决定；不要写成
+         *     catch-all 吞掉，那会丢掉可观测性。</li>
+         * </ul>
+         */
         public byte[] get(String url, Map<String, String> extra, int retries, int[] out) throws Exception {
             URI t = URI.create(url);
             if (!"http".equals(t.getScheme())) {
-                throw new IllegalArgumentException("only plain http targets are supported (no CONNECT tunneling)");
+                throw new IllegalArgumentException(
+                        "only plain http targets are supported (no CONNECT tunneling), got scheme: " + t.getScheme());
             }
             String targetHost = t.getAuthority();
             String path = t.getRawPath();

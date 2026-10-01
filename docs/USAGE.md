@@ -58,6 +58,42 @@ powershell -ExecutionPolicy Bypass -File tools/ipp.ps1 stop          # 精确停
 
 Node 见 `tools/ipp_sdk_node.js`、Go 见 `tools/ipp_sdk_go.go`、.NET 见 `tools/ipp_sdk_dotnet.cs`、Java 见 `tools/ipp_sdk_java.java`（自检默认不自动跑，仅网关/mocks 活着时手动跑）。
 
+#### SDK 错误契约（OPT-R10 C1/C2 统一，5 语言一致）
+
+**两类失败走两个通道。** 这一点此前在 .NET 和 Go 上是错的（详见下方「为什么统一」）。
+
+| 失败类型 | 含义 | 各语言通道 |
+| -------- | ---- | ---------- |
+| **编程错误** | 调用方把 url 用错了 | Python `raise ValueError`／Java `IllegalArgumentException`／Node `throw Error`／**.NET `ArgumentException`**／**Go `return err`（第三个返回值，status 恒 0）** |
+| **网络/网关失败** | 连接失败、超时、503 重试耗尽 | **一律不抛**——返回 status=0＋body 为诊断信息 |
+
+当前只有一种编程错误：**scheme 非 http**。网关是反向式 egress 路由，**不做 CONNECT 隧道**（结论见 `docs/SPIKE_R2.md` 的 E7），所以传 `https://` 必然失败。
+
+正确用法（以 Go 为例，其余语言同理）：
+
+```go
+status, body, err := c.Get("http://httpbin.org/ip", nil, 1)
+if err != nil {
+    // 编程错误：url 传错了（例如 https）。不要重试——重试一个
+    // 永远不可能成功的请求只是浪费配额。
+    return err
+}
+if status != 200 {
+    // 网络/网关失败：可预期的瞬时故障，退避/重试策略由你决定。
+    // 诊断信息在 body 里，别写成 catch-all 吞掉，否则丢掉可观测性。
+    log.Printf("status=%d body=%s", status, body)
+}
+```
+
+**反模式：** 用 `catch`/`recover`/`if err != nil` 无差别兜住所有失败。那会把「我传错了 https」和「网关暂时不可用」当成同一件事，结果要么重试一个永不会成功的请求，要么把真正的参数错误静默吞掉。
+
+#### 为什么统一（两个实测缺陷）
+
+1. **.NET 函数内自相矛盾**：原 `GetAsync` 里 url 解析失败走 `return (0, msg)`、scheme 非 http 走 `throw ArgumentException`——同一函数、同一类错误，两个通道。更糟的是原来的 `catch (Exception)` 会把 SDK **自身的编程错误**（如误用 `HttpClient` API 抛的 `InvalidOperationException`）也吞成 `(0, message)`，**真 bug 被伪装成网络故障**。现已改为只捕获 `HttpRequestException` 与 `OperationCanceledException`，其余冒泡。
+2. **Go 静默降级**：原 `Get` 对非 http target 返回 `(0, "only plain http...")`，与真正的网络失败（连接失败、超时）**返回值完全同形**，调用方无法区分。现在编程错误走第三个返回值 `err`。
+
+一致性由 `tools/check_sdk_contract.py` 在 CI 断言（**不依赖任何编译器**——.NET/Java 的编译门依赖 SDK 预装，历史上 .NET 正是唯一「改了没人编译」的那个）。
+
 ### 限制表（实测结论）
 
 | 事项 | 行为 |
@@ -68,6 +104,9 @@ Node 见 `tools/ipp_sdk_node.js`、Go 见 `tools/ipp_sdk_go.go`、.NET 见 `tool
 | 免费池水位 | 常态 0（公网存活率极低）；`tier=free` 池空时正确 503 |
 | `tier=free`＋`Authorization`/`Cookie` | 403（D1：匿名共享出口拒收凭据，防泄露给陌生出口；网关自有 `X-API-Key` 不受影响） |
 | 鉴权（D3 缺省开门） | 无 `X-Api-Key` 头即 403；开发带 `default_key`，生产换真 Key（SDK 缺省已带） |
+| `API_KEY`（OPT-R12 B1） | 设了它就用它作默认租户 Key，**`default_key` 立即 403 失效**；未设则沿用 `default_key`（仅本机开发）。误配（空串／等于 `default_key`）fail-closed：全部 403 |
+| `REQUIRE_API_KEY=0`（OPT-R12 实测澄清） | ⚠️ **不等于「无鉴权」**。实测无头请求返回 **200** 并拿到完整代理服务——无头被静默补成默认租户（qps/并发 10000/10000），故其语义是「**全网共享一个满额身份**」。仅限本机开发／隔离网络 |
+| 危险组合告警（OPT-R12 A1） | 弱默认 Key ＋ 满配额 ＋ 非回环监听三者同时成立时启动打 `WARN` 并给出整改动作；缺一不告警 |
 | 局域网敞口 | 缺省 `127.0.0.1:8916` 仅回环（D3 已收紧）；需局域网/容器可达时显式 `GATEWAY_ADDR=0.0.0.0:8916`，多机走 WireGuard 后绑 WG 地址 |
 | 公网目标经免费节点 | 目标必须公网可达（免费节点回连你内网必失败） |
 | Windows 网关进程 | 约 5 分钟有序退出一次（已知），重起即恢复；生产跑 Linux |
@@ -133,6 +172,41 @@ Observe: Grafana `:3000` (5 panels); `:9091/metrics` (16 groups); `SELECT count(
 
 Node `tools/ipp_sdk_node.js`, Go `tools/ipp_sdk_go.go`, .NET `tools/ipp_sdk_dotnet.cs`, Java `tools/ipp_sdk_java.java` (self-tests never auto-run; run manually only while gateway/mocks are alive).
 
+#### SDK error contract (OPT-R10 C1/C2 — unified across all 5 SDKs)
+
+**Two failure classes, two channels.** This was previously wrong in .NET and Go (see "Why unified" below).
+
+| Failure class | Meaning | Channel per language |
+| ------------- | ------- | --------------------- |
+| **Programming error** | You passed a bad url | Python `raise ValueError` / Java `IllegalArgumentException` / Node `throw Error` / **.NET `ArgumentException`** / **Go `return err`** (third return value; status is always 0) |
+| **Network/gateway failure** | Connect failure, timeout, 503 retries exhausted | **Never throws** — returns status=0 with the diagnostic in `body` |
+
+There is currently exactly one programming error: **scheme is not http**. The gateway is a reverse-style egress router and does **not** do CONNECT tunnelling (see E7 in `docs/SPIKE_R2.md`), so an `https://` target can never succeed.
+
+```go
+status, body, err := c.Get("http://httpbin.org/ip", nil, 1)
+if err != nil {
+    // Programming error: you passed a bad url (e.g. https).
+    // Do NOT retry — retrying a request that can never succeed just burns quota.
+    return err
+}
+if status != 200 {
+    // Network/gateway failure: an expected transient fault. Backoff/retry
+    // policy is yours to choose. The diagnostic is in body — don't swallow it
+    // with a catch-all, or you lose observability.
+    log.Printf("status=%d body=%s", status, body)
+}
+```
+
+**Anti-pattern:** a blanket `catch` / `recover` / `if err != nil` that treats every failure alike. It conflates "I passed https by mistake" with "the gateway is briefly down", so you either retry something that can never succeed or silently swallow a real caller bug.
+
+#### Why unified (two measured defects)
+
+1. **.NET contradicted itself inside one function**: `GetAsync` returned `(0, msg)` when url parsing failed but threw `ArgumentException` when the scheme wasn't http — same function, same error class, two channels. Worse, the original `catch (Exception)` also swallowed the SDK's **own** programming errors (e.g. an `InvalidOperationException` from misusing the `HttpClient` API) as `(0, message)`, **disguising real bugs as network faults**. It now catches only `HttpRequestException` and `OperationCanceledException`; everything else bubbles up.
+2. **Go degraded silently**: `Get` returned `(0, "only plain http...")` for a non-http target — **shape-identical** to a genuine network failure, so callers could not tell them apart. Programming errors now go through the third `err` return value.
+
+Consistency is asserted in CI by `tools/check_sdk_contract.py`, which needs **no compiler** — the .NET/Java compile gates depend on preinstalled SDKs, and .NET was historically the one language nobody ever compiled.
+
 ### Limits (drill conclusions)
 
 | Item | Behavior |
@@ -143,6 +217,9 @@ Node `tools/ipp_sdk_node.js`, Go `tools/ipp_sdk_go.go`, .NET `tools/ipp_sdk_dotn
 | Free pool level | usually 0 (tiny public survival); `tier=free` correctly 503 when empty |
 | `tier=free` + `Authorization`/`Cookie` | 403 (D1: anonymous shared egress refuses credentials, blocks leaks to stranger exits; the gateway's own `X-API-Key` unaffected) |
 | Auth (D3 gate on by default) | headerless requests get 403; send dev `default_key`, production uses real keys (SDK sends one by default) |
+| `API_KEY` (OPT-R12 B1) | when set, it becomes the default tenant's key and **`default_key` immediately stops authenticating (403)**; when unset, `default_key` remains for local dev only. Misconfiguration (empty / equal to `default_key`) is **fail-closed**: every request 403 |
+| `REQUIRE_API_KEY=0` (OPT-R12, measured) | ⚠️ **is NOT "no auth"**. Measured: a headerless request returns **200** with full proxy service — the gateway silently substitutes the default tenant (qps/concurrency 10000/10000), so the real semantics are "**the whole network shares one full-rate identity**". Local dev / isolated networks only |
+| Dangerous-config warning (OPT-R12 A1) | warns at startup when weak default key + sentinel quota + **non-loopback** listen all hold at once, listing remediation; silent when any one does not |
 | LAN exposure | default `127.0.0.1:8916` loopback-only (tightened by D3); override `GATEWAY_ADDR=0.0.0.0:8916` for LAN/containers, multi-host binds the WireGuard address after meshing |
 | Public targets via free nodes | target must be publicly reachable (free nodes can't dial your intranet) |
 | Windows gateway process | orderly exit ~every 5 min (known), restart recovers; production runs Linux |

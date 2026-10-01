@@ -1,0 +1,43 @@
+// ============================================================================
+// OPT-R9 A3：.NET SDK 编译验证用的**最小工程壳**
+// ============================================================================
+// 用途：让 CI 能真正**编译** `tools/ipp_sdk_dotnet.cs`（此前该文件从未被任何
+//       构建系统碰过——仓库既无 `.csproj`，CI 也只跑 `python3 compileall`）。
+//
+// 为何需要它：审阅发现的历史破损——`ipp_sdk_dotnet.cs` 的文件头写
+// `dotnet run -- --self-test`，而无 `.csproj` 时该命令直接报错。修文档不如
+// 让代码**可编译**，编译通过则「类名/签名/语法」这类问题在 CI 就被挡住。
+//
+// 为何不把 SDK 移进本目录：SDK 的对外用法是「把单个 .cs 文件加进你的项目」，
+// 移动会改变它的分发形态。`<Compile Include="..\ipp_sdk_dotnet.cs" />`
+// **引用**原文件而不复制，两处内容永远一致。
+//
+// 这不是给用户用的发布包：你写应用时把 `tools/ipp_sdk_dotnet.cs` 加进你自己的
+// `.csproj` 即可，不需要本壳。
+// ============================================================================
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net8.0 LTS：CI 的 ubuntu-latest runner 自带该 SDK，无需额外安装。 -->
+    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      可空引用类型：SDK 未使用 nullable 注解，关掉可避免数百条无意义告警
+      淹没真正的问题（我们要让 CI 只在「真编译错误」时红）。
+    -->
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- 该壳只做编译验证，不需要产出可分发程序集。 -->
+    <OutputType>Library</OutputType>
+    <AssemblyName>IppSdkCompileCheck</AssemblyName>
+    <RootNamespace>IppSdkCompileCheck</RootNamespace>
+    <!-- 抑制「未使用变量/字段」等分析器噪音，只保留编译错误。 -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS0649;CS0169;CS0414</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 引用 SDK 源文件本身（不复制，改一处即两处生效）。 -->
+    <Compile Include="..\ipp_sdk_dotnet.cs" Link="ipp_sdk_dotnet.cs" />
+  </ItemGroup>
+
+</Project>

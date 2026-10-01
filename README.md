@@ -11,9 +11,11 @@ IPProxyPool 是基于 Pingora 的企业级代理网关：智能选路（LinUCB�
 
 - 数据面：`:8916`（Pingora 五阶段：鉴权→选路→转发→计量→遥测），P99 dev 基线约 65ms（Windows debug 参考值，非生产承诺）。
 - 控制面：prober/prewarmer/sweep/arbitrage/free_pool 后台 ticker＋supervisor 托管。
-- 质量：201 单测＋4 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。
+- 质量：274 单测＋4 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。数字口径见 [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md)。
+- 第三方数据：启用 GeoLite2（`GEOIP_MMDB_PATH`）即须随部署附带 **MaxMind 署名**（CC BY-SA 4.0 强制）——可复制文本见 [`docs/OPERATION.md` §第三方数据署名](docs/OPERATION.md#第三方数据署名--third-party-data-attribution)。
 
-文档：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（架构）· [`docs/TECHNICAL.md`](docs/TECHNICAL.md)（技术）· [`docs/COMPONENTS.md`](docs/COMPONENTS.md)（组件）· [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)（用户手册）· [`docs/OPERATION.md`](docs/OPERATION.md)（运维）· [`CONTRIBUTING.md`](CONTRIBUTING.md)（贡献）。
+文档：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（架构）· [`docs/TECHNICAL.md`](docs/TECHNICAL.md)（技术）· [`docs/COMPONENTS.md`](docs/COMPONENTS.md)（组件）· [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)（用户手册）· [`docs/FEATURES.md`](docs/FEATURES.md)（功能）· [`docs/USAGE.md`](docs/USAGE.md)（上手与 SDK 错误契约）· [`docs/OPERATION.md`](docs/OPERATION.md)（运维）· [`docs/DATAFLOW.md`](docs/DATAFLOW.md)（数据流）· [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md)（质量基线，测试数字的唯一权威来源）· [`docs/OPEN-SOURCE.md`](docs/OPEN-SOURCE.md)（开源与许可）· [`CONTRIBUTING.md`](CONTRIBUTING.md)（贡献）。
+> [`manual/`](manual/README.md) 是 v1 阶段设计草稿的归档区，**已废弃、勿据此部署**。
 
 ### 快速开始（5 步，详见用户手册）
 
@@ -46,9 +48,11 @@ IPProxyPool is a Pingora-based enterprise proxy gateway: smart routing (LinUCB +
 
 - Data plane: `:8916` (Pingora five phases: auth → route → forward → meter → telemetry); P99 dev baseline ~65ms (Windows debug reference, not a production commitment).
 - Control plane: prober/prewarmer/sweep/arbitrage/free_pool background tickers, supervised.
-- Quality: 201 unit tests + 4 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage self-healing).
+- Quality: 274 unit tests + 4 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage self-healing). Numbers are canonical in [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md).
+- Third-party data: enabling GeoLite2 (`GEOIP_MMDB_PATH`) requires shipping the **MaxMind attribution** with your deployment (mandated by CC BY-SA 4.0) — copy-paste text in [`docs/OPERATION.md`](docs/OPERATION.md#第三方数据署名--third-party-data-attribution).
 
-Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) · [`docs/OPERATION.md`](docs/OPERATION.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · hands-on [`docs/HANDS-ON.md`](docs/HANDS-ON.md) · arch [`docs/SYSTEM-ARCHITECTURE.md`](docs/SYSTEM-ARCHITECTURE.md) · features [`docs/FEATURES.md`](docs/FEATURES.md) · dataflow [`docs/DATAFLOW.md`](docs/DATAFLOW.md) · usage [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) · oss [`docs/OPEN-SOURCE.md`](docs/OPEN-SOURCE.md).
+Docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) · [`docs/OPERATION.md`](docs/OPERATION.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · hands-on [`docs/HANDS-ON.md`](docs/HANDS-ON.md) · arch [`docs/SYSTEM-ARCHITECTURE.md`](docs/SYSTEM-ARCHITECTURE.md) · features [`docs/FEATURES.md`](docs/FEATURES.md) · dataflow [`docs/DATAFLOW.md`](docs/DATAFLOW.md) · usage [`docs/USAGE.md`](docs/USAGE.md) · quality [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md) · oss [`docs/OPEN-SOURCE.md`](docs/OPEN-SOURCE.md).
+> [`manual/`](manual/README.md) is an archived v1 design-draft area — **deprecated, do not deploy from it**.
 
 ### Quickstart (5 steps, see user manual)
 

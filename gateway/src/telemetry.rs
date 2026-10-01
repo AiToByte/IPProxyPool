@@ -14,6 +14,12 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+use crate::metrics::MetricsRegistry;
+
+/// OPT-R15：`telemetry_sink_up{backend="redis"}` 的 backend 标签。
+/// Redis 挂了 ⇒ 数据进不了 stream，`ChSinkWorker` 也就无源可读，整条遥测链断在第一级。
+pub const SINK_BACKEND_REDIS: &str = "redis";
+
 /// Data-plane channel capacity: full queue drops, never blocks (GW-2a).
 pub const TELEMETRY_CHANNEL_CAP: usize = 10_000;
 /// Batch flush thresholds (GW-2a).
@@ -152,6 +158,9 @@ pub struct TelemetryWorker {
     ///（`batch_len - queued`，含 `queued==0` 全失败分支）单独累加于此，
     /// 不再按整批 `batch_len` 累加。通道满另计 `channel_dropped`。
     flush_dropped: Arc<AtomicU64>,
+    /// OPT-R15：落地端健康上报口（与 `flush_dropped` 同一个 `MetricsRegistry`）。
+    /// 只在真正与 Redis 交互成功/失败时调用——序列化失败不算落地端问题。
+    metrics: Arc<MetricsRegistry>,
     /// R2-4 空 id 回填序号（正常只走 emit 配号；直调 worker 的单测/旧代码走这里）。
     fallback_seq: u64,
 }
@@ -167,6 +176,7 @@ impl TelemetryWorker {
         redis_conn: ConnectionManager,
         stream_key: String,
         flush_dropped: Arc<AtomicU64>,
+        metrics: Arc<MetricsRegistry>,
     ) -> Self {
         Self {
             receiver,
@@ -175,6 +185,7 @@ impl TelemetryWorker {
             batch_size: TELEMETRY_BATCH_SIZE,
             flush_interval: TELEMETRY_FLUSH_INTERVAL,
             flush_dropped,
+            metrics,
             fallback_seq: 0,
         }
     }
@@ -235,11 +246,15 @@ impl TelemetryWorker {
         // 漏计）：上面已单独计数，这里打 warn 后返回；空 pipe 不 query。
         if queued == 0 {
             log::warn!("[TelemetryWorker] serialize failed, dropped {batch_len} events");
+            // OPT-R15：序列化失败**不**标记落地端不健康——那是网关自己的问题，
+            // 标到 Redis/ClickHouse 上会把责任指错方向，也无法靠改依赖解决。
             return;
         }
         let mut conn = self.redis_conn.clone();
         if let Err(first) = pipe.query_async::<()>(&mut conn).await {
             log::warn!("[TelemetryWorker] flush failed ({first:?}), retrying once");
+            // OPT-R15：首次失败即置 `up=0`（语义是"最近一次尝试"，告警侧用持续时间过滤毛刺）。
+            self.metrics.mark_sink_failed(SINK_BACKEND_REDIS);
             tokio::time::sleep(TELEMETRY_FLUSH_RETRY_DELAY).await;
             let mut retry_conn = self.redis_conn.clone();
             if let Err(second) = pipe.query_async::<()>(&mut retry_conn).await {
@@ -248,6 +263,9 @@ impl TelemetryWorker {
                 self.flush_dropped.fetch_add(queued, Ordering::Relaxed);
                 log::error!("[TelemetryWorker] retry failed, dropped {queued} events: {second:?}");
             }
+        } else {
+            // OPT-R15：XADD 成功——Redis 这一级健康。
+            self.metrics.mark_sink_ok(SINK_BACKEND_REDIS);
         }
     }
 }
@@ -396,7 +414,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<TelemetryEvent>(TELEMETRY_CHANNEL_CAP);
         // OPT-4：live 工人持独立计数器（与线上 main 的共享装配语义一致，单测不污染全局）。
         let dropped = Arc::new(AtomicU64::new(0));
-        let worker = TelemetryWorker::new(rx, manager.clone(), stream_key.clone(), dropped);
+        let worker = TelemetryWorker::new(
+            rx,
+            manager.clone(),
+            stream_key.clone(),
+            dropped,
+            Arc::new(MetricsRegistry::new()),
+        );
         tokio::spawn(worker.run());
         // R2-4：publisher 持独立通道计数器（live 只断言落库，不污染 flush 口径）。
         TelemetryPublisher::new(tx, Arc::new(AtomicU64::new(0))).emit(sample());

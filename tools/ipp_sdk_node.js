@@ -53,10 +53,20 @@ class IPPClient {
   }
 
   async get(url, extraHeaders = {}, retries = 1) {
-    // 经网关 GET 公网 URL。返回 {status, body:Buffer}。503 延迟 1s 重试一次。
+    /**
+     * 经网关 GET 公网 URL。返回 {status, body:Buffer}。503 延迟 1s 重试一次。
+     *
+     * 错误契约（OPT-R10 C1，与 Python/Java/Go/.NET SDK 一致）：
+     *   - **编程错误**（调用方把 url 用错了）⇒ 抛异常。当前一种：
+     *     protocol 非 http:（网关不做 CONNECT 隧道，见 docs/SPIKE_R2.md 的 E7
+     *     结论）。不重试——重试一个永远不可能成功的请求只是浪费配额。
+     *   - **网络/网关失败**（连接失败、超时、503 重试耗尽）⇒ **不抛**，
+     *     返回 {status:0, body:<诊断信息>}。可预期的瞬时故障，退避/重试
+     *     策略由调用方决定；不要写成 catch-all 吞掉，那会丢掉可观测性。
+     */
     const t = new URL(url);
     if (t.protocol !== "http:") {
-      throw new Error("only plain http targets are supported (no CONNECT tunneling)");
+      throw new Error("only plain http targets are supported (no CONNECT tunneling), got protocol: " + t.protocol);
     }
     const targetHost = t.host;
     const path = (t.pathname || "/") + (t.search || "");

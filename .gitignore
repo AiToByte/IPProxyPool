@@ -20,6 +20,16 @@ log/*.log
 log/*.txt
 *.log
 
+# log/ 下的**编译产物**不入库（OPT-R15 提交前审查发现）：
+# 性能对比（如 R11 B1 的 pre-B1 / post-B1）会把 release 二进制 `cp` 到 log/ 做前后
+# 对照，每个约 13 MB。此前无 `*.exe` 规则，`git add -A` 会把这两个 13MB 的构建产物
+# 直接提交进库（见 EXEC_LOG 步骤 47 前审查）。
+# 只限定 log/，**不写全局 `*.exe`**——全局规则会误伤将来可能需要入库的
+# Windows 工具/安装器等合法二进制。
+log/*.exe
+log/*.dll
+log/*.pdb
+
 # --- Python ---
 __pycache__/
 *.py[cod]

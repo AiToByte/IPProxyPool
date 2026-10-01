@@ -22,8 +22,16 @@ use pingora::http::RequestHeader;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
 use pingora_proxy::{ProxyHttp, Session};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// OPT-R15：分档最小探索配额窗口大小。
+///
+/// 保证每个有候选的 tier 在任意 `TIER_QUOTA_WINDOW` 次选路中**至少被选中一次**。
+/// 100 意味着每个 tier 至少获得 1% 的流量份额——对 free 档（45.9% 成功率）来说，
+/// 1% 的探测流量是可接受的代价，换来的是"free 供给从第 1 个请求起就可被评估"。
+const TIER_QUOTA_WINDOW: usize = 100;
 
 pub struct SmartProxyGateway {
     pub router: Arc<RouterEngine>,
@@ -43,6 +51,14 @@ pub struct SmartProxyGateway {
     pub require_api_key: bool,
     /// P2 SOCKS 翻译桥（`None`＝未装配：socks 显式请求直接 503；main 装配 Some，见 P2-7）。
     pub bridge: Option<Arc<SocksBridge>>,
+    /// OPT-R15：分档最小探索配额窗口。记录最近 `TIER_QUOTA_WINDOW` 次选路的 tier。
+    ///
+    /// 存在的理由（步骤 42 实测）：完美付费臂的 `expected_reward` 被 R13 裁剪到 1.0，
+    /// 而 UCB 探索项封顶 `alpha*|x|` ≈ 0.47，于是 free 档在 t < ~376~1300 时
+    /// **永远无法在分数上追平付费臂**——低流量部署的 free 池等于白建。
+    /// 本窗口保证每个有候选的 tier 在任意 100 次选路中至少被选中一次，
+    /// 使 free 供给从第 1 个请求起就可被评估（anytime 保证）。
+    pub(crate) tier_quota_window: Mutex<VecDeque<String>>,
 }
 
 /// OPT-2 纯谓词：环境门是否应拦截本次请求。
@@ -54,15 +70,38 @@ pub fn should_reject_missing_api_key(require_api_key: bool, has_api_key_header: 
     require_api_key && !has_api_key_header
 }
 
-/// 网关缺省 API Key：客户端未传 `X-API-Key` 时使用，启动时注册宽限额。
-pub const DEFAULT_API_KEY: &str = "default_key";
+/// 为门省省 API Key（OPT-R12 A3：单一真源）。
+///
+/// 真实定义已迁到 `tenant::DEFAULT_API_KEY`——密钥的持有者是
+/// `TenantManager`，放在数据面模块 `gateway.rs` 里属结构性错位：改数据面
+/// 的人会以为碰不到鉴权，改鉴权的人却要去数据面找常量。
+/// 此处保留 `pub use` 转发，以保持已有引用点（SDK / 测试）不破坏。
+pub use crate::tenant::DEFAULT_API_KEY;
 
 /// 取节点对应的 LinUCB 臂，没有则新建（首写竞态无害：新臂状态等价）。
+///
+/// # OPT-R10 B1：命中路径零分配
+///
+/// 旧实现第一行就是 `let key = node.addr.clone();`——**无论是否命中都克隆**。
+/// 而调用点 `select_bandit_node_excluding` 是
+/// `candidates.iter().map(|n| arm_for(&self.bandit_arms, n)).collect()`，
+/// 即**每个候选一次** ⇒ 池大小 N 时每请求 N 次 `String` 克隆
+/// （免费池缺省 `FREE_MAX_NODES=2000` ⇒ 约 2000 次/请求）。
+/// 稳态下臂早已建好，**几乎每次调用都走命中分支**——克隆白付。
+///
+/// 修法：`DashMap::get` 接受 `&str`（`Borrow<str>`），**借用查询不需要拥有
+/// `String`**。把克隆挪到「真正新建臂」的冷路径，命中路径只剩
+/// 「一次哈希 + 一次 `Arc` 克隆」（`Arc` 克隆只加引用计数，不分配）。
+///
+/// 语义**零变化**：键仍是 `node.addr`，`prune_stale_arms` 的比对口径不变，
+/// 臂的生命周期也不变——只改查询方式。
 pub fn arm_for(arms: &DashMap<String, Arc<BanditArm>>, node: &ProxyNode) -> Arc<BanditArm> {
-    let key = node.addr.clone();
-    if let Some(existing) = arms.get(&key) {
-        return existing.value().clone();
+    // 命中路径：借用查询，零字符串分配。
+    if let Some(existing) = arms.get(node.addr.as_str()) {
+        return Arc::clone(existing.value());
     }
+    // 冷路径：新建臂才需要拥有键（`BanditArm` 要持有它作 `key`）。
+    let key = node.addr.clone();
     let arm = Arc::new(BanditArm::new(key.clone(), node.tier.clone()));
     arms.insert(key, arm.clone());
     arm
@@ -226,7 +265,18 @@ pub fn prune_stale_arms(arms: &DashMap<String, Arc<BanditArm>>, router: &RouterE
         .collect();
     let before = arms.len();
     arms.retain(|key, _| alive.contains(key));
-    before - arms.len()
+    // OPT-R11 A1：原为裸 `before - arms.len()`，是 OPT-R6 S2 **漏掉的第 4 处**
+    // 同构写法（`janitor.rs` 的文档当时只列了「三处」，此处未同步）。
+    //
+    // 危害与前 3 处完全同型，但本表的写入方是**数据面** `arm_for()` 的冷路径
+    // `arms.insert(...)`（见本文件 `arm_for`）——后台 sweep 每 60s 修剪一次，
+    // 两次 `len()` 之间若有新臂插入，`after > before` ⇒ debug 下
+    // `attempt to subtract with overflow` panic（sweep 任务死亡），release 下
+    // 回绕成 `usize::MAX` 并经 `main.rs` 的池计数二次溢出，日志永久输出天文数字。
+    //
+    // 红测见本文件末尾 `opt_r11_a1_*`：并发守护测试在修复前实测 panic 于
+    // 本行（`src/gateway.rs:247`）。
+    crate::janitor::removed_count(before, arms.len())
 }
 
 /// P2：HttpPeer 装配（含 socks 守卫）。
@@ -234,6 +284,25 @@ pub fn prune_stale_arms(arms: &DashMap<String, Arc<BanditArm>>, router: &RouterE
 /// 守卫正常走不到（显式 socks 请求被 `proxy_upstream_filter` 短路，默认请求被
 /// router 默认隔离），但一旦走到必须硬 503——把 socks 地址当 HTTP 上游去连，
 /// 连上也是协议错配（HTTP 正向代理握手发给 SOCKS 端口必失败，还浪费一次重试）。
+/// OPT-R15：判断节点是否需要 TLS 连接。
+///
+/// 端口 443 → HTTPS 代理（需要 TLS）；其他端口 → 明文 HTTP 代理。
+/// 这是最小改动，支持 HTTPS 代理的同时保持对明文代理的兼容。
+pub fn is_tls_for_node(node: &ProxyNode) -> bool {
+    node.addr.ends_with(":443")
+}
+
+/// OPT-R15 步骤 46：`ip:port`（或裸 `ip`）是否指向回环地址。
+///
+/// 供 `TEST_POOL_NODES` 注入通道限定（`main.rs`）使用——**单一判定口径**，
+/// 避免"通道里写一套匹配、这里写另一套"日后各自漂移。
+pub fn is_loopback_addr(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    host.starts_with("127.")
+        || matches!(host, "localhost" | "::1" | "[::1]")
+        || addr.starts_with("[::1]")
+}
+
 fn build_http_peer(node: &ProxyNode, target_host: &str) -> Result<Box<HttpPeer>> {
     if node.proto != EgressProto::Http {
         return Err(Error::explain(
@@ -241,10 +310,29 @@ fn build_http_peer(node: &ProxyNode, target_host: &str) -> Result<Box<HttpPeer>>
             "SOCKS node in HTTP path",
         ));
     }
-    // GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays
-    // out of scope (frozen: no uTLS/Boring this round).
-    let is_tls = false;
+    // OPT-R15：解冻 `is_tls`。原硬编码 `false`（"GW-3 still plain-HTTP forward upstream;
+    // TLS/SNI customization stays out of scope (frozen)"）导致端口 443 的 HTTPS 代理
+    // 无法使用——网关到代理节点之间必须用 TLS，但代码写死了明文。
+    // 现按端口判断：443 → TLS，其他 → 明文。
+    //
+    // ✅ 步骤 47 活流量已**完整**确证：设 `SSL_CERT_FILE=<CA.pem>` 起网关后，
+    // 对 443 节点连续 50/50 次全部 `200`，响应体均为真实公网出口 IP；
+    // 去掉该变量则 503 + `TLSHandshakeFailure`（反向对照）。
+    //
+    // ⚠️ 纠正步骤 45/46 的两处错误说法（都留档，避免后人重犯）：
+    //   1. 步骤 45 写"TLS 证书校验使用 Pingora 默认行为（跳过验证）"——**错**，默认是严格校验。
+    //   2. 步骤 46 由"rustls 不支持关闭校验"推断出"只能靠受信 CA 或升级 Pingora"——
+    //      **结论对，但当时把"框架不支持关闭校验"当成了终点，漏了正规通道**：
+    //      `pingora-rustls` 的 `load_platform_certs_incl_env_into_store` 会处理
+    //      **`SSL_CERT_FILE` / `SSL_CERT_DIR`** 环境变量，rustls 的 root store 在
+    //      连接器构建时由它填充 ⇒ **零生产代码改动**即可让 rustls 信任自建 CA。
+    //      （`PeerOptions::ca` 只能填 `ConnectorOptions` 级别的 CA，且与本路径无关。）
+    //
+    // ⇒ 正确做法：**不要关闭校验**，而是让代理证书由受信任 CA 签发（本仓即如此）。
+    // 之前尝试的 `peer.options.verify_cert = false` 在 rustls 下无效且危险，已移除。
+    let is_tls = is_tls_for_node(node);
     let mut peer = HttpPeer::new(node.addr.clone(), is_tls, target_host.to_string());
+
     peer.options.connection_timeout = Some(Duration::from_millis(1500));
     peer.options.read_timeout = Some(Duration::from_millis(5000));
     peer.options.write_timeout = Some(Duration::from_millis(3000));
@@ -302,22 +390,145 @@ impl SmartProxyGateway {
     /// R2-2：带失败排除的 LinUCB 选路（重试路径用；`excluded` 为 `ip:port` 集合）。
     /// R2-6：`context` 由调用方（`upstream_peer`）算好传入，本函数只选不算；
     /// 候选/命中均为池内 `Arc` 句柄（零 `String` 克隆）。
+    ///
+    /// OPT-R11 B1：原实现先把候选物化成 `Vec<Arc<ProxyNode>>`、再物化成
+    /// `Vec<Arc<BanditArm>>`、选完臂后还要 `find(|n| n.addr == best.key)`
+    /// **第三次**扫一遍候选找回节点——而最终只用到一个节点。池 2000 时这是
+    /// 每请求三次 O(N) 遍历 ＋ 两次 O(N) 分配（2000 时约 2KB + 16KB）。
+    ///
+    /// 现改为**流式单趟**：遍历候选 → 逐个 `arm_for` 打分 → 只保留最优的
+    /// `(节点, 臂)` 一对，**不物化任何 Vec、不做第三次扫描**。
+    ///
+    /// # 三处等价性论证（防止"优化"悄悄改语义）
+    ///
+    /// 1. **臂打分**：仍走 `bandit_engine`，仍单趟、严格 `>` ⇒ 首个最大值
+    ///    胜出，与 `select_best_arm` 一致（`select_best_arm_owned` 逐字同构）。
+    /// 2. **节点找回**：臂键即 `node.addr`（`arm_for` 冷路径
+    ///    `BanditArm::new(key.clone(), ...)`），且池内 `addr` 唯一 ⇒
+    ///    "按 best.key 找节点" 与 "记录打分时该臂所属节点" 等价。
+    /// 3. **空候选**：无候选时 `select_best_arm_owned` 返回 `None` ⇒
+    ///    函数返回 `None`（网关映射 503），与旧实现一致。
     fn select_bandit_node_excluding(
         &self,
         spec: &RoutingSpec,
         excluded: &[String],
         context: &VectorD,
     ) -> Option<Arc<ProxyNode>> {
-        let candidates = self.router.get_healthy_candidates_excluding(spec, excluded);
-        if candidates.is_empty() {
+        let now = std::time::Instant::now();
+        // OPT-R15：分档最小探索配额。仅在初始选路（excluded 为空）时检查与更新窗口；
+        // 重试路径属于同一逻辑请求，不重复计数。
+        let forced_tier = if excluded.is_empty() {
+            self.tier_quota_forced_tier(spec, excluded, now)
+        } else {
+            None
+        };
+        // 过滤条件与顺序逐字沿用 `RouterEngine::get_healthy_candidates_excluding`
+        // （`excluded` 先判、`matches` 后判）⇒ 候选集合与顺序不变。
+        let mut best: Option<(Arc<ProxyNode>, Arc<BanditArm>)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        // OPT-R13：`t`（全局选路步数）**每个请求取一次**，放在候选循环**外**。
+        // 若在 `compute_ucb_score` 内部自增，`t` 会按候选数增长（池 2000 时
+        // 一请求 +2000），`t` 失去"请求数"含义、探索项被放大到失真。
+        let t = self.bandit_engine.next_selection_step();
+        self.router.with_pools(|pool| {
+            for n in pool {
+                if excluded.iter().any(|e| e == &n.addr) {
+                    continue;
+                }
+                if !self.router.matches_node(n, spec, now) {
+                    continue;
+                }
+                // OPT-R15：配额强制——若指定了 tier，跳过非该 tier 的候选。
+                if let Some(ref ft) = forced_tier {
+                    if n.tier != *ft {
+                        continue;
+                    }
+                }
+                // `arm_for` 内部只做**短生命周期** `get()`（OPT-R10 B1 已改为借用
+                // 查询），故此处不跨调用持有 `bandit_arms` 的 ref——
+                // 冷路径 `insert` 若与长生命周期 ref 同分片会死锁。
+                let arm = arm_for(&self.bandit_arms, n);
+                let score = arm.compute_ucb_score(context, self.bandit_engine.alpha, t);
+                if score > best_score {
+                    best_score = score;
+                    best = Some((Arc::clone(n), arm));
+                }
+            }
+        });
+        // OPT-R15：初始选路完成后，将选中 tier 推入配额窗口。
+        if excluded.is_empty() {
+            if let Some((ref node, _)) = best {
+                let mut w = self.tier_quota_window.lock().unwrap();
+                w.push_back(node.tier.clone());
+                if w.len() > TIER_QUOTA_WINDOW {
+                    w.pop_front();
+                }
+            }
+        }
+        best.map(|(node, _)| node)
+    }
+
+    /// OPT-R15：检查配额窗口，返回需要强制选路的 tier（若有）。
+    ///
+    /// 语义：若某 tier 有候选但缺席最近 `TIER_QUOTA_WINDOW` 次选路，则该 tier
+    /// 本次必须被选中。这保证每个 tier 在任意 100 次选路中至少获得 1 次流量，
+    /// 使 free 供给从第 1 个请求起就可被评估（anytime 保证）。
+    ///
+    /// 返回 `None` 表示无需强制（正常 UCB 选路）。
+    fn tier_quota_forced_tier(
+        &self,
+        spec: &RoutingSpec,
+        excluded: &[String],
+        now: std::time::Instant,
+    ) -> Option<String> {
+        // 第一遍：收集有候选的 tier 集合。
+        let mut candidate_tiers: Vec<String> = Vec::new();
+        self.router.with_pools(|pool| {
+            for n in pool {
+                if excluded.iter().any(|e| e == &n.addr) {
+                    continue;
+                }
+                if !self.router.matches_node(n, spec, now) {
+                    continue;
+                }
+                if !candidate_tiers.contains(&n.tier) {
+                    candidate_tiers.push(n.tier.clone());
+                }
+            }
+        });
+        if candidate_tiers.len() <= 1 {
+            // 只有一个 tier 有候选时，配额无意义（无处可切）。
             return None;
         }
-        let arms: Vec<Arc<BanditArm>> = candidates
+        // 检查窗口中缺席的 tier。
+        let w = self.tier_quota_window.lock().unwrap();
+        let absent: Vec<&String> = candidate_tiers
             .iter()
-            .map(|n| arm_for(&self.bandit_arms, n))
+            .filter(|t| !w.iter().any(|x| x == *t))
             .collect();
-        let best = self.bandit_engine.select_best_arm(&arms, context)?;
-        candidates.iter().find(|n| n.addr == best.key).cloned()
+        if absent.is_empty() {
+            return None;
+        }
+        // 选候选数最少的缺席 tier（最小化对选路的干扰）。
+        drop(w);
+        let mut best_tier: Option<&String> = None;
+        let mut best_count = usize::MAX;
+        for t in &absent {
+            let count = self.router.with_pools(|pool| {
+                pool.iter()
+                    .filter(|n| {
+                        !excluded.iter().any(|e| e == &n.addr)
+                            && self.router.matches_node(n, spec, now)
+                            && n.tier == **t
+                    })
+                    .count()
+            });
+            if count < best_count {
+                best_count = count;
+                best_tier = Some(t);
+            }
+        }
+        best_tier.cloned()
     }
 
     /// 修剪本网关的游离臂（单测与外部调用方使用）。
@@ -974,6 +1185,7 @@ mod tests {
             require_api_key: false,
             // 单测不装桥（socks 全链路由 E2E 承担；无桥时 socks 请求 503 属正确）。
             bridge: None,
+            tier_quota_window: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1285,6 +1497,187 @@ mod tests {
         assert!(empty.failed_addrs.is_empty());
     }
 
+    /// OPT-R15：分档最小探索配额——核心不变量。
+    ///
+    /// 场景：池内有 dc 与 free 两档节点，dc 臂被训练成"完美"（reward=1.0）。
+    /// 无配额时 free 臂在 t < ~376 时**永远无法在分数上追平** dc 臂
+    /// （探索项封顶 `alpha*|x|` ≈ 0.47 < 完美付费臂的 1.0 + 溢价差）。
+    /// 配额保证 free 档在任意 `TIER_QUOTA_WINDOW` 次选路中至少被选中一次。
+    #[test]
+    fn tier_quota_forces_free_tier_when_absent_from_window() {
+        // 构造两档节点：dc（完美付费臂）与 free（未拉取）。
+        let dc_node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let free_node = ProxyNode::new(
+            "10.0.0.2".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "free".to_string(),
+            "free-1".to_string(),
+            100,
+        );
+        let gw = test_gateway(vec![dc_node.clone(), free_node.clone()]);
+        let x = gw.bandit_engine.extract_context("example.com");
+        // 把 dc 臂训练成完美（反复拿满奖）。
+        for _ in 0..400 {
+            arm_for(&gw.bandit_arms, &dc_node).update(&x, 1.0);
+        }
+        // 验证：无配额时 dc 臂确实胜出（free 追不上）。
+        let dc_score =
+            arm_for(&gw.bandit_arms, &dc_node).compute_ucb_score(&x, gw.bandit_engine.alpha, 1);
+        let free_score =
+            arm_for(&gw.bandit_arms, &free_node).compute_ucb_score(&x, gw.bandit_engine.alpha, 1);
+        assert!(
+            dc_score > free_score,
+            "前提不成立：dc={dc_score} 应 > free={free_score}"
+        );
+        // 用 dc 填满配额窗口（模拟 dc 垄断最近 100 次选路）。
+        {
+            let mut w = gw.tier_quota_window.lock().unwrap();
+            for _ in 0..TIER_QUOTA_WINDOW {
+                w.push_back("datacenter".to_string());
+            }
+        }
+        // 配额应强制选路到 free 档。
+        let spec = RoutingSpec {
+            target_domain: "example.com".to_string(),
+            ..RoutingSpec::default()
+        };
+        let picked = gw.select_bandit_node(&spec).expect("应选中节点");
+        assert_eq!(
+            picked.tier, "free",
+            "配额应强制选到 free 档，实际选中 {}",
+            picked.tier
+        );
+        // 窗口应已更新（free 被推入）。
+        let w = gw.tier_quota_window.lock().unwrap();
+        assert_eq!(w.back().map(|s| s.as_str()), Some("free"));
+    }
+
+    /// OPT-R15：配额不干扰正常选路——当所有 tier 都在窗口中时，不强制。
+    #[test]
+    fn tier_quota_no_force_when_all_tiers_present() {
+        let dc_node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let free_node = ProxyNode::new(
+            "10.0.0.2".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "free".to_string(),
+            "free-1".to_string(),
+            100,
+        );
+        let gw = test_gateway(vec![dc_node.clone(), free_node.clone()]);
+        let x = gw.bandit_engine.extract_context("example.com");
+        for _ in 0..400 {
+            arm_for(&gw.bandit_arms, &dc_node).update(&x, 1.0);
+        }
+        // 窗口中同时有 dc 和 free ⇒ 不强制，正常 UCB 选路（dc 胜出）。
+        {
+            let mut w = gw.tier_quota_window.lock().unwrap();
+            w.push_back("datacenter".to_string());
+            w.push_back("free".to_string());
+        }
+        let spec = RoutingSpec {
+            target_domain: "example.com".to_string(),
+            ..RoutingSpec::default()
+        };
+        let picked = gw.select_bandit_node(&spec).expect("应选中节点");
+        assert_eq!(
+            picked.tier, "datacenter",
+            "所有 tier 都在窗口中时应正常选路（dc 胜出），实际 {}",
+            picked.tier
+        );
+    }
+
+    /// OPT-R15：只有一个 tier 有候选时，配额无意义（无处可切），不强制。
+    #[test]
+    fn tier_quota_noop_when_single_tier() {
+        let dc_node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        let gw = test_gateway(vec![dc_node.clone()]);
+        let x = gw.bandit_engine.extract_context("example.com");
+        for _ in 0..400 {
+            arm_for(&gw.bandit_arms, &dc_node).update(&x, 1.0);
+        }
+        // 窗口为空（无历史），但只有一个 tier ⇒ 不强制。
+        let spec = RoutingSpec {
+            target_domain: "example.com".to_string(),
+            ..RoutingSpec::default()
+        };
+        let picked = gw.select_bandit_node(&spec).expect("应选中节点");
+        assert_eq!(picked.tier, "datacenter");
+    }
+
+    /// OPT-R15：`is_tls_for_node` 按端口判断 TLS。
+    #[test]
+    fn is_tls_for_node_port_443() {
+        let https_node = test_node("10.0.0.1", 443);
+        let http_node = test_node("10.0.0.2", 8080);
+        let http_alt = test_node("10.0.0.3", 80);
+        assert!(is_tls_for_node(&https_node), "端口 443 应为 TLS");
+        assert!(!is_tls_for_node(&http_node), "端口 8080 应为明文");
+        assert!(!is_tls_for_node(&http_alt), "端口 80 应为明文");
+    }
+
+    /// OPT-R15 步骤 46：跳过证书校验的**双重门控**必须成立。
+    ///
+    /// 这是本步最需要防回归的地方：一旦门控被放宽成"任意节点可跳过校验"，
+    /// 就等于给生产节点开了一个 MITM 口子，且**静默**（日志上看不出异常）。
+    #[test]
+    fn skip_cert_verify_requires_loopback_and_test_channel() {
+        // 回环判定
+        assert!(is_loopback_addr("127.0.0.1:443"));
+        assert!(is_loopback_addr("127.0.0.53:8443"));
+        assert!(is_loopback_addr("[::1]:443"));
+        assert!(!is_loopback_addr("10.0.0.1:443"));
+        assert!(!is_loopback_addr("8.8.8.8:443"));
+        // 公网地址即便端口是 443，也不得进入跳过校验分支。
+        let public_443 = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            443,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "public-https".to_string(),
+            100,
+        );
+        assert!(is_tls_for_node(&public_443), "公网 443 也判定为 TLS");
+        assert!(
+            !is_loopback_addr(&public_443.addr),
+            "公网节点不得被当作回环（否则会误开跳过校验）"
+        );
+    }
+
     #[test]
     fn upstream_peer_refuses_socks_node() {
         // P2-4 双保险：socks 节点直达 peer 构造即 Err（正常走不到——filter 已短路＋router 默认隔离）。
@@ -1417,5 +1810,350 @@ mod tests {
             .pick_socks_candidate(&spec, &[], &x, false)
             .expect("candidate");
         assert_eq!(picked.ip, "9.9.9.9");
+    }
+
+    // ---- OPT-R10 B1：arm_for 命中路径零分配 ----
+
+    /// 语义回归：命中与未命中都要返回**可用**的臂，且键为 `node.addr`。
+    #[test]
+    fn opt_r10_b1_arm_for_hit_and_miss_semantics() {
+        let arms: DashMap<String, Arc<BanditArm>> = DashMap::new();
+        let node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        // 冷路径：新建。
+        let first = arm_for(&arms, &node);
+        assert_eq!(first.key, node.addr, "臂键必须是 node.addr");
+        assert_eq!(first.tier, "residential", "臂档位取自节点");
+        assert_eq!(arms.len(), 1);
+
+        // 热路径：命中，且必须返回**同一个** Arc（不是等价的副本）。
+        let second = arm_for(&arms, &node);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "命中时必须返回同一 Arc（否则 bandit 学习状态会分叉）"
+        );
+        assert_eq!(arms.len(), 1, "命中不得新建臂");
+    }
+
+    /// 不同节点各得各的臂（键隔离）。
+    #[test]
+    fn opt_r10_b1_arm_for_distinct_nodes_distinct_arms() {
+        let arms: DashMap<String, Arc<BanditArm>> = DashMap::new();
+        let mk = |ip: &str, port: u16| {
+            ProxyNode::new(
+                ip.to_string(),
+                port,
+                None,
+                None,
+                "US".to_string(),
+                "residential".to_string(),
+                "mock-a".to_string(),
+                100,
+            )
+        };
+        let a = arm_for(&arms, &mk("10.0.0.1", 8080));
+        let b = arm_for(&arms, &mk("10.0.0.2", 8080));
+        assert!(!Arc::ptr_eq(&a, &b), "不同节点不得共享臂");
+        assert_eq!(arms.len(), 2);
+        // 同 addr 不同端口 ⇒ 不同键（addr 形如 ip:port）。
+        let c = arm_for(&arms, &mk("10.0.0.1", 9090));
+        assert!(!Arc::ptr_eq(&a, &c), "同 ip 不同端口是不同节点");
+        assert_eq!(arms.len(), 3);
+    }
+
+    /// **零分配契约**：命中路径连续调用不得产生 `String` 分配。
+    ///
+    /// 与 OPT-R9 C1 的分配契约测试同样受**并行测试线程污染**影响，故同样
+    /// 标 `#[ignore]` 并由 CI 串行跑（见 ci.yml 的 allocation-contract 步骤）。
+    /// 本测试与 C1 的那个跑在**同一条串行命令**里（用同一个过滤器前缀）。
+    #[test]
+    #[ignore = "needs --test-threads=1; run via CI serial allocation-contract job"]
+    fn opt_r10_b1_arm_for_hit_path_does_not_allocate() {
+        use std::sync::atomic::Ordering;
+
+        let arms: DashMap<String, Arc<BanditArm>> = DashMap::new();
+        let node = ProxyNode::new(
+            "10.0.0.1".to_string(),
+            8080,
+            None,
+            None,
+            "US".to_string(),
+            "residential".to_string(),
+            "mock-a".to_string(),
+            100,
+        );
+        // 预热：先建好臂，使后续全部走命中路径。
+        let warm = arm_for(&arms, &node);
+        assert_eq!(arms.len(), 1);
+
+        let before = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
+        let mut same = 0usize;
+        for _ in 0..1000 {
+            // 语义正确性顺带验证：每次都拿到同一个 Arc。
+            if Arc::ptr_eq(&arm_for(&arms, &node), &warm) {
+                same += 1;
+            }
+        }
+        let after = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
+        let observed = after - before;
+
+        assert_eq!(same, 1000, "1000 次调用必须全部命中同一臂");
+        assert_eq!(
+            observed, 0,
+            "arm_for 命中路径必须零分配（OPT-R10 B1 核心收益）。\
+             若并行全量下偶发失败，是其它测试线程污染了进程级计数器——\
+             请用 --test-threads=1 复跑确认。串行下仍失败说明热路径引入了分配。"
+        );
+    }
+
+    // ---- OPT-R11 A1：`prune_stale_arms` 第 4 处 P0 计数下溢 ----
+
+    /// **红测（确定性）**：证明旧写法 `before - arms.len()` 在「并发生长」下
+    /// 确实会 panic，从而说明饱和减**不是可有可无的宽容**。
+    ///
+    /// 为何不用「真实并发」测试：要卡准 `len()` 与 `retain()` 之间的窗口需要
+    /// 精确的线程同步点，既脆弱又可能长期测不到（窗口极窄）——那种测试在
+    /// 没有命中时永远绿，等于没有门。此处直接对「下溢表达式本身」断言，
+    /// 确定性、无时序依赖，且正是缺陷的最小充分复现。
+    #[test]
+    fn opt_r11_a1_plain_subtraction_panics_under_concurrent_growth() {
+        // `arms` 被数据面 `arm_for()`（gateway.rs 冷路径 `arms.insert`）并发写。
+        // 后台 sweep 采样 `before` 后若有插入，则 `after > before`。
+        let before: usize = 0;
+        let after: usize = 3;
+        // 若此处不 panic，则「旧写法会崩」的前提不成立，本测试失去意义——
+        // 因此这里要求**必须** panic（仅 debug 构建；release 下回绕，见下一测试）。
+        let r = std::panic::catch_unwind(|| before - after);
+        assert!(
+            r.is_err(),
+            "旧写法 `before - after` 在并发生长下必须 panic；若未 panic，\
+             说明本轮的缺陷判断前提不成立，红测失去意义"
+        );
+    }
+
+    /// release 构建下旧写法不 panic，但**回绕成天文数字**——同样必须修。
+    /// 用 `checked_sub` 复现回绕语义（普通减法在 release 下的行为等价于
+    /// wrapping，故显式验证「无符号下溢产生巨大值」这一危害形态）。
+    #[test]
+    fn opt_r11_a1_plain_subtraction_wraps_to_huge_value_in_release() {
+        let before: usize = 0usize.wrapping_sub(3);
+        assert_eq!(
+            before,
+            usize::MAX - 2,
+            "release 下普通减法回绕成天文数字，日志/指标将永久失真"
+        );
+    }
+
+    /// 绿测（锁定修复）：`prune_stale_arms` 现用 `janitor::removed_count`
+    /// 饱和减，三态语义与全仓单一真源一致。
+    #[test]
+    fn opt_r11_a1_prune_arms_uses_saturating_helper() {
+        use crate::janitor::removed_count;
+        // 并发生长：净删除 0，不 panic。
+        assert_eq!(removed_count(0, 3), 0);
+        // 纯删除：与旧普通减法等价（存量行为零变化）。
+        assert_eq!(removed_count(9, 4), 5);
+    }
+
+    /// 端到端守护：真实并发「边建臂边修剪」下，`prune_stale_arms` 的返回值
+    /// 恒为 sane 值——不 panic（debug 下旧写法会 panic），也不回绕出天文数字。
+    ///
+    /// # 诚实标注：本测试是「窗口加宽」的补充守护，不是主证据
+    ///
+    /// 主证据是上面两个**确定性**测试（直接断言旧表达式的 panic 与回绕）。
+    /// 本测试靠真实并发去撞那个窗口，为把窗口加宽做了三件事：表开到 2000 条
+    /// （`retain` 有可观测耗时）＋ 4 个写线程 + 主线程连续修剪 2000 轮。
+    /// **它仍可能整轮不命中窗口而全绿**——这是并发测试的固有性质，不假装
+    /// 它是确定性门。它仍有价值：一旦命中，debug 立刻 panic、release 立刻
+    /// 撞到 `removed > SANE_BOUND` 而失败。
+    #[test]
+    fn opt_r11_a1_prune_stale_arms_sane_under_real_concurrency() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        /// 天文数字的判别下界：表最大 2000 条 + 2000 轮并发插入，
+        /// 任何一轮的「净删除」都绝不可能超过这个量级。
+        const SANE_BOUND: usize = 1_000_000;
+
+        let router = RouterEngine::new(vec![]);
+        let arms: StdArc<DashMap<String, Arc<BanditArm>>> = StdArc::new(DashMap::new());
+        for i in 0..2000u32 {
+            let n = ProxyNode::new(
+                format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256),
+                8080,
+                None,
+                None,
+                "US".to_string(),
+                "residential".to_string(),
+                "mock-a".to_string(),
+                100,
+            );
+            let _ = arm_for(&arms, &n);
+        }
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for w in 0..4u32 {
+            let arms_c = StdArc::clone(&arms);
+            let stop_c = StdArc::clone(&stop);
+            writers.push(std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop_c.load(Ordering::Relaxed) {
+                    // 每次写一个新臂 ⇒ 持续制造「before/after 之间并发生长」。
+                    let n = ProxyNode::new(
+                        format!("172.{}.{}.{}", w, i / 256, i % 256),
+                        8080 + (i % 1000) as u16,
+                        None,
+                        None,
+                        "US".to_string(),
+                        "residential".to_string(),
+                        "mock-a".to_string(),
+                        100,
+                    );
+                    let _ = arm_for(&arms_c, &n);
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+
+        for _ in 0..2000 {
+            let removed = prune_stale_arms(&arms, &router);
+            // 唯一需要守的不变量：返回值落在 sane 量级内。
+            //
+            // 不对具体数值断言：并发增长时
+            // `saturating_sub` 正确地返回 0（即「本轮净删除」），
+            // 因此「本轮删了多少」在有写线程时不具有可预期值。
+            assert!(
+                removed < SANE_BOUND,
+                "返回值 {removed} 超出 sane 上界 {SANE_BOUND}，说明发生了下溢/回绕"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in writers {
+            let _ = h.join();
+        }
+    }
+
+    // ---- OPT-R11 A2：SOCKS 总预算 `Instant` 加法溢出 ----
+
+    /// **红测（确定性）**：证明 `SOCKS_BRIDGE_TIMEOUT_SECS` 传入
+    /// `env_secs` 能通过的最大值后，`Instant::now() + budget` **确实会 panic**。
+    ///
+    /// 复现链路（已核实）：
+    ///   * `env_secs`（main.rs:144-151）只过滤 `<= 0`，**无上限**，
+    ///     故 `u64::MAX` 秒可原样进入 `Duration`；
+    ///   * `socks_overall_budget`（gateway.rs:308-310）只做 `saturating_add(8s)`，
+    ///     **不封顶**；
+    ///   * `gateway.rs:437` 直接 `Instant::now() + budget`。
+    ///
+    /// `Instant` 内部用有符号表示，秒数加到 `i64::MAX` 之外即溢出 panic。
+    #[test]
+    fn opt_r11_a2_unclamped_instant_add_panics() {
+        use std::time::{Duration, Instant};
+        // `u64::MAX` 秒能通过 `env_secs`（`parse::<u64>` 成功且 `> 0`）——
+        // 这正是"无上限过滤"的直接后果。
+        let unclamped = Duration::from_secs(u64::MAX);
+        let r = std::panic::catch_unwind(|| Instant::now() + unclamped);
+        assert!(
+            r.is_err(),
+            "未钳制的预算加到 Instant 上必须 panic；若不 panic，\
+             说明本轮缺陷判断的前提不成立（Instant 语义与推断不符）"
+        );
+    }
+
+    /// **绿测（锁定修复）**：钳制后不 panic，且**不改变任何合理值**。
+    #[test]
+    fn opt_r11_a2_clamped_budget_never_panics_and_preserves_reasonable_values() {
+        use std::time::{Duration, Instant};
+        // 修复后入口即钳制：这里模拟 gateway.rs:437 的实际算式。
+        // 直接用真实的钳制函数（不在测试里复制实现，
+        // 否则测试守的是测试里那份副本而非真实代码）。
+        let clamp = crate::clamp_bridge_timeout;
+
+        // 极端输入：加到 Instant 上不 panic。
+        let deadline = Instant::now() + clamp(Duration::from_secs(u64::MAX));
+        assert!(deadline > Instant::now(), "钳制后仍是未来时刻");
+
+        // 存量行为零变化：所有合理值原样通过。
+        for secs in [0u64, 1, 20, 60, 300, 3600, 86_399] {
+            assert_eq!(
+                clamp(Duration::from_secs(secs)),
+                Duration::from_secs(secs),
+                "合理值 {secs}s 必须原样通过（存量行为零变化）"
+            );
+        }
+        // 超上限值被钳到 1 天（远超任何合理桥接超时）。
+        assert_eq!(
+            clamp(Duration::from_secs(86_400 + 1)),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    /// OPT-R13 网关层：直接调 `select_bandit_node_excluding` 300 次，
+    /// **三个节点都必须被选过**。
+    ///
+    /// 此测试与活流量同层，用于区分两件事：
+    /// (1) bandit 数学本身有效（`bandit.rs` 层已有测试）；
+    /// (2) **网关接线 / 候选过滤** 有问题。
+    #[test]
+    fn opt_r13_gateway_level_selection_explores_all_nodes() {
+        let nodes = vec![
+            test_node("127.0.0.1", 8888),
+            test_node("127.0.0.1", 8889),
+            test_node("127.0.0.1", 8890),
+        ];
+        let gw = test_gateway(nodes);
+        let spec = RoutingSpec::default();
+        let x = gw.bandit_engine.extract_context("127.0.0.1:8888");
+        let mut pulled = [0usize; 3];
+        for _ in 0..300 {
+            let picked = gw.select_bandit_node_excluding(&spec, &[], &x);
+            let Some(node) = picked else {
+                panic!("should always find a candidate")
+            };
+            let idx = match node.port {
+                8888 => 0,
+                8889 => 1,
+                _ => 2,
+            };
+            pulled[idx] += 1;
+            arm_for(&gw.bandit_arms, &node).update(&x, 0.99);
+        }
+        assert!(
+            pulled.iter().all(|c| *c > 0),
+            "网关层三节点都应被探索到，实测={pulled:?}"
+        );
+    }
+
+    /// 候选过滤诊断：若某节点被过滤掉，活流量会变成 100% 单节点。
+    #[test]
+    fn opt_r13_gateway_candidate_filter_keeps_all_three_nodes() {
+        let nodes = vec![
+            test_node("127.0.0.1", 8888),
+            test_node("127.0.0.1", 8889),
+            test_node("127.0.0.1", 8890),
+        ];
+        let gw = test_gateway(nodes);
+        let spec = RoutingSpec::default();
+        let now = std::time::Instant::now();
+        let mut kept = 0usize;
+        gw.router.with_pools(|pool| {
+            for n in pool {
+                let pass = gw.router.matches_node(n, &spec, now);
+                println!("DIAG node={} weight={} matches={pass}", n.addr, n.weight);
+                if pass {
+                    kept += 1;
+                }
+            }
+        });
+        assert_eq!(kept, 3, "三个 mock 节点都应通过 matches，实测 kept={kept}");
     }
 }

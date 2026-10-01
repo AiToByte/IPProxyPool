@@ -1,3 +1,21 @@
+> **[已废弃 / DEPRECATED] — 请勿据此部署**
+>
+> 本文件是 **v1 阶段的设计草稿**，内容已严重过时，且**从未被仓库任何文档链接**。
+> 已确认的三处失实（不要照抄）：
+> - 端口写 `0.0.0.0:8080` —— 实际自 OPT-R5 起默认 `:8916`（避让 traefik 争用）。
+> - 声称 P99 <5ms —— 实测 dev 基线约 **65ms**（Windows debug 参考值，非生产承诺）。
+> - 端口/鉴权/组件清单早于多轮架构迭代（CH 迁移、supervisor、free_pool 等）。
+>
+> **当前有效文档**：
+> - 运维：[`docs/OPERATION.md`](../docs/OPERATION.md)
+> - 功能：[`docs/FEATURES.md`](../docs/FEATURES.md)
+> - 使用：[`docs/USAGE.md`](../docs/USAGE.md)
+> - 架构：[`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)
+> - 质量基线：[`docs/QUALITY_BASELINE.md`](../docs/QUALITY_BASELINE.md)
+>
+> 保留本文件仅为记录设计演进轨迹。**执行摘要见
+> [`manual/README.md`](README.md)。**
+
 再进一步细化我的方案, 要求: 响应速度极高, 吞吐率高, 技术先进符合前沿科技发展方向, 方案高质量,
 
 为了实现**极低延迟（P99 < 5ms 附加开销）、千万级 QPS 超高吞吐量、协议层高度拟真以及自适应容灾**，传统的“基于 Redis 集中查询 + 阻塞式反向代理”架构必须升级为**控制面与数据面彻底分离（Control/Data Plane Decoupling）、内核级加速（eBPF/io_uring）与无锁流式传输**的前沿架构。

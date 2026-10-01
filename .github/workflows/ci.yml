@@ -9,6 +9,17 @@ name: ci
 on:
   push:
     branches: ["**"]
+    # OPT-R9 A4：纯文档改动不触发 Rust 全量冷编译。
+    # 依赖树含 pingora/ring/openssl-sys/lz4/zstd/aws-lc-rs 等重型原生 crate，
+    # 此前改一行 .md 也会触发整树重编（无 paths-ignore ＋ 无缓存）。
+    # 注意：docs/ 下的文档含**可执行的命令与代码片段**，改动它们可能需要
+    # 跑 static-checks（如 README 里的 compose 命令），故**只忽略**根级
+    # 与 plan/ 下的纯记录性文档，不忽略 docs/。
+    paths-ignore:
+      - "**/*.md"
+      - "!docs/**"
+      - "plan/**"
+      - "log/**"
   pull_request:
 
 jobs:
@@ -22,16 +33,80 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # OPT-R9 A4：缓存 cargo 依赖与构建产物。
+      # 无缓存时每次 push 都要重编整个依赖树（数分钟）；`Swatinem/rust-cache`
+      # 按 Cargo.lock 的哈希做 key，lockfile 不变即命中。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+          # 缓存 target/ 与 ~/.cargo/registry；lockfile 变则 key 变，自动失效。
+          shared-key: ipp-gateway
+      # OPT-R9 A4：全部 cargo 命令加 `--locked`。
+      # 缺此 flag 时，CI 会**静默重写** Cargo.lock（解析出新版本），
+      # 与 docs/OPEN-SOURCE.md「锁 Cargo.lock 构建可复现」的承诺相悖。
+      # 加 `--locked` 后，manifest 与 lockfile 不一致会**直接失败**。
       - name: fmt
         run: cargo fmt --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: unit tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+      # OPT-R9 C1 / OPT-R10 B1 / OPT-R11 B1：分配契约门（**必须串行 + --include-ignored + --exact**）。
+      #
+      # 三个测试锁定「生产热路径零分配」的性能契约：
+      #   * `router::tests::opt_r9_c1_isolated_lookup_does_not_allocate` —— 隔离查表；
+      #   * `gateway::tests::opt_r10_b1_arm_for_hit_path_does_not_allocate` —— LinUCB
+      #     臂表命中路径（`arm_for`，每请求每候选一次）；
+      #   * `router::tests::opt_r11_b1_pick_weighted_streaming_hit_path_does_not_allocate`
+      #     —— 流式加权选路（替代了每请求 O(N) 物化）。
+      #
+      # 三个参数**缺一不可**，每个都实测踩过：
+      #   * `--test-threads=1`：`#[global_allocator]` 的计数器是**进程级**的，
+      #     并行测试的分配会污染读数（实测并行下假红）。
+      #   * `--include-ignored`：三个测试都带 `#[ignore]`（让并行全量 `cargo test`
+      #     保持全绿）。只给过滤器不给它，libtest 会跳过并报 `0 passed`
+      #     —— 门禁静默失效。**OPT-R11 实测再次踩中**：新增的第三个测试在加入
+      #     串行循环前一直是 `ignored`、从未真正跑过，首次实跑就暴露了测试
+      #     自身的缺陷（循环内 `thread_rng()` 首次 TLS 初始化被计入窗口）。
+      #   * `--exact` + **完整测试名**（含模块路径）：只写函数名会过滤不命中，
+      #     同样静默跑不到任何测试（实测 `--exact` 配短名报 0 passed）。
+      #
+      # 为何**不**改成「并行下不误报」：实测那种设计会让真实回归溜过——把
+      # `format!`/`clone`/物化塞回热路径后分别观察到 2000/1000/65000 次分配，
+      # 却被当作「污染」放行。**放宽判据的门禁等于没有门禁。**
+      - name: allocation-contract tests (serial + include-ignored)
+        run: |
+          set -euo pipefail
+          for t in \
+            router::tests::opt_r9_c1_isolated_lookup_does_not_allocate \
+            gateway::tests::opt_r10_b1_arm_for_hit_path_does_not_allocate \
+            router::tests::opt_r11_b1_pick_weighted_streaming_hit_path_does_not_allocate
+          do
+            cargo test --locked --workspace "$t" \
+              -- --test-threads=1 --include-ignored --exact 2>&1 | tee alloc-test.log
+            grep -q "1 passed" alloc-test.log || {
+              echo "::error::allocation-contract test did not run: $t (expected '1 passed')"
+              grep -E "test result|running [0-9]+ test" alloc-test.log || true
+              exit 1
+            }
+          done
       - name: release bandit (<200ns select path)
-        run: cargo test --release bandit
+        run: cargo test --locked --release bandit
       - name: bench compile
-        run: cargo bench --workspace --no-run
+        run: cargo bench --locked --workspace --no-run
+      # OPT-R9 A4：lockfile 漂移断言。
+      # `--locked` 保证「cargo 不改 lockfile」，但**不保证**「lockfile 与
+      # manifest 本来就一致」——若有人改了 Cargo.toml 却没提交 Cargo.lock，
+      # 上一步会失败（好）；但若有人**连 lockfile 一起改错**，这里兜底。
+      # 缓存命中时 cargo 可能完全不碰 lockfile，故仍需显式断言工作区未被改。
+      - name: Cargo.lock unchanged by the build
+        run: |
+          if ! git diff --exit-code -- gateway/Cargo.lock; then
+            echo "::error::gateway/Cargo.lock was modified during the build (--locked should have prevented this)"
+            git diff -- gateway/Cargo.lock | head -50
+            exit 1
+          fi
+          echo "Cargo.lock unchanged"
 
   # OPT-R4 C8：脚本/配置漂移门（端口/头名/规则在合入前拦截；cargo 门在上）。
   static-checks:
@@ -56,13 +131,127 @@ jobs:
         # /proc/<pid>/cmdline）。正确做法是环境变量（REDISCLI_AUTH /
         # CLICKHOUSE_PASSWORD）或请求头（X-ClickHouse-Key）。
         run: python3 tools/check_no_plaintext_creds.py
+      # OPT-R10 A1：第三方**数据**署名门。
+      #
+      # 这是**唯一有法律时效**的检查（CC BY-SA 4.0 §3(a) 强制署名）。此前
+      # docs/OPEN-SOURCE.md 两处声称「OPERATION 有署名行」，而 OPERATION 里
+      # 实际只有 GeoLite2 的操作步骤、**没有任何署名**——对外的不实陈述 ＋
+      # 合规缺口。本门断言四要素齐全（提供者/许可名称/许可链接/免责声明/来源），
+      # 防止署名在后续文档精简中被改坏。
+      #
+      # 为何不靠 review：署名是纯文档改动，最容易被"顺手精简"掉，而它一旦
+      # 丢了就是**分发即违规**。
+      - name: Third-party data attribution (MaxMind / CC BY-SA 4.0)
+        run: python3 tools/check_attribution.py
+      # OPT-R10 D1：活文档的测试数字必须与权威基线一致。
+      #
+      # 实测漂移：`docs/FEATURES.md` 停在 209（落后 5 轮）、`README.md` 停在
+      # 201→235（且 live 数写成 5、实为 4）。数字散落 10+ 文件、手改必漂。
+      #
+      # 关键设计：门禁**只扫活文档**（ALLOWLIST），**不扫历史文件**
+      # （CHANGELOG/TASK_PLAN/plan/EXEC_LOG）——那些记录的是某轮收官的真实
+      # 状态（OPT-R4 收官确为 201），改了就等于伪造执行记录。
+      - name: Doc quality numbers match canonical baseline
+        run: python3 tools/check_doc_consistency.py
+      # OPT-R12 A2：鉴权配置文档必须说清 `REQUIRE_API_KEY=0` / `API_KEY` 的真实语义。
+      #
+      # 实测确认的失实：此前只写「`REQUIRE_API_KEY=0` 显式关闭鉴权门」，而
+      # release 二进制实测该配置下**完全不带 key 的请求返回 200** 并拿到完整
+      # 代理服务（无头被静默补成 qps=10000 的默认租户）。真实语义是「全网共享
+      # 一个满额身份」，与「关闭鉴权」差了一个量级。
+      #
+      # 不准确文档比没有文档更糟——它给运维虚假的安全感。与 MaxMind 署名门
+      # 同属「对外表述 vs 实际行为」类，故同样用静态门锁住。
+      - name: Auth config docs state the real semantics
+        run: python3 tools/check_auth_docs.py
+      # OPT-R14 A2：free 池**契约**门（确定性，不依赖公网）。
+      #
+      # 刻意**不做**"healthy 节点数 ≥ N"的数量门：公网免费代理存活率天然 churn
+      # （2026-09-30 实测两轮分别 30 / 22 个通过验证），任何数量门都会周期性假红，
+      # 而假红门禁会被运维学会忽略——比没有门更糟。数量的可重复验证改由报告式
+      # `tools/probe_free_pool.py` 承担（需公网 + 数分钟，不进 CI）。
+      #
+      # 本门只锁确定性的四类：verify 分类集合 / 指标名 / intake 下限 / 文档口径。
+      # 已实证它能抓：新增未登记分类、去掉 intake 下限、抹掉文档"未验证"口径。
+      - name: Free-pool supply-side contract (deterministic, no internet)
+        run: python3 tools/check_free_pool_contract.py
+      # OPT-R14 B4：Windows「300 秒自杀」的修复不得被静默回退。
+      #
+      # 根因在依赖：`pingora-core 0.6.0` 的 `Server::run()` 有
+      # `#[cfg(windows)] let shutdown_type = ShutdownType::Graceful;` —— Windows 上
+      # `main_loop` 从不被 await（那段是 `#[cfg(unix)]`），**没有信号等待**，
+      # 于是必然 `sleep(grace_period)` 后 `process::exit(0)`。本机实测退出寿命
+      # **305~308s**，且**无 panic、无错误码**，此前被误判为随机崩溃。
+      #
+      # 修复是「`GATEWAY_GRACE_SECS` 默认值平台感知」。这类修复的典型死法是：
+      # 有人看到「Windows 默认 86400 看着奇怪」就清理回 300 —— **Unix 侧行为
+      # 一模一样、全绿**，而 Windows 上网关又开始 5 分钟自杀。
+      - name: Windows lifetime fix must not be reverted (OPT-R14)
+        run: python3 tools/check_windows_lifetime.py
+      # ---- OPT-R9 A3：SDK 编译验证 ----
+      # 4 个非 Python SDK 此前从未被任何构建系统碰过（仓库无 go.mod/.csproj/
+      # package.json，CI 只跑 python3 compileall）。审阅已发现两处**确定破损**：
+      #   ① ipp_sdk_go.go 文件头写 `import ipp "path/to/..."`，而它是
+      #      `package main` —— Go 禁止 import package main，示例 100% 编译失败；
+      #   ② ipp_sdk_dotnet.cs 文件头写 `dotnet run -- --self-test`，无 .csproj
+      #      时该命令直接报错。
+      # 两处文档已在 OPT-R9 A3 修正；下面是**代码级**门禁，防同类问题复发。
+      #
+      # 能力边界（如实标注）：Node 只做**语法**检查（JS 没有零配置的类型检查
+      # 方案）；Go/Java/.NET 做**完整编译**（含类型检查）。运行时验证靠各 SDK
+      # 自带的 --self-test（需网关在线，不进快速门）。
+      - name: Go SDK compiles (go vet + go build)
+        run: python3 tools/check_go_sdk.py
+      - name: Node SDK syntax check
+        run: python3 tools/check_node_sdk.py
+      - name: .NET + Java SDK compile
+        # 显式固定 SDK 版本：runner 预装版本会漂移，而 SDK 代码可能用到新语法。
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: .NET + Java SDK compile (run)
+        run: |
+          python3 tools/check_jvm_sdk.py --java
+      - name: .NET SDK compile (run)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: .NET SDK compile (run2)
+        run: python3 tools/check_jvm_sdk.py --dotnet
+      # OPT-R10 C2：SDK 错误契约静态门（**不依赖任何编译器**）。
+      #
+      # 为何编译门不够：.NET/Java 的编译门依赖 SDK 预装，**本机没有 .NET SDK**
+      # （NuGet provider 缺失装不上），意味着 .NET 改动在本机**完全没有验证**。
+      # 历史上 .NET 正是 5 个语言里唯一"改了没人编译"的那个，其
+      # `GetAsync` 函数内自相矛盾的错误通道（解析失败 return / scheme 抛异常）
+      # 就是这么长期存活的。本门纯文本断言，无论 CI 有无 SDK 都能拦回归。
+      - name: SDK error-contract consistency (5 languages, compiler-free)
+        run: python3 tools/check_sdk_contract.py
       # OPT-R7 B2：规则/配置解析显式指定 UTF-8。仓库的 YAML/JSON 均含中文注释，
       # 而 Python 的 `open()` 默认跟随**系统 locale 编码**——在非 UTF-8 locale
       # （如 Windows 上的 GBK）会抛 UnicodeDecodeError。本机实测即如此：
       # 未加 `encoding="utf-8"` 时三条检查全挂在解码上。
       # 加 `encoding="utf-8"` 后与 locale 无关，跨平台稳定。
-      - name: Prometheus rules syntax
+      - name: Prometheus rules (YAML syntax)
         run: python3 -c "import yaml; d=yaml.safe_load(open('deploy/prometheus/rules.yml', encoding='utf-8')); assert d['groups'], 'no rule groups'"
+      # OPT-R9 A1：promtool 做 **PromQL 静态类型检查**——yaml.safe_load 只验缩进语法，
+      # 验不出 `histogram_quantile(0.99, "str")` 这类参数类型错。
+      # 用 Prometheus 官方镜像（版本与 docker-compose.yml 的 prom/prometheus 一致，
+      # 避免版本漂移造成误报/漏报）。`--entrypoint promtool` 覆盖镜像默认 ENTRYPOINT。
+      # 名称里的冒号必须加引号——YAML 会把未加引号的 `key: value` 里的冒号
+      # 当作映射分隔符（实测踩过：整份 workflow 因此解析失败）。
+      - name: "Prometheus rules (promtool: PromQL types, not just YAML)"
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/prometheus:/rules:ro" \
+            prom/prometheus:v2.53.0 check rules /rules/rules.yml
+      # OPT-R9 A2：指标名 + **聚合标签**与 metrics.rs 的实际渲染对账。
+      # 为何需要这道（promtool 抓不到的）：实测把「分母写成 sum by(provider) 而该指标
+      # 只有 status 标签」注入后，promtool 报 SUCCESS 放行——但该表达式运行期恒返回
+      # 空集。promtool 只做静态类型检查，不做运行期标签匹配。
+      - name: PromQL metrics/labels match metrics.rs (OPT-R9 A2)
+        run: python3 tools/check_promql_metrics.py
       - name: Alertmanager config syntax
         run: python3 -c "import yaml; yaml.safe_load(open('deploy/alertmanager.yml', encoding='utf-8'))"
       - name: Dashboards + compose valid
@@ -82,3 +271,96 @@ jobs:
         run: docker build -t ipproxy-gateway:ci ./gateway
       - name: Compose dual-profile config (gateway + observability)
         run: docker compose --profile gateway --profile observability config --quiet
+
+  # OPT-R9 B1：Windows PowerShell 5.1 门（覆盖**生产真实执行环境**）。
+  #
+  # 为何必须单独一个 job（此前是结构性漏洞）：
+  #   现有 static-checks 用 `shell: pwsh` on **ubuntu-latest** = Linux 上的
+  #   PowerShell 7。而 tools/ 下 6 个 .ps1 全部是 **Windows PowerShell 5.1**
+  #   专属（`#Requires -Version 5.1`；`install_watchdog.ps1` 用 `schtasks`；
+  #   `ipp.ps1` 用 `Get-CimInstance Win32_Process`；`docs/USAGE.md` 改
+  #   `HKCU:\` 注册表）。PS 7 on Linux 的**解析器与 cmdlet 集都不同**，
+  #   验不到生产面——仓库已因「.ps1 缺 BOM 致 PS 5.1 误解析」踩过一次坑
+  #   （见 docs/FREE_BASELINE.md）。
+  #
+  # 本 job 的两道检查都**不执行脚本**（只解析），因此不需要 Docker/网关/凭据：
+  #   ① PSScriptAnalyzer：静态规则；
+  #   ② [PSParser]::Tokenize：解析器级别的语法/编码校验。
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `shell: powershell` 就是 **Windows PowerShell 5.1**（不是 pwsh）——
+      # 这正是本 job 的意义所在。
+      - name: PSScriptAnalyzer (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          # 版本锁定：PSGallery 上的包可被作者重发布，浮动版本会让同一份代码
+          # 在不同时间得到不同结论（CI 变成薛定谔的绿）。锁定到具体版本。
+          # 本机装不上（NuGet provider 缺失，PSGallery 供应链问题）⇒ 该检查
+          # **未在本地实证**，由 CI 首次运行确认；这是已知取舍，已登记。
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.21.0 `
+            -Scope CurrentUser -Force -ErrorAction Stop
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.21.0
+          # OPT-R9 B2：从「只查 Error」改为「**只查白名单规则**」。
+          #
+          # 为何用白名单（-IncludeRule）而不是黑名单（-ExcludeRule）：
+          #   * 规则集**固定**，不受 PSScriptAnalyzer 新版本新增规则影响 ——
+          #     黑名单下，升级引入的新规则会让存量代码突然红，而「为什么红」
+          #     与「是不是真问题」没有必然关系；
+          #   * 不会因存量告警数量未知而使 CI 首次运行直接失败（本机无法安装
+          #     PSSA，**无法预先枚举存量告警**，这是选择白名单的直接原因）；
+          #   * 语义更清晰：只对我们**明确想要**的规则负责。
+          #
+          # 白名单规则的选择标准：**会造成真实故障**的那一类
+          # （未初始化变量、别名覆盖内置 cmdlet、命令参数歧义、硬编码凭据），
+          # 而非风格类（命名/大写/缩进）。
+          $results = Invoke-ScriptAnalyzer -Path tools -Recurse -IncludeRule @(
+            # 引用了未初始化的变量 → 运行期取到 $null，行为不可预期
+            'PSUseDeclaredVarsMoreThanAssignments',
+            # Write-Host / echo 的别名遮蔽内置 cmdlet
+            'PSAvoidUsingCmdletAliases',
+            # 参数位置歧义（switch 传值）
+            'PSAvoidUsingPositionalParameters',
+            # 明文口令（本仓 .env 开发缺省属设计内，但仍要求显式确认才放行）
+            'PSAvoidUsingPlainTextForPassword',
+            # 缺少 [CmdletBinding()] 却用 $args 自动变量
+            'PSReviewUnusedParameter'
+          )
+          if ($results) {
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize |
+              Out-String -Width 220 | Write-Output
+            Write-Error "PSScriptAnalyzer found $($results.Count) issue(s) in the whitelisted rule set"
+            exit 1
+          }
+          Write-Output "PSScriptAnalyzer (whitelisted rules): clean"
+      - name: PowerShell 5.1 parse check (encoding + syntax)
+        shell: powershell
+        run: |
+          # 用**生产同款**的 5.1 解析器逐文件校验：
+          #   ① 解析错误（括号/引号/结构）——PSParser 的 Tokenize 会抛；
+          #   ② BOM 缺失（PS 5.1 按 ANSI 代码页读无 BOM 文件，中文注释会乱码
+          #      并可能引发解析故障——仓库已踩过，见 docs/FREE_BASELINE.md）。
+          # 只解析不执行：无需 Docker/网关/凭据，纯静态门。
+          $failed = $false
+          $files = Get-ChildItem -Path tools -Filter *.ps1 -Recurse
+          foreach ($f in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $hasBom = ($bytes.Length -ge 3 -and
+                       $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            if (-not $hasBom) {
+              Write-Error "MISSING UTF-8 BOM: $($f.Name)  (PS 5.1 parses BOM-less .ps1 as ANSI/GBK)"
+              $failed = $true
+            }
+            $errors = $null
+            [System.Management.Automation.PSParser]::Tokenize(
+              (Get-Content -LiteralPath $f.FullName -Raw), [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              foreach ($e in $errors) {
+                Write-Error "PARSE ERROR $($f.Name): line $($e.Token.StartLine) — $($e.Message)"
+              }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+          Write-Output "PowerShell 5.1 parse + BOM: clean ($($files.Count) file(s))"

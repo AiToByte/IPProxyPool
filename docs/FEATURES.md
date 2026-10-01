@@ -1,7 +1,7 @@
 # 功能说明文档 / Feature Catalog
 
 > 双语：中文在前，English after.
-> 口径基线：D3（Key 门默认开＋回环监听）、209 单测＋4 真 live。每项按“是什么／为什么／怎么看／配置项”四段写。
+> 口径基线：D3（Key 门默认开＋回环监听）、274 单测＋4 真 live（权威数字见 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)）。每项按“是什么／为什么／怎么看／配置项”四段写。
 
 ## 中文
 

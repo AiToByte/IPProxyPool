@@ -11,11 +11,17 @@
 
 use crate::analytics::{AnalyticsEngine, TelemetryRow};
 use crate::circuit_breaker::field_text;
+use crate::metrics::MetricsRegistry;
 use crate::telemetry::TelemetryEvent;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// OPT-R15：`telemetry_sink_up{backend="clickhouse"}` 的 backend 标签。
+/// CH 挂 ⇒ stream 里数据堆积但不 ack，pending 持续增长（这一层与 Redis 级互相独立：
+/// Redis 好、CH 坏时 `backend="redis"` 仍是 1，只有 CH 这条转 0）。
+pub const SINK_BACKEND_CLICKHOUSE: &str = "clickhouse";
 
 /// Sink consumer group (separate from the circuit-breaker group).
 pub const SINK_GROUP: &str = "ch_sink_group";
@@ -87,6 +93,8 @@ pub struct ChSinkWorker {
     flush_interval: Duration,
     /// R2-5 去重窗：insert→ack 间崩溃的重放对消于此，不进仓。
     seen: SeenIds,
+    /// OPT-R15：落地端健康上报口（ClickHouse 这一级；Redis 级由 `TelemetryWorker` 上报）。
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl ChSinkWorker {
@@ -94,6 +102,7 @@ impl ChSinkWorker {
         redis_conn: ConnectionManager,
         analytics: Arc<AnalyticsEngine>,
         stream_key: String,
+        metrics: Arc<MetricsRegistry>,
     ) -> Self {
         let batch_size = analytics.batch_size();
         let flush_interval = analytics.flush_interval();
@@ -106,6 +115,7 @@ impl ChSinkWorker {
             batch_size,
             flush_interval,
             seen: SeenIds::new(SEEN_IDS_CAP),
+            metrics,
         }
     }
 
@@ -240,10 +250,15 @@ impl ChSinkWorker {
                     .await
                     .unwrap_or(());
                 log::info!("[ChSink] landed {landed} rows to ClickHouse");
+                // OPT-R15：insert 成功——ClickHouse 这一级健康。
+                self.metrics.mark_sink_ok(SINK_BACKEND_CLICKHOUSE);
                 landed
             }
             Err(e) => {
                 log::error!("[ChSink] insert failed ({e:?}), holding acks for redelivery");
+                // OPT-R15：置 `up=0`。注意"读 stream 失败"（上面的 debug 分支）**不**标记——
+                // 那是 Redis 侧问题，归 Redis 那条序列管，否则两级会互相掩盖。
+                self.metrics.mark_sink_failed(SINK_BACKEND_CLICKHOUSE);
                 tokio::time::sleep(INSERT_BACKOFF).await;
                 0
             }
@@ -584,6 +599,7 @@ mod tests {
             manager.clone(),
             analytics.clone(),
             STREAM_KEY_TEST.to_string(),
+            Arc::new(MetricsRegistry::new()),
         );
         // Poll a few cycles: block-read needs the entries to arrive.
         // R2-5：pump 需 &mut（去重窗写入）。

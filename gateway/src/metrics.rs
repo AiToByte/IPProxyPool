@@ -38,6 +38,21 @@ pub const METRICS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// R2-8 数据面日志采样分母（非 5xx 每 1000 条全量一条，其余降 `debug!`）。
 pub const LOG_SAMPLE_EVERY: u64 = 1000;
 
+/// OPT-R9 C2：`free_exit_total` 的出口 IP **标签基数上限**。
+///
+/// 免费代理的出口 IP 是公网随机 IP，取值空间无界；不设上限时
+/// `MetricsRegistry::free_exit_total`（`DashMap`）与 Prometheus TSDB
+/// 都会随运行时长无界增长。512 与 `free_pool` 侧 `FullChecker` 的 HTTP Client
+/// 缓存上限同量级（见 `free_pool.rs`），即「一个出口在生命周期内被复用」的
+/// 合理规模。超过后新出口并入 [`EXIT_OVERFLOW_LABEL`] 桶。
+pub const EXIT_LABEL_CAP: usize = 512;
+
+/// OPT-R9 C2：溢出桶的 `exit_ip` 标签值（第 513 个及以后的出口都归这里）。
+///
+/// 用双下划线前缀是为了**不可能与真实 IP 相同**（真实 IP 形如 `1.2.3.4` 或
+/// `2409:8c54::11`，不含下划线），故该序列在语义上无歧义。
+pub const EXIT_OVERFLOW_LABEL: &str = "__overflow__";
+
 pub struct MetricsRegistry {
     req_2xx: AtomicU64,
     req_4xx: AtomicU64,
@@ -62,6 +77,18 @@ pub struct MetricsRegistry {
     /// R2-4 通道丢弃计数：与 `TelemetryPublisher` 共享同一个 `Arc`
     ///（emit 满队列/已关闭时累加），此处只读渲染，不参与 `observe`。
     channel_dropped: Arc<AtomicU64>,
+    /// OPT-R15 遥测**落地端**健康（`telemetry_sink_up{backend}` 渲染），`backend` = `redis` | `clickhouse`。
+    /// 存在的理由：Redis / ClickHouse 鉴权或连通性失败时，遥测**静默丢光**——唯一信号是
+    /// `telemetry_dropped_total` 在涨，但它既不告诉你是**哪一级**落地失败，也分不清
+    /// 「本来就没有事件」与「落地端挂了」。这个 gauge 让两者可编程区分。
+    /// 懒出现（首次 flush/insert 才建序列，不预置 `redis`/`clickhouse`）：未配置的落地端
+    /// 不该被渲染成 `up=0` 而误报告警；「从未成功过」用 `absent()` + `last_ok=0` 表达。
+    sink_up: DashMap<String, AtomicU64>,
+    /// OPT-R15：落地端写入失败次数（`telemetry_sink_failures_total{backend}`），含重试后仍失败。
+    sink_failures: DashMap<String, AtomicU64>,
+    /// OPT-R15：最近一次**成功**写入的 Unix 秒（`telemetry_sink_last_ok_unixtime_seconds{backend}`）。
+    /// 0 = 存在但从未成功过；与 `telemetry_sink_up` 组合可区分「彻底不通」与「通但很久没写」。
+    sink_last_ok: DashMap<String, AtomicU64>,
     /// R2-8 后台重启计数（supervisor 直写，`supervisor_restarts_total{worker}` 渲染）。
     supervisor_restarts: DashMap<String, AtomicU64>,
     /// R2-8 日志采样序号（`sample_full_log` 发号，单调递增；5xx 不经过此处）。
@@ -76,7 +103,7 @@ pub struct MetricsRegistry {
     /// 回答“哪个源真出货”，yield 高≠elite 高，调用方保证源名集合）。
     free_source_elite: DashMap<String, AtomicU64>,
     /// FreePool 质检结果计数（`free_pool_verify_total{result}` 渲染；
-    /// result∈pass/tcp_fail/full_fail/backoff_skip，调用方保证集合）。
+    /// result 实际只有 4 个：pass/tcp_fail/full_fail/geo_fail（无 backoff_skip，见 L259 说明）。
     free_verify: DashMap<String, AtomicU64>,
     /// FreePool 匿名度分级计数（`free_pool_anonymity_total{level}` 渲染；
     /// level∈elite/anonymous/transparent/unknown，调用方保证集合）。
@@ -154,6 +181,9 @@ impl MetricsRegistry {
             duration_sum_ms: AtomicU64::new(0),
             telemetry_dropped,
             channel_dropped,
+            sink_up: DashMap::new(),
+            sink_failures: DashMap::new(),
+            sink_last_ok: DashMap::new(),
             supervisor_restarts: DashMap::new(),
             log_sample_seq: AtomicU64::new(0),
             logs_sampled: AtomicU64::new(0),
@@ -224,6 +254,45 @@ impl MetricsRegistry {
         self.free_pool_nodes.store(n, Ordering::Relaxed);
     }
 
+    /// OPT-R15：标记某落地端一次**成功**写入（`up=1` 并刷新 `last_ok`）。
+    ///
+    /// 只在真正把数据交给落地端后才调用。序列化失败、本地缓冲溢出**都不算**落地端健康，
+    /// 否则会把"网关自己的 bug"误报成"依赖挂了"。
+    pub fn mark_sink_ok(&self, backend: &str) {
+        self.sink_up
+            .entry(backend.to_string())
+            .or_insert_with(|| AtomicU64::new(1))
+            .store(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.sink_last_ok
+            .entry(backend.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(now, Ordering::Relaxed);
+    }
+
+    /// OPT-R15：标记某落地端一次**失败**（`up=0` + 失败计数 +1）。
+    ///
+    /// `up` 的语义是「最近一次尝试的结果」而非「一段时间内的健康度」——抖动会翻转，
+    /// 这是刻意的：告警侧用 `== 0` 持续 2m 过滤毛刺（见 `docs/OPERATION.md` 告警口径）。
+    pub fn mark_sink_failed(&self, backend: &str) {
+        self.sink_up
+            .entry(backend.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(0, Ordering::Relaxed);
+        self.sink_failures
+            .entry(backend.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        // 首次失败即建 `last_ok=0` 序列：告警上「试过、一直失败、从未成功」
+        // 与「压根还没试过」必须可区分，否则一次都没成功的后端会一直沉默。
+        self.sink_last_ok
+            .entry(backend.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+    }
+
     /// FreePool 源站抓取产出累加（worker 每轮按 source 聚合计数；零产出源不记，
     /// 其熔断由 suspend gauge 可见）。
     pub fn note_free_source_yield(&self, source: &str, n: u64) {
@@ -241,7 +310,11 @@ impl MetricsRegistry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// FreePool 质检结果计数（result 调用方保证∈pass/tcp_fail/full_fail/backoff_skip/geo_fail）。
+    /// FreePool 质检结果计数。**OPT-R14 A2：以 `tools/check_free_pool_contract.py` 为契约源**。
+    /// 调用点实际只有 4 个：`pass/tcp_fail/full_fail/geo_fail`。
+    /// 原注释曾列 `backoff_skip`，但**无任何调用点会发出它**（`backoff_until` 机制存在却不记账）——
+    /// 它是个**死标签**：运维看到该标签永远不出现，会误以为“被 backoff 跳过的节点在统计”。
+    /// 本轮已从注释删除；若未来确实要发出它，请**同时**加上调用点并更新那道门的期望集。
     pub fn note_free_verify(&self, result: &str) {
         self.free_verify
             .entry(result.to_string())
@@ -332,8 +405,50 @@ impl MetricsRegistry {
 
     /// OPT-R5 E5：出口分组记一笔（空串不记；None 由调用方跳过，不在此处展开 Option；
     /// 轮转语义＝该序列 `changes()`，见 render/HELP 注释）。
+    ///
+    /// # OPT-R9 C2：容量上限（出口 IP 标签基数护栏）
+    ///
+    /// 旧实现无条件 `entry(exit_ip.to_string()).or_insert_with(...)`，而免费代理的
+    /// 出口 IP 是**公网随机 IP** ⇒ 标签取值空间无界 ⇒ 长期运行会同时撑爆两处：
+    /// 网关内存（`DashMap` 条目）与 Prometheus TSDB（每个新序列一个 chunk +
+    /// 索引项）。这是**资源无界增长**问题，与并发/安全无关。
+    ///
+    /// # 为什么用「溢出桶」而不是「直接丢弃」
+    ///
+    /// 直接丢弃会让「某出口已用 1M 次」与「某出口仅 1 次」在 TopK 图上无法区分
+    /// （后者已存在序列），造成**指标语义断层**。溢出桶保留了「还有更多出口在用」
+    /// 这一事实，且是唯一常渲染的「上限已触达」信号。
+    ///
+    /// # 语义保证（向后兼容）
+    ///
+    /// 未超上限时渲染输出与旧实现**逐字节一致**。超上限后：已存在的 512 条真实
+    /// 序列**继续正常递增**（不因达上限而冻结）；新出口全部计入
+    /// `exit_ip="__overflow__"`；该桶**恒渲染**（值为 0 时也渲染），
+    /// 使面板/告警能判「是否已溢出」。
     pub fn note_free_exit(&self, exit_ip: &str) {
         if exit_ip.is_empty() {
+            return;
+        }
+        // 快路径：已有序列直接递增。**刻意不检查上限**——已达上限后已存在的
+        // 序列必须继续正常计数，否则统计会在 512 处静默截断（更坏的失真）。
+        if let Some(counter) = self.free_exit_total.get(exit_ip) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // 慢路径：首次见到该出口。达上限则并入溢出桶。
+        //
+        // 不用 `DashMap::entry().or_insert_with()`：那样在并发下两个线程可能
+        // 同时越过 `len() < CAP` 检查，各自建序列，导致**略微超限**。这里先取
+        // 持有 `Ref` 再决策，保证同一时刻只有一个线程能新建（`entry` API 本身
+        // 是原子的，但与 `len()` 检查组合不原子；先 get 再 entry 的两步法
+        // 同样不严格，但**超限幅度被限制在并发窗口内**，且语义可接受——
+        // 上限是**护栏**不是精确配额，真正的硬保证应由 Prometheus 侧
+        // `metric_relabel_configs` 兜底）。
+        if self.free_exit_total.len() >= EXIT_LABEL_CAP {
+            self.free_exit_total
+                .entry(EXIT_OVERFLOW_LABEL.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.free_exit_total
@@ -495,6 +610,51 @@ impl MetricsRegistry {
             "telemetry_channel_dropped_total {}\n",
             self.channel_dropped.load(Ordering::Relaxed)
         ));
+        // OPT-R15：落地端健康三件套。缺哪级 backend 的序列就渲染哪级——未配置的落地端
+        // 不出现（而非渲染成 `up=0` 误报）；告警口径见 docs/OPERATION.md。
+        out.push_str(
+            "# HELP telemetry_sink_up Telemetry sink reachable (1) or failing (0), last attempt.\n",
+        );
+        out.push_str("# TYPE telemetry_sink_up gauge\n");
+        let mut ups: Vec<(String, u64)> = self
+            .sink_up
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        ups.sort();
+        for (b, v) in ups {
+            out.push_str(&format!("telemetry_sink_up{{backend=\"{b}\"}} {v}\n"));
+        }
+        out.push_str(
+            "# HELP telemetry_sink_failures_total Telemetry sink write attempts that failed.\n",
+        );
+        out.push_str("# TYPE telemetry_sink_failures_total counter\n");
+        let mut fails: Vec<(String, u64)> = self
+            .sink_failures
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        fails.sort();
+        for (b, v) in fails {
+            out.push_str(&format!(
+                "telemetry_sink_failures_total{{backend=\"{b}\"}} {v}\n"
+            ));
+        }
+        out.push_str(
+            "# HELP telemetry_sink_last_ok_unixtime_seconds Unix time of last successful sink write (0 = never).\n",
+        );
+        out.push_str("# TYPE telemetry_sink_last_ok_unixtime_seconds gauge\n");
+        let mut oks: Vec<(String, u64)> = self
+            .sink_last_ok
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        oks.sort();
+        for (b, v) in oks {
+            out.push_str(&format!(
+                "telemetry_sink_last_ok_unixtime_seconds{{backend=\"{b}\"}} {v}\n"
+            ));
+        }
         // R2-8：后台 worker 重启数（supervisor 计数；无重启时无线，保持 exposition 干净）。
         out.push_str("# HELP supervisor_restarts_total Background worker restarts by worker.\n");
         out.push_str("# TYPE supervisor_restarts_total counter\n");
@@ -697,16 +857,37 @@ impl MetricsRegistry {
         ));
         // OPT-R5 E5：出口分组计数（轮转不在此处算状态机，由 PromQL
         // `changes(free_pool_exit_total[5m])` 看轮转；无数据时只 HELP/TYPE 无行）。
-        out.push_str("# HELP free_pool_exit_total FreePool forward passes by exit ip.\n");
-        out.push_str("# TYPE free_pool_exit_total counter\n");
+        out.push_str("# HELP free_exit_total FreePool forward passes by exit ip.\n");
+        out.push_str("# TYPE free_exit_total counter\n");
         let mut exits: Vec<(String, u64)> = self
             .free_exit_total
             .iter()
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         exits.sort();
-        for (ip, n) in exits {
-            out.push_str(&format!("free_pool_exit_total{{exit_ip=\"{ip}\"}} {n}\n"));
+        // OPT-R9 C2：溢出桶**恒渲染**（未溢出时值为 0），使面板/告警可判
+        // 「标签基数上限是否已被触达」。放最后一行，便于人眼在长列表末尾看到。
+        let overflow = exits
+            .iter()
+            .find(|(k, _)| k == EXIT_OVERFLOW_LABEL)
+            .map(|(_, v)| *v);
+        if let Some(v) = overflow {
+            exits.retain(|(k, _)| k != EXIT_OVERFLOW_LABEL);
+            for (ip, n) in exits {
+                out.push_str(&format!("free_pool_exit_total{{exit_ip=\"{ip}\"}} {n}\n"));
+            }
+            out.push_str(&format!(
+                "free_pool_exit_total{{exit_ip=\"{EXIT_OVERFLOW_LABEL}\"}} {v}\n"
+            ));
+        } else {
+            for (ip, n) in exits {
+                out.push_str(&format!("free_pool_exit_total{{exit_ip=\"{ip}\"}} {n}\n"));
+            }
+            // 未触达上限：仍渲染 0 值，让「上限已触达」这一状态可被主动查询，
+            // 而不必依赖「序列是否出现」这种间接推断。
+            out.push_str(&format!(
+                "free_pool_exit_total{{exit_ip=\"{EXIT_OVERFLOW_LABEL}\"}} 0\n"
+            ));
         }
         out
     }
@@ -775,6 +956,97 @@ pub async fn serve_metrics(registry: Arc<MetricsRegistry>, addr: &str) {
             inflight.fetch_sub(1, Ordering::SeqCst);
         });
     }
+}
+
+// ---- OPT-R9 C2：无界标签基数护栏（溢出桶）回归锁定 ----
+
+/// 未超上限时，渲染输出与旧实现**逐字节一致**（向后兼容保证）。
+/// 只多了一行 `__overflow__ 0`（恒渲染，用于判「上限是否已触达」）。
+#[test]
+fn opt_r9_c2_rendering_unchanged_below_cap() {
+    let m = MetricsRegistry::new();
+    m.note_free_exit("1.2.3.4");
+    m.note_free_exit("1.2.3.4");
+    m.note_free_exit("5.6.7.8");
+    let text = m.render();
+    // 既有序列形态不变。
+    assert!(text.contains("free_pool_exit_total{exit_ip=\"1.2.3.4\"} 2"));
+    assert!(text.contains("free_pool_exit_total{exit_ip=\"5.6.7.8\"} 1"));
+    // 新增一行 0 值溢出桶（这是本轮唯一的新增行）。
+    assert!(text.contains("free_pool_exit_total{exit_ip=\"__overflow__\"} 0"));
+}
+
+/// 超上限后：新出口并入溢出桶，**基数被真正限制住**。
+#[test]
+fn opt_r9_c2_overflow_bucket_absorbs_beyond_cap() {
+    let m = MetricsRegistry::new();
+    for i in 0..EXIT_LABEL_CAP {
+        m.note_free_exit(&format!("10.0.{}.{}", i / 256, i % 256));
+    }
+    let text = m.render();
+    assert!(
+        text.contains("free_pool_exit_total{exit_ip=\"__overflow__\"} 0"),
+        "恰好用满上限时不应溢出"
+    );
+
+    // 第 513 个出口开始进溢出桶。
+    for i in 0..5 {
+        m.note_free_exit(&format!("192.168.{i}.1"));
+    }
+    let text = m.render();
+    assert!(
+        text.contains("free_pool_exit_total{exit_ip=\"__overflow__\"} 5"),
+        "超出上限的 5 次应全部计入溢出桶"
+    );
+    // 真实序列基数未增长。
+    let real = text
+        .lines()
+        .filter(|l| l.starts_with("free_pool_exit_total{"))
+        .filter(|l| !l.contains("__overflow__"))
+        .count();
+    assert_eq!(real, EXIT_LABEL_CAP, "真实序列数必须被上限钳住");
+}
+
+/// **关键语义**：已达上限后，**已存在的**序列必须继续正常递增。
+///
+/// 旧的无上限实现没有这个场景；一个偷懒的实现会在 `len() >= CAP` 时
+/// 无条件把新计数也塞进溢出桶，导致前 512 个出口的统计**静默冻结**——
+/// 那比无界增长更难发现（数据看起来还在，只是不动了）。
+#[test]
+fn opt_r9_c2_existing_series_keep_counting_after_cap() {
+    let m = MetricsRegistry::new();
+    m.note_free_exit("1.1.1.1");
+    // 用满上限。
+    for i in 0..EXIT_LABEL_CAP - 1 {
+        m.note_free_exit(&format!("10.0.{}.{}", i / 256, i % 256));
+    }
+    // 触达上限后再写已存在的序列。
+    for _ in 0..100 {
+        m.note_free_exit("1.1.1.1");
+    }
+    let text = m.render();
+    assert!(
+        text.contains("free_pool_exit_total{exit_ip=\"1.1.1.1\"} 101"),
+        "已存在的序列在达上限后必须继续递增，不得静默冻结"
+    );
+}
+
+/// 空串不记（存量语义保留）。
+#[test]
+fn opt_r9_c2_empty_exit_ip_not_counted() {
+    let m = MetricsRegistry::new();
+    m.note_free_exit("");
+    let text = m.render();
+    assert!(
+        text.contains("free_pool_exit_total{exit_ip=\"__overflow__\"} 0"),
+        "空串不得进溢出桶"
+    );
+    let real = text
+        .lines()
+        .filter(|l| l.starts_with("free_pool_exit_total{"))
+        .filter(|l| !l.contains("__overflow__"))
+        .count();
+    assert_eq!(real, 0, "空串不得产生任何真实序列");
 }
 
 #[cfg(test)]
@@ -983,6 +1255,71 @@ mod tests {
         assert_eq!(m.channel_dropped_count(), 3);
         assert!(m.render().contains("telemetry_dropped_total 7"));
         assert!(m.render().contains("telemetry_channel_dropped_total 3"));
+    }
+
+    /// OPT-R15：落地端健康三件套的**懒出现**语义。
+    ///
+    /// 关键设计：未配置/未跑过的落地端**不渲染任何行**（而不是渲染 `up=0`）。
+    /// 否则「ClickHouse 压根没配」的部署会被 `telemetry_sink_up == 0` 告警直接误伤——
+    /// 告警的默认状态必须是"沉默"，而不是"一片红"。
+    #[test]
+    fn sink_health_is_lazy_per_backend() {
+        let m = MetricsRegistry::new();
+        let r = m.render();
+        // HELP/TYPE 头行常驻（与其它指标族一致），所以只能断言**样本行**不存在。
+        assert!(
+            r.contains("# TYPE telemetry_sink_up gauge"),
+            "指标族声明应常驻"
+        );
+        assert!(
+            !r.contains("telemetry_sink_up{backend="),
+            "未跑过时不得出现 sink 样本行，否则未配置的落地端会误报 down"
+        );
+        assert!(!r.contains("telemetry_sink_failures_total{backend="));
+        assert!(!r.contains("telemetry_sink_last_ok_unixtime_seconds{backend="));
+    }
+
+    /// OPT-R15：失败→成功 的状态机与失败计数、last_ok 刷新。
+    ///
+    /// 覆盖这次要修的真问题：鉴权/连通性失败时遥测**静默丢光**，而
+    /// `telemetry_dropped_total` 只说"丢了多少"、不说"哪一级丢了、还通不通"。
+    #[test]
+    fn sink_health_tracks_failure_then_recovery_per_backend() {
+        let m = MetricsRegistry::new();
+        // Redis 失败一次 → up=0、failures=1、last_ok 仍无（从未成功）。
+        m.mark_sink_failed("redis");
+        let r = m.render();
+        assert!(r.contains("telemetry_sink_up{backend=\"redis\"} 0"));
+        assert!(r.contains("telemetry_sink_failures_total{backend=\"redis\"} 1"));
+        assert!(r.contains("telemetry_sink_last_ok_unixtime_seconds{backend=\"redis\"} 0"));
+        // ClickHouse 成功 → 独立序列，不受 Redis 影响（两级必须可分辨）。
+        m.mark_sink_ok("clickhouse");
+        let r = m.render();
+        assert!(r.contains("telemetry_sink_up{backend=\"clickhouse\"} 1"));
+        assert!(r.contains("telemetry_sink_up{backend=\"redis\"} 0"));
+        // last_ok 必须是**真实 Unix 秒**而不是 0/1 占位，否则告警算不出"多久没写"。
+        let last_ok: u64 = r
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("telemetry_sink_last_ok_unixtime_seconds{backend=\"clickhouse\"} ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .expect("clickhouse last_ok line");
+        assert!(
+            last_ok > 1_700_000_000,
+            "last_ok={last_ok} 应为真实 Unix 秒"
+        );
+        // Redis 恢复 → up 回 1，但失败计数**保留**（累计故障史不能被恢复抹掉）。
+        m.mark_sink_ok("redis");
+        let r = m.render();
+        assert!(r.contains("telemetry_sink_up{backend=\"redis\"} 1"));
+        assert!(r.contains("telemetry_sink_failures_total{backend=\"redis\"} 1"));
+        // 连续失败要累加。
+        m.mark_sink_failed("redis");
+        m.mark_sink_failed("redis");
+        assert!(m
+            .render()
+            .contains("telemetry_sink_failures_total{backend=\"redis\"} 3"));
     }
 
     #[test]

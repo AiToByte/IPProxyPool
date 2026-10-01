@@ -1,6 +1,6 @@
 # 任务执行流水日志（IPProxyPool GW-R1）
 
-> 本文件只留活跃轮条目，历史查 `banyan-skills/archive/README.md` 方法（本仓暂未归档）。
+> 本文件只留活跃轮条目。历史归档方法见 banyan-skills 仓（独立仓库，不随本仓分发）；本仓暂未归档。
 > 跟踪表：`plan/2026年9月19日-GW-R1实施计划.md`。
 
 ### [2026-09-19 12:00] GW-R1 规划完成：dated计划落plan/ + TASK_PLAN初始化
@@ -746,15 +746,21 @@
 
 ### [2026-09-28] 步骤 31 立项: OPT-R6 止血优化（3×P0＋P1 supervisor 覆盖）
 - **前置**：全仓审阅（Rust 源码 + 部署/文档/工具链双路）产出 90 条风险清单；3 个 P0 全部**逐行实证确认**（非推测），落库方案 plan/2026年9月28日-OPT-R6止血优化方案.md。
-- **P0-1（安全，最急）**：free 凭据护栏可一行头绕过。gateway.rs:96-102 仅在 X-Proxy-Tier=="free" 时拦截，而 outer.rs:222-237 无 tier 约束时按权重**本就可能命中 free 节点** ⇒ 带 Authorization/Cookie 但不发 tier 头的请求可经陌生免费出口泄露凭据；ree_pool.rs:733 注释承诺的「Transparent 永不服务认证流量」与 FREE_REQUIRE_ELITE 默认关相互矛盾。修法：判定输入从「请求声明 tier」改为「**实际选中节点档位**」（选路后校验，粘滞/新鲜共用）。
-- **P0-2（可用性）**：淘汰计数下溢。outer.rs:145-150 等 efore - len() 两次取值间 session_store 被数据面并发 insert（:322）⇒ debug panic / release 回绕。同类三处：outer.rs:150,155、socks_bridge.rs:274、prober.rs:113。放大链路：sweep 是裸 spawn（main.rs:652）**无 supervisor**，panic 即静默死亡 → 会话/隔离表无界增长至 OOM。修法：共享 emoved_count 助手 + saturating_sub。
+- **P0-1（安全，最急）**：free 凭据护栏可一行头绕过。gateway.rs:96-102 仅在 X-Proxy-Tier=="free" 时拦截，而 
+outer.rs:222-237 无 tier 约束时按权重**本就可能命中 free 节点** ⇒ 带 Authorization/Cookie 但不发 tier 头的请求可经陌生免费出口泄露凭据；ree_pool.rs:733 注释承诺的「Transparent 永不服务认证流量」与 FREE_REQUIRE_ELITE 默认关相互矛盾。修法：判定输入从「请求声明 tier」改为「**实际选中节点档位**」（选路后校验，粘滞/新鲜共用）。
+- **P0-2（可用性）**：淘汰计数下溢。
+outer.rs:145-150 等 efore - len() 两次取值间 session_store 被数据面并发 insert（:322）⇒ debug panic / release 回绕。同类三处：
+outer.rs:150,155、socks_bridge.rs:274、prober.rs:113。放大链路：sweep 是裸 spawn（main.rs:652）**无 supervisor**，panic 即静默死亡 → 会话/隔离表无界增长至 OOM。修法：共享 
+emoved_count 助手 + saturating_sub。
 - **P0-3（门禁）**：live.yml:22-28 的 CH service 不挂  01_schema.sql，而全仓无 CREATE TABLE ⇒ ch_sink.rs:598 必失败；且 :3 宣称的 SKIP 门未实现（:35-36 无断言），ch_sink.rs:526/538/551 三处 SKIP 会静默 return ⇒ **依赖全挂也报绿**。唯一集成测试门从未真正跑通。
 - **P1（联动）**：4 条裸 spawn 无 supervisor（main.rs:318 prewarmer／:417 telemetry／:488 prober／:652 sweep）⇒ panic 等于功能永久静默死亡。S2 与 V1 必须同批落地才能真正消除 OOM 链路。
 - **范围纪律**：其余 P1/P2 已在方案「不在本轮范围」显式登记（可观测性组/部署组/结构组），无静默丢弃；每个修复配回归单测；S1 属**行为收紧**（破坏性），已在方案决策 1 写明理由与存量影响面。
 
 ### [2026-09-28] 步骤 31 完成: OPT-R6 止血优化（3×P0＋P1 supervisor 覆盖）
 - **S1（P0 安全，free 凭据护栏）**：新增 ree_node_exits_with_credentials（按**实际选中节点**档位判定）＋has_authorization/has_cookie 助手；接入 upstream_peer（HTTP）与 serve_via_socks（SOCKS，逐跳重试内每跳重判）两条出站路径。保留显式 	ier=free 提前拒绝；付费节点零变化；比较用 eq_ignore_ascii_case（零分配，避免热路径 String）。**6 项回归单测全绿。**
-- **S2（P0 可用性，淘汰计数下溢）**：新增 gateway/src/janitor.rs（emoved_count 单一真源，附完整单测）；outer.rs/socks_bridge.rs/prober.rs 三处改饱和减法。**红测有效性实证**：临时回退为普通减法后，opt_r6_s2_sweep_survives_concurrent_session_writes（Barrier＋双线程真实竞态）立即 panic ttempt to subtract with overflow，与 P0 根因逐字一致；恢复后全绿。
+- **S2（P0 可用性，淘汰计数下溢）**：新增 gateway/src/janitor.rs（
+emoved_count 单一真源，附完整单测）；
+outer.rs/socks_bridge.rs/prober.rs 三处改饱和减法。**红测有效性实证**：临时回退为普通减法后，opt_r6_s2_sweep_survives_concurrent_session_writes（Barrier＋双线程真实竞态）立即 panic ttempt to subtract with overflow，与 P0 根因逐字一致；恢复后全绿。
 - **S3（P0 门禁，live workflow）**：挂 CH schema 到 initdb（landed=1 前提）＋依赖可达性前置门＋CH healthcheck＋**SKIP 断言门**（grep -qE '^SKIP' 命中即红）＋失败 artifact 上传。YAML 解析验证通过；SKIP 门逻辑三态实测（无 SKIP 放行／行首 SKIP 判红／行中含 SKIP 字样放行，证 ^ 锚定必要）。
 - **V1（P1 supervisor 覆盖）**：prewarmer/prober/sweep 三条裸 spawn 包 supervise_until（prober 的 CanaryProber/Semaphore 下沉闭包内以支持重启）；telemetry 因 Receiver 不可 Clone 改为**有尽监督**（崩溃记 supervisor_restarts_total{worker="telemetry"} 后停止，不假装自愈）。现 9 个后台 worker 全部有监督。**3 项回归单测全绿。**
 - **四门全绿**：fmt exit=0；clippy -D warnings exit=0；cargo test **223 passed 0 failed 4 ignored**（基线 213 → +10）；bench exit=0；cargo test --release bandit 12 passed。
@@ -762,7 +768,8 @@
 - **诚实记录**：①S1 的两个 Pingora 钩子因 Session 不可构造无法单测，「护栏被调用」靠走查＋端到端，已在测试注释显式写明盲区；②S3 未在 Actions 真跑，仅做 YAML＋门逻辑验证；③新增 1 个纯函数助手模块 janitor.rs；④本机 RUSTUP_HOME 误设为空的 D:\DevSoft\rustup，真实 MSVC 工具链在 C:\Users\xiaoj\.rustup（rustc 1.93.0）。
 - **落库**：本条目＋plan §状态表✅＋TASK 31✅；禁未授权 commit。
 ### [2026-09-28] 步骤 32 立项: OPT-R7 可观测性与部署加固
-- **前置**：承接步骤 31 后的审阅 P1 清单；本轮所有断言**逐条实证**——线上 SHOW CREATE TABLE proxy.proxy_telemetry_log 确认排序键为 (target_domain, provider, status_code, event_time) 且**零跳过索引**；ules.yml 逐行读确认两处 PromQL 语义 bug；docker ps 确认 ipproxy-clickhouse 长期 unhealthy。
+- **前置**：承接步骤 31 后的审阅 P1 清单；本轮所有断言**逐条实证**——线上 SHOW CREATE TABLE proxy.proxy_telemetry_log 确认排序键为 (target_domain, provider, status_code, event_time) 且**零跳过索引**；
+ules.yml 逐行读确认两处 PromQL 语义 bug；docker ps 确认 ipproxy-clickhouse 长期 unhealthy。
 - **A 组（查询性能，P1）**：nalytics.rs:88-91 的唯一查询按 provider + country + event_time 过滤，而排序键首位 	arget_domain 不在任何 WHERE 里、country 根本不在排序键中 ⇒ 每次 SLA 查询**分区全扫描**；endor_arbitrage 每分钟并发 9 次，90 天累积线性劣化。ClickHouse 排序键**不可 ALTER**，只能重建表 ⇒ 提供  02_reorder.sql，**只写脚本不在生产执行**。
 - **B 组（告警语义，P1）**：①TelemetryStreamLagGrowing 对 gauge 用 increase() 且阈值 >0 ⇒ **系统健康时永久 firing**；②SupervisorRestarted 无 sum by (worker) 而 annotation 用 $labels.worker ⇒ 聚合后标签消失、无法定位 worker。补三类零告警：延迟／源站熔断／遥测丢数。
 - **C 组（部署，P1）**：①CH healthcheck 用 wget --spider 而项目文档自承该探针不可靠，gateway 服务又 depends_on: clickhouse: service_healthy ⇒ **--profile gateway up 下网关永不启动**；②prometheus **无持久化卷**，每次 recreate 全量历史指标归零；③alertmanager receiver 为 empty ⇒ **所有 firing 静默丢弃**。
@@ -782,25 +789,581 @@
 - **四门全绿**：fmt/clippy exit=0；cargo test **226 passed 0 failed 4 ignored**（223 → +3）；bench exit=0；cargo test --release bandit 12 passed。
 - **待验证**：告警端到端 firing 演练未做（12 条全 inactive）；Linux 侧 host.docker.internal 不可解析致 GatewayDown 永久 firing（本轮未修，需 Linux 实测给方案）；Grafana 面板语义属 P2 批次未动。
 ### [2026-09-28] 步骤 33 立项: OPT-R8 凭据与运维脚本加固
-- **A 组（凭据出 argv，P1）**：用 Select-String 逐条实测确认泄漏面共 **9 处**——compose 侧 4 处（edis-server --requirepass、healthcheck edis-cli -a、REDIS_URL 内嵌密码、CLICKHOUSE_PASSWORD 环境），脚本侧 5 处（ipp.ps1:78/102 与 ackup.ps1:58 的 edis-cli -a；ipp.ps1:79 与 ackup.ps1:68/74 的 curl --user／clickhouse-client --password；ipp_free_test.ps1:62 还硬编码了 proxy:123456）。任何同机用户可经 Get-CimInstance Win32_Process／/proc/<pid>/cmdline 读到。
-- **B 组（脚本健壮性，P1）**：①ackup.ps1:78/83 硬编码卷名 → 用 -p other 或 COMPOSE_PROJECT_NAME 时 docker run -v 自动建**空卷**，tar 打包空目录后照常打印 ALL BACKUP DONE ⇒ **静默备份空卷**；修法双重＝卷名推导 ＋ **产物校验**（校验比参数化更关键）。②ipp_watchdog.ps1:68-83 身份探针写死 mock-*，而 docs/OPERATION.md:42-43 的真 Key 灰度流程要求把 mock 换成真实节点 ⇒ 换完后**无限重拉**（每 3 轮约 90s）；修法「端口归属＋HTTP 探活」双判据，mock- 降为日志指纹。③ipp_free_test.ps1:50-58 的 $verdict 初始值 CLEAN，而 -match 对 $null 返回 $false ⇒ 网关 502/503/超时时判定**停留在 CLEAN**——**失败方向与安全方向相反**；修法加 UNKNOWN 态＋非零退出码。④estore.ps1 只有 dry-run，FEATURES.md 引用的 --dry-run 参数还不存在 ⇒ **有备份无恢复**。
+- **A 组（凭据出 argv，P1）**：用 Select-String 逐条实测确认泄漏面共 **9 处**——compose 侧 4 处（
+edis-server --requirepass、healthcheck 
+edis-cli -a、REDIS_URL 内嵌密码、CLICKHOUSE_PASSWORD 环境），脚本侧 5 处（ipp.ps1:78/102 与 ackup.ps1:58 的 
+edis-cli -a；ipp.ps1:79 与 ackup.ps1:68/74 的 curl --user／clickhouse-client --password；ipp_free_test.ps1:62 还硬编码了 proxy:123456）。任何同机用户可经 Get-CimInstance Win32_Process／/proc/<pid>/cmdline 读到。
+- **B 组（脚本健壮性，P1）**：①ackup.ps1:78/83 硬编码卷名 → 用 -p other 或 COMPOSE_PROJECT_NAME 时 docker run -v 自动建**空卷**，tar 打包空目录后照常打印 ALL BACKUP DONE ⇒ **静默备份空卷**；修法双重＝卷名推导 ＋ **产物校验**（校验比参数化更关键）。②ipp_watchdog.ps1:68-83 身份探针写死 mock-*，而 docs/OPERATION.md:42-43 的真 Key 灰度流程要求把 mock 换成真实节点 ⇒ 换完后**无限重拉**（每 3 轮约 90s）；修法「端口归属＋HTTP 探活」双判据，mock- 降为日志指纹。③ipp_free_test.ps1:50-58 的 $verdict 初始值 CLEAN，而 -match 对 $null 返回 $false ⇒ 网关 502/503/超时时判定**停留在 CLEAN**——**失败方向与安全方向相反**；修法加 UNKNOWN 态＋非零退出码。④
+estore.ps1 只有 dry-run，FEATURES.md 引用的 --dry-run 参数还不存在 ⇒ **有备份无恢复**。
 - **范围纪律**：零 Rust 改动；不硬编码任何新凭据；.ps1 改动后须过 OPT-R7 D1 的 BOM 断言；B4 属破坏性操作，演练需用户在场。
 
 ### [2026-09-28] 步骤 33 完成: OPT-R8 凭据与运维脚本加固
-- **A 组**：ipp.ps1/ackup.ps1 的 edis-cli -a 改 docker exec -e REDISCLI_AUTH=，clickhouse-client --password 改 env，curl --user u:p 改 X-ClickHouse-Key 请求头；ipp_free_test.ps1 硬编码 proxy:123456 改读 .env/env。**A3 实测：ipp.ps1 status 返回 PONG/Ok.（凭据经 env 仍认证成功）。**
-- **A1 降级（设计变更，如实说明）**：原计划「Redis 配置文件传密码」降级为**只做 healthcheck 侧**——实测确认 edis-server --requirepass **无环境变量替代**（Redis 自身限制），彻底规避需配置文件＋挂载＋生成器，属更大改动，故该处 argv 泄漏**保留**并在 compose 注释标注。
+- **A 组**：ipp.ps1/ackup.ps1 的 
+edis-cli -a 改 docker exec -e REDISCLI_AUTH=，clickhouse-client --password 改 env，curl --user u:p 改 X-ClickHouse-Key 请求头；ipp_free_test.ps1 硬编码 proxy:123456 改读 .env/env。**A3 实测：ipp.ps1 status 返回 PONG/Ok.（凭据经 env 仍认证成功）。**
+- **A1 降级（设计变更，如实说明）**：原计划「Redis 配置文件传密码」降级为**只做 healthcheck 侧**——实测确认 
+edis-server --requirepass **无环境变量替代**（Redis 自身限制），彻底规避需配置文件＋挂载＋生成器，属更大改动，故该处 argv 泄漏**保留**并在 compose 注释标注。
 - **A5（新增 CI 断言）**：	ools/check_no_plaintext_creds.py 已接入 ci.yml。**双向实测：真实仓库 0 误报；注入 3 类违规全被抓住。断言自身经历 3 轮修正**：①误报自己（文档字符串含违规样例字面量）→ 排除自身；②live.yml 的 $（容器 env 引用，正确形态）被误判 → 放宽为变量引用放行（并顺手把 live.yml 的 --password 123456 字面量改成 $）；③反向验证时发现**真实漏检**——docker exec ... redis-cli -a "" 被第 2 轮规则误放行，补「$env: 必须与 docker exec -e VAR= 同行才算安全注入」。**教训：断言的价值不在一次写对，而在用「正向 0 误报＋反向必抓」双向实测校准；只跑正向会写出自欺欺人的门禁。**
-- **B1（静默备份空卷）**：ackup.ps1 卷名改从 compose 实际项目名推导＋**两道闸**。**双向实测**：错误项目名→第一道闸 olume not found 中止且**未创建空卷**；绕过第一道闸时第二道闸 rchive has only 1 entries (< 3) — backup FAILED 退出 1；正确项目名→CH 2000 条目/433MB、Grafana 6 条目/1MB 正常完成。附带把 Start-Sleep 3 换成 db_bgsave_in_progress 轮询（原写法可能拷到上一版 dump.rdb）。**第一道闸最初是失效的**：原写 if (-not (docker volume inspect  2>))，实测本机 docker volume inspect **对存在的卷也返回 exit=1 并写 stderr 告警** ⇒ 输出非空、-not 恒 false、闸门形同虚设；改用 docker volume ls 列取比对后生效。**这正是「两道闸」的价值——第一道失效时第二道仍抓住了空卷。**
+- **B1（静默备份空卷）**：ackup.ps1 卷名改从 compose 实际项目名推导＋**两道闸**。**双向实测**：错误项目名→第一道闸 olume not found 中止且**未创建空卷**；绕过第一道闸时第二道闸 rchive has only 1 entries (< 3) — backup FAILED 退出 1；正确项目名→CH 2000 条目/433MB、Grafana 6 条目/1MB 正常完成。附带把 Start-Sleep 3 换成 
+db_bgsave_in_progress 轮询（原写法可能拷到上一版 dump.rdb）。**第一道闸最初是失效的**：原写 if (-not (docker volume inspect  2>))，实测本机 docker volume inspect **对存在的卷也返回 exit=1 并写 stderr 告警** ⇒ 输出非空、-not 恒 false、闸门形同虚设；改用 docker volume ls 列取比对后生效。**这正是「两道闸」的价值——第一道失效时第二道仍抓住了空卷。**
 - **B2（看护无限重拉）**：ipp_watchdog.ps1 身份探针改「端口归属（
 etstat -ano 比对可执行路径）＋ HTTP 探活」双判据。**四场景实测**：真供应商 body（无 mock-）旧逻辑 404-foreign（无限重拉）→ 新逻辑 200（健康）；mock 场景两版一致；端口无人监听→
 o-owner（仍重拉）；他人占端口→
 o-owner（不误认）。按 EXEC 教训用 
 etstat -ano 而非 Get-NetTCPConnection（后者 Win11 有卡死 20s+ 实测）。
 - **B3（误判 CLEAN）**：ipp_free_test.ps1 改四态判定＋记录 http_code＋非零退出码。**六场景实测**：503／超时／502 三种失败旧逻辑全判 CLEAN（误判）→ 新逻辑全判 UNKNOWN 且 exit=1；SUSPECT-VPN／TRANSPARENT／真 CLEAN 三种成功场景判定与旧一致（无回归）。附带修了一个隐藏问题：旧代码在 Clash 不可达时 V="UNKNOWN"，Escape("UNKNOWN") 会去响应体里匹配字面 "UNKNOWN"（语义失真），新代码显式跳过。
-- **B4（有备份无恢复）**：estore.ps1 实现 -Execute 真恢复（停服→RDB 拷回→双 tar 回放→起服→行数对账），**默认 dry-run 行为不变**；三道闸＝产物完整性校验＋键入 RESTORE 交互确认（非交互会话直接拒绝）＋分阶段失败即停。**实测**：缺备份时明确报错；产物完整时 dry-run 打印计划且**零写入**、exit 0。**-Execute 属破坏性操作，本轮刻意未演练。**
+- **B4（有备份无恢复）**：
+estore.ps1 实现 -Execute 真恢复（停服→RDB 拷回→双 tar 回放→起服→行数对账），**默认 dry-run 行为不变**；三道闸＝产物完整性校验＋键入 RESTORE 交互确认（非交互会话直接拒绝）＋分阶段失败即停。**实测**：缺备份时明确报错；产物完整时 dry-run 打印计划且**零写入**、exit 0。**-Execute 属破坏性操作，本轮刻意未演练。**
 - **两处 PowerShell 陷阱（已修并留注记）**：①项目名解析连续踩坑——docker inspect -f "{{ index .Config.Labels \"com.docker.compose.project\" }}" 本机返回 **0 行**（PowerShell 双引号串里 \" 不构成对 docker 的转义）；简化模板 {{.Config.Labels.com.docker.compose.project}} 返回字面 **<no value>**（键名含点被当嵌套路径）⇒ 最终用全量 JSON＋ConvertFrom-Json 直读标签。②Write-Output "text " +  的**行尾 + 被 PowerShell 当续行符**，输出出现孤立 + 行 ⇒ 改用 "text "。
 - **一次虚惊如实记录**：验证 restore 时报「backup incomplete（tar MISSING）」，排查确认是**我并发调用了两次 backup**、后一次未写完即被读取——**非脚本缺陷**；但它恰好证明「产物完整性校验」这道闸有效。
 - **四门全绿**：fmt/clippy exit=0；cargo test **226 passed 0 failed 4 ignored**（本轮零 Rust 改动）；bench exit=0；cargo test --release bandit 12 passed。CI 静态门全绿。
 - **落库工具教训（重要）**：EXEC_LOG.md 原为 CRLF，本轮用 ReadAllText/WriteAllText 往返与 git add 曾两次污染该文件（index blob 膨胀到 171770 字节、虚假 diff 1500+ 行），并致已写条目丢失。**正确姿势：git reset + git checkout 恢复后，用 [IO.File]::Open(..., Append) 二进制追加且显式 CRLF，全程不经暂存区。** 本次已按此重做。
-- **待验证（如实登记）**：①estore.ps1 -Execute 真恢复未演练（破坏性，需用户在场）；②容器环境变量仍可被 docker inspect 读到（Docker 固有行为），本项只把暴露面从「同机任意用户」缩到「有 Docker 权限者」；③edis-server --requirepass 的 argv 泄漏保留；④CI 组／结构组／文档组仍待后续立项。
+- **待验证（如实登记）**：①
+estore.ps1 -Execute 真恢复未演练（破坏性，需用户在场）；②容器环境变量仍可被 docker inspect 读到（Docker 固有行为），本项只把暴露面从「同机任意用户」缩到「有 Docker 权限者」；③
+edis-server --requirepass 的 argv 泄漏保留；④CI 组／结构组／文档组仍待后续立项。
 - **落库**：本条目＋plan §状态表✅＋TASK 33✅；禁未授权 commit。
+### [2026-09-28] 步骤 34 立项: OPT-R9 CI 门禁加固与性能结构
+- **前置**：承接步骤 33 后的审阅清单；本轮断言**逐条实证**——读 ci.yml 全文确认 5 条 cargo 命令无 --locked、规则门只有 yaml.safe_load；Get-ChildItem 确认仓库**无** go.mod/.csproj/package.json（故 4 个 SDK 从未被编译过）；定位 
+outer.rs:172 的 ormat!("{}:{ip}", normalize_domain(domain)) 与 metrics.rs:335-343 的无界 DashMap::entry 插入。
+- **A 组（CI 门禁，P1）**：①promtool check rules——**这一条有亲身踩坑依据**：OPT-R7 B2 我写的 403 比值分母用了 sum by(provider)，而 proxy_requests_total 无 provider 标签；yaml.safe_load 全绿、Prometheus health=ok（语法合法），但**结果恒错配**。promtool 的类型检查才能抓。用 Prometheus 官方镜像（版本与 compose 的 2.53.0 一致）避免版本漂移。②配套新增「指标名核对门」——promtool **验不了指标名拼错**（未知序列是合法表达式），故抽取 
+ules.yml LHS 指标名对 metrics.rs 的 # HELP 清单核对，把 OPT-R7 B2 手工做过的核对固化成门。③SDK 编译验证——审阅已发现两处**确定破损**：ipp_sdk_go.go:19 是 package main 而文件头示例写 import ipp "path/to/..."（Go 禁止 import package main，该示例必失败）；ipp_sdk_dotnet.cs:10 的 dotnet run 无 .csproj 直接报错。④--locked ＋ git diff --exit-code Cargo.lock ＋ Swatinem/rust-cache ＋ paths-ignore（docs/OPEN-SOURCE.md:22/63 宣称「锁 Cargo.lock 构建可复现」但 CI 无任何保证）。
+- **B 组（PowerShell 门，P1）**：①ci.yml:42 是 shell: pwsh on ubuntu-latest = **Linux 上的 PS 7**，而 6 个 .ps1 是 **Windows PowerShell 5.1 专属**（#Requires -Version 5.1、schtasks、Get-CimInstance Win32_Process、HKCU:\ 注册表），PS 7 on Linux 的解析器与 cmdlet 集不同 ⇒ **验不到生产真实执行面**；改加 windows-latest job 用真 5.1 跑语法解析断言（[PSParser]::Tokenize，不执行脚本）。②-Severity Error 把 Warning 全丢，而 PSAvoidUsingPlainTextForPassword 等绝大多数规则是 Warning ⇒ 升 Warning 并对存量规则 -ExcludeRule（**如实标注「存量不阻断」取舍**）。
+- **C 组（生产热路径与基数，P1）**：①
+outer.rs:172 的 ormat! + 
+ormalize_domain 位于 matches 的**节点循环内**（经 is_node_quarantined 传导）⇒ 池 N 时每请求 **2N 次 String 分配**，免费池缺省 2000 节点即约 4000 次/请求。修法：隔离表改**两级结构**（domain → ip → expiry），
+ormalize_domain 移出循环；**不缓存 key**（缓存仍需一次 String clone 去查询，省不掉分配且引入无界缓存，得不偿失）。对外 set_quarantine 接口与 **Redis key 生成保持不变**（跨进程协议不动）。②
+ote_free_exit 无容量上限，而免费出口 IP 是**公网随机 IP** ⇒ 标签取值空间无界，长期撑爆 DashMap 与 TSDB。修法用**溢出桶**（512 上限 ＋ label="__overflow__"），**不用截断丢弃**（丢弃会让「用 1M 次」与「用 1 次」在 TopK 上不可区分，造成指标语义断层）。
+- **范围纪律**：零新生产依赖；C1 改热路径**必须复测 release bandit <200ns**（本轮最大回归风险点，单列验收）；CI 组/结构组/文档组其余项已在方案显式登记为后续立项。
+### [2026-09-28] 步骤 34 完成: OPT-R9 CI 门禁加固与性能结构
+- **A1（PromQL 语义门）**：ci.yml 规则门改用 Prometheus 官方镜像跑 promtool check rules（--entrypoint promtool 覆盖镜像默认 ENTRYPOINT；版本 v2.53.0 与 compose 一致）。**反向实测**：注入 histogram_quantile(0.99, "oops", ...) 被抓出 parse error: expected 2 argument(s)。
+- **A1 实测推翻了原计划对 A2 的论证方向（重要）**：原以为「promtool 抓标签错配 ⇒ 补 A2」，实测**恰好相反**——注入 OPT-R7 B2 的原始错误（分母写 sum by(provider) 而 proxy_requests_total 只有 status 标签）后，promtool 报 **SUCCESS: 12 rules found 完全放过**。它只能抓**参数类型**错，做不了运行期标签匹配。⇒ A2 不是「补充」而是**唯一**能抓该类错误的手段（已写进 check_promql_metrics.py 文件头，避免后人误以为重复）。
+- **A2（指标名+标签核对门）**：新增 	ools/check_promql_metrics.py（对 metrics.rs 的 # HELP 与渲染标签逐名核对；含 ProviderForbiddenRatioHigh 的**显式豁免**并附理由——该限制已在 OPT-R7 B2 标注，补上 provider 标签后应删豁免）。断言自身经历 4 轮修正：①误报自己的文档字符串字面量 → 排除自身；②$（容器 env 引用，正确形态）被误判 → 放宽为变量引用放行；③Rust 转义引号 \" 让 [^}]* 正则在 } 处截断致标签提取失败 → 改非贪婪 .*?；④反向验证时发现**真实漏检**。**双向实测**：注入标签错配与指标名拼错均判红。
+- **A3（SDK 编译验证）**：修两处**确定破损**——ipp_sdk_go.go 文件头 import ipp "path/to/..." 与 package main 矛盾（Go 禁止 import package main，示例必编译失败）、ipp_sdk_dotnet.cs 的 dotnet run -- 缺 --project。新增 check_go_sdk.py（复制到临时模块后 go vet+go build）、check_node_sdk.py（
+ode --check）、check_jvm_sdk.py（dotnet build+javac）＋ 	ools/sdk-dotnet/ipp_sdk.csproj 最小工程壳（Compile Include 引用原文件不复制）。**Go/Node 双向实测**（注入 undefinedIdentifierXYZ 与语法错均被抓）；**JVM 本机无工具链，按「跳过不失败」处理并如实标注未实证**（工具缺失返回 2 而非误报失败，已实测）。
+- **A4（可复现性）**：5 条 cargo 命令加 --locked；新增 git diff --exit-code gateway/Cargo.lock 漂移断言；Swatinem/rust-cache@v2 缓存；paths-ignore 忽略纯文档改动。**实测 --locked 全绿**（说明 Cargo.lock 与 manifest 一致，此前「构建可复现」的承诺无任何强制手段）。
+- **B1（PS 5.1 生产面）**：新增 windows-powershell job，用 **Windows PowerShell 5.1**（shell: powershell）跑 PSScriptAnalyzer ＋ [PSParser]::Tokenize 逐文件解析 ＋ BOM 校验。**本机正是 PS 5.1，双向实测通过**（注入无 BOM 文件与语法错均被抓）。
+- **B2（规则严化，设计变更）**：从 -Severity Error（丢弃全部 Warning）改为 **-IncludeRule 白名单**。**相对原计划的变更及理由**：本机装不上 PSScriptAnalyzer（PSGallery 缺 NuGet provider），**无法预先枚举存量告警**，原计划的 -ExcludeRule 黑名单会让 CI 首次运行直接红；白名单规则集固定、不受 PSSA 版本新增规则影响。**同时锁定 PSSA 版本 1.21.0**，修掉审阅指出的供应链漂移风险。**代价**：未列入白名单的规则仍不检查，覆盖面小于「全量 Warning」——已如实登记。
+- **C1（选路 O(N) 分配）**：
+outer.rs 隔离表改两级结构（domain → ip → expiry），
+ormalize_domain 移出节点循环（两个入口各算一次）。**顺带修掉一个真实缺陷**：旧扁平 key "{domain}:{ip}" 在 domain 含 : 时**碰撞**——
+ormalize_domain 对 IPv6 字面量产出 ::1，且既有单测已锁定 
+ormalize_domain("a:b") == "a:b"。**6 项单测**含语义等价/归一化/碰撞修复/空内层回收。
+- **C1 零分配契约测试首版是假测试（三轮修正，如实记录）**：①在函数体内定义分配器但**漏 #[global_allocator]** ⇒ 计数器恒 0、塞回 ormat! 仍绿；②加上后变红，根因是**并行测试线程污染进程级计数器**（--test-threads=1 下绿）；③一度改成「并行下不误报」——**实测这让真实回归溜过**（塞回 ormat! 观察到 2000 次分配却被当作污染放行），**放宽判据的门禁等于没有门禁**，故回退硬断言＋标 #[ignore]＋CI 单独串行跑。最终 CI 命令需**三个参数**才真正跑到它：--test-threads=1、--include-ignored（否则 libtest 跳过并报   passed，门禁静默失效）、--exact 配**完整测试名**（只写函数名过滤不命中，同样静默跑不到）——三个都实测确认。
+- **C2（无界基数）**：metrics.rs 的 ree_exit_total 加 512 上限 ＋ exit_ip="__overflow__" 溢出桶（恒渲染）。**4 项单测**含向后兼容、溢出吸收、**已存在序列达上限后继续递增**（防「统计静默冻结」这一比无界增长更隐蔽的失真）、空串不记。
+- **一次 YAML 陷阱（实测）**：step 名里的**冒号未加引号**（promtool: PromQL types）⇒ YAML 当映射分隔符 ⇒ **整份 workflow 解析失败**。已加引号＋注记。
+- **两次自己的诊断失误（如实记录）**：①误以为 docker inspect -f 的 \" 在 PowerShell 双引号串里能转义（OPT-R8 已踩过同类坑，**该坑值得进检查清单**）；②误把「GBK 终端显示乱码」当成「ci.yml 注释被折断」——逐字节验证后确认注释完好、YAML 合法、11 步齐全。**教训：控制台乱码不等于文件损坏，诊断前先做字节级验证**。
+- **四门全绿**：fmt exit=0；clippy --locked -D warnings exit=0；cargo test --locked --workspace **235 passed 0 failed 5 ignored**（226 → +9）；bench --locked --no-run exit=0；cargo test --locked --release bandit 12 passed（select_best_arm_avg_under_200ns **不回归**——C1 改了热路径，是本轮最大回归风险点）；分配契约门串行 1 passed。CI 静态门全绿（compileall／BOM／creds／promql／promtool／go／node／jvm-skip／compose×2）。
+- **待验证（如实登记）**：①JVM SDK 编译门本机无工具链未实证（CI 用 setup-java/setup-dotnet 固定版本接入，首跑确认）；②PSSA 白名单的存量命中数未知（本机装不上 PSSA，无法预验证；首跑若红需按输出调整）；③ci.yml 本身从未在 Actions 上跑过（3 job／32 步），下次 push 需关注首个 run；④Linux 侧 host.docker.internal；⑤CH 未被 Prometheus 观测；⑥C1 同类的 rm_for 热点（
+ode.addr.clone()）需改臂表键生命周期，留待独立立项。
+- **落库**：本条目＋plan §状态表✅＋TASK 34✅；禁未授权 commit。
+
+### [2026-09-29] 步骤 35 完成：OPT-R10 合规／性能／文档一致性（A1 MaxMind 署名／B1 arm_for 零分配／C1~C2 SDK 错误契约／D1~D2 文档收敛）
+
+- **A1 MaxMind 署名（CC BY-SA 4.0 §3(a) 强制，本轮唯一有法律时效项）**：
+  - 缺口定性——`docs/OPEN-SOURCE.md` 两处声称「OPERATION 有署名行」，而 `docs/OPERATION.md` 当时**只有 GeoLite2 操作步骤、没有任何署名**。这是**对外的不实陈述 ＋ 合规缺口**（非笔误级）。
+  - 处置：`OPERATION.md` 补完整署名块（提供者 `Copyright © MaxMind`／许可名称 `CC BY-SA 4.0`／许可链接／`AS IS` 免责声明／来源 `maxmind.com`）＋ 独立「方法论底座」说明；README 中英双语补指向；`OPEN-SOURCE.md` 措辞改为指向具体章节。
+  - 新门 `tools/check_attribution.py` **双向实测**：正向 5/5 绿；反向删「AS IS」→ exit 1 指出缺免责声明，删许可链接 → exit 1，恢复 → 绿。
+- **B1 `arm_for` 命中路径零分配（生产热路径）**：
+  - 根因——旧实现首行 `let key = node.addr.clone();` **无论命中与否都克隆**。调用点 `select_bandit_node_excluding` 是 `candidates.iter().map(|n| arm_for(...))`，即每候选一次 ⇒ 池 N 个节点时每请求 N 次 `String` 克隆（`FREE_MAX_NODES=2000` 缺省 ⇒ 约 2000 次/请求）。稳态下臂早已建好，**几乎每次都走命中分支，克隆白付**。
+  - 处置——`DashMap::get` 接受 `&str`（`Borrow<str>`），改借用查询 `arms.get(node.addr.as_str())`，把克隆挪到「真正新建臂」的冷路径。**语义零变化**（键、生命周期、`prune_stale_arms` 比对口径均不变）。
+  - 配套——`test_allocs` 分配计数器由 `router::tests` 私有提升为 **crate 级**（`main.rs` 的 `#[cfg(test)] pub mod`）：两个模块的零分配测试要的是**同一个进程级计数器**，而 `#[global_allocator]` 本就作用于整个 test binary。
+  - 3 个新测试：命中/未命中语义（含 `Arc::ptr_eq` 证同一臂，防 bandit 学习状态分叉）、不同节点臂隔离、**零分配契约**。
+  - **红测有效性实测**：把 `clone` 注回命中路径 → 断言失败 `left: 1000`（1000 次分配被抓）⇒ 门确实能捕获真实回归，非纸面通过。
+- **C1/C2 5 SDK 错误契约统一（修两个真实缺陷）**：
+  - **.NET 自相矛盾**——`GetAsync` 内 url 解析失败走 `return (0, msg)`、scheme 非 http 走 `throw ArgumentException`：同一函数、同一类错误两个通道。更糟：原 `catch (Exception)` 把 SDK **自身编程错误**（如误用 `HttpClient` API 抛的 `InvalidOperationException`）也吞成 `(0, message)`，**真 bug 被伪装成网络故障**（反向丢弃诊断信息）。已改：编程错误一律 `ArgumentException`（含 `Uri.TryCreate` 替代 `new Uri`+catch），网络失败只捕获 `HttpRequestException || OperationCanceledException`，其余冒泡。
+  - **Go 静默降级**——原 `Get` 对非 http target 返回 `(0, "only plain http...")`，与真正网络失败**返回值完全同形**，调用方无法区分「传错 https」与「网关不可用」。已改签名 `Get(...) (int, []byte, error)`，编程错误走 `error`（含 `%w` 包裹），网络失败不变。调用点由 `go vet` 门抓出（`assignment mismatch: 2 variables but c.Get returns 3 values`）后同步 self-test，并**新增 https 必返 err 的断言**。
+  - 统一后：编程错误走异常／Go `error`（status 恒 0）；网络失败**一律不抛**，返回 status=0＋body 诊断。Python/Java/Node 侧**实现本就正确、只是没文档**——新门首跑即报此缺失，补文档注释后绿。
+  - 新门 `tools/check_sdk_contract.py` **不依赖任何编译器**（.NET 本机无 SDK、NuGet provider 缺失装不上；历史上 .NET 正是唯一「改了没人编译」的那个，故缺陷能长期存活）。含**反向断言**（检出无过滤 `catch(Exception)`／URL 解析走 return 通道即判红），已实测红→绿。
+  - 文档：`docs/USAGE.md` 中英双语补「SDK 错误契约」节（表格＋正确用法＋反模式＋为何统一）。
+- **D1 单测数收敛＋权威基线**：
+  - 实测漂移——`docs/FEATURES.md` 停在 **209**（落后 5 轮）、`README.md` 停在 **235 且 live 写成 5（实为 4）**。
+  - 关键设计——数字散落 10+ 文件、手改必漂；且**同一批数字里有「当前值」（该更新）与「历史值」（改了就是伪造记录）**，人肉分辨必然出错。故建 `docs/QUALITY_BASELINE.md` 作**唯一权威来源**，新门 `tools/check_doc_consistency.py` **只扫活文档**（ALLOWLIST），**不扫** `CHANGELOG/TASK_PLAN/plan/EXEC_LOG`（OPT-R4 收官确为 201，是史实）。
+  - 双向实测：正向 6 文档一致；反向把 README 改回 235 → exit 1 精确指出 `README.md:14 写着 235，但基线是 237`。
+- **D2 孤儿文档收口**：
+  - `manual/` 7 份 v1 草稿（122KB、零入链、已确认失实：写 `0.0.0.0:8080`／声称 P99<5ms 而实测 65ms）→ 逐份加**已废弃横幅**（列出具体失实项＋指向现行文档）＋ 新建 `manual/README.md` 归档说明（讲清**为何保留**「删除会丢失演进轨迹」与**为何不改**「保留历史错误原文是刻意的，改掉等于伪造当时记录」）。
+  - README 中英双语文档导航补 `USAGE/FEATURES/DATAFLOW/QUALITY_BASELINE/OPEN-SOURCE`＋`manual/` 废弃标注（实测 `USAGE.md` 此前虽在 README 有链，但 `README.md:53` 英文导航里链的是 `USER-GUIDE.md` 另一个文件）。
+  - `banyan-skills` 悬空引用消除：`OPERATION.md:3`／`EXEC_LOG.md:3` 原引用 `banyan-skills/archive/README.md`。**核实**：`git ls-files banyan-skills` = 0 跟踪文件、`.gitignore:6` 有 `/banyan-skills/` ⇒ 该目录是**本地克隆、不随本仓分发** ⇒ 对克隆者确属悬空。改为纯文字说明（独立仓库、不随本仓分发、本仓暂未归档），全仓 grep 复验无悬空路径。
+- **CI 接入**：3 个新门全部入 `.github/workflows/ci.yml`——`check_attribution.py`（唯一有法律时效项）、`check_sdk_contract.py`（免编译）、`check_doc_consistency.py`（活文档数字门）。`allocation-contract` 步骤改为 for 循环覆盖**两个**分配契约测试，沿用 `grep -q "1 passed"` 兜底。
+- **CI 侧同步修正**：`allocation-contract` 的 CI 命令实测踩坑记录补全——本轮首次本地复跑时漏了模块路径（`--exact` 配短名）→ `0 passed` 静默失效，与 OPT-R9 记录的同一坑一致，故把「三个参数缺一不可」的理由写进注释。
+- **门禁实测（全部本机执行，非推断）**：
+  - `cargo fmt --check` 绿；`cargo clippy --locked --workspace --all-targets -- -D warnings` 绿。
+  - `cargo test --locked --workspace` = **237 passed / 0 failed / 6 ignored**（上轮 235；本轮 +2 语义测试 +1 ignored 分配契约）。6 ignored 构成已核实并落库：4 真 live（analytics/ch_sink/circuit_breaker/telemetry）＋ 2 串行分配契约。
+  - 两个分配契约**串行各 1 passed**（`--test-threads=1 --include-ignored --exact`，CI 同款命令）。
+  - `cargo bench --locked --workspace --no-run` 绿；`cargo test --locked --release bandit` = 12 passed（8 臂 <200ns 未回归）。
+  - 9 个 Python 门全绿（attribution/sdk_contract/doc_consistency/go/node/jvm/creds/promql/ps1_bom）＋ `compileall` 绿。
+- **诚实标注（未在本机验证）**：
+  - `check_jvm_sdk.py` 本机 **skipped**（无 JDK；.NET SDK 缺失且 NuGet provider 缺失装不上）⇒ C1 的 **.NET 改动本机无任何编译验证**，其正确性依赖 CI 的 `check_jvm_sdk.py --dotnet` ＋ 本轮新增的免编译契约门。**不得**声称 .NET 改动已编译通过。
+  - Java 侧本轮仅补文档注释（未改逻辑），`javac` 未跑。
+  - GitHub Actions 尚未实跑；CI 改动（3 个新门 ＋ allocation-contract 循环）的真实执行结果未知。
+  - Linux 侧 `host.docker.internal`、ClickHouse Prometheus exporter 仍在本轮范围外。
+- **不 commit**：工作树保留 OPT-R6~R10 全部未提交变更，未获授权不提交。
+### [2026-09-29] 步骤 36 完成：OPT-R11 残留 P0 根治与选路零物化（A1 臂表下溢／A2 Instant 溢出／B1 流式选路／C1 隔离表水位）
+
+- **勘察（先定范围，再动手）**：对 `gateway/src` 20 文件做全量深审——181 处 `unwrap/expect/panic` 逐点分类（**165 处在测试内**、16 处在生产路径）、13 个 `DashMap` 插入点逐个回溯 key 来源、数据面选路链的分配点逐个定位。三条决定范围的结论：
+  - **OPT-R6 S2 漏了一处 P0**：`janitor.rs` 注释自述修「三处」，而 `gateway.rs:247` 的 `prune_stale_arms` 是**第 4 处同构写法**，且其表正是数据面 `arm_for` 并发 `insert` 的同一张。
+  - **`metrics.rs` 没有第二个无界 key**：11 个 `DashMap` 的 key 全部是字面量或经 `free_pool.rs` `intern_name` 固化的 `&'static str`，基数被 `config.api_urls/html_urls/github_urls` 长度钉死（除已加 512 上限的 `free_exit_total`）。**真正的无界 key 在 `metrics.rs` 之外**。
+  - **鉴权不存在时序攻击**：`tenant.rs:119` 用 `DashMap::get` 哈希查找，比裸 `String ==` 安全。故**未把「加常量时间比较」列为本轮项**——那会为一个不存在的威胁模型增加 `subtle` 供应链面。
+
+- **A1 `prune_stale_arms` 计数下溢（P0，第 4 处漏网）**：
+  - 修法：改用已存在且已有穷举单测的三态语义助手 `janitor::removed_count`（饱和减）。**行为零变化**（纯删除时与普通减法逐值等价）。
+  - **红测实证**：新增 4 个测试。其中 `opt_r11_a1_prune_stale_arms_sane_under_real_concurrency`（2000 条表 ＋ 4 写线程 ＋ 2000 轮修剪）在修复前**实测 panic 于 `src\gateway.rs:247`**——正是那行未修的 `before - arms.len()`。
+  - 另两条**确定性**测试锁死「旧写法在并发生长下必 panic」与「release 下回绕成天文数字」，把前提从注释变成断言。
+  - **同步修文档债**：`janitor.rs` 模块头「三处」→「四处」并列出第 4 处与各自写入方，并新增「教训：单一真源也会漏收编」段——用「列举已知实例」收敛同构缺陷时，注释里那份清单本身会变成误导。
+
+- **A2 SOCKS 总预算 `Instant` 加法溢出 panic（P0，本仓第 4 处同类防护漏网）**：
+  - 链路已核实：`env_secs`（`main.rs`）只过滤 `<= 0`、**无上限** ⇒ `SOCKS_BRIDGE_TIMEOUT_SECS` 可设 `u64::MAX`；`socks_overall_budget` 只 `saturating_add(8s)`、**不封顶**；最终落到 `Instant::now() + budget`。
+  - 危害高于 A1：触发只需**一个 env ＋ 一个带 `X-Proxy-Proto: socks5` 的请求，无需任何权限**。
+  - 修法：新增 `clamp_bridge_timeout`（上限 1 天，复用 `QUARANTINE_MAX_TTL_SECS`），**钳在读入处**（`SocksBridge::new` 是唯一入口）以杜绝多处防漏。风格与既有 `clamp_free_ttl` 一致。
+  - **红测实证**：`opt_r11_a2_unclamped_instant_add_panics` 用 `catch_unwind` 断言**未钳制**版本确实 panic（若不 panic 则说明缺陷前提不成立，红测失去意义）；绿测逐值锁定 7 个合理值原样通过。测试**直接调用真实 `crate::clamp_bridge_timeout`**，不在测试里复制实现。
+
+- **B1 每请求两次 O(N) `Vec` 物化（本轮最大性能收益）**：
+  - 已核实物化点：`router.rs` `get_healthy_candidates_excluding` ＋ `select_node_excluding` 步骤 2（`Vec<Arc<ProxyNode>>`），`gateway.rs` `select_bandit_node_excluding`（`Vec<Arc<BanditArm>>`），外加选完臂后 `find(|n| n.addr == best.key)` 的**第三次**扫描。`FREE_MAX_NODES=2000` 时每请求约 2KB＋16KB 分配 ＋ 约 11 次 realloc。
+  - 关键论证（决定修法形态）：`pick_weighted` 只需 `total`＋roll＋一次扫描，**天然可流式**；`select_best_arm` 经核实是**单趟打分、只留最优**，同样可流式。均改为**流式**（router 侧两趟、bandit 侧单趟），并借流式**顺带消掉第三次扫描**（打分时同步记录节点；臂键即 `addr` 且池内唯一 ⇒ 等价）。
+  - 边界控制：新增 `RouterEngine::with_pools` 闭包式只读访问器，**不泄漏 `ArcSwap` guard 类型**（该类型在模块内被同名 `Arc` 遮蔽），且从**类型上**保证「快照只在闭包期间有效」——把「不跨 await 持引用」从口头约定变成机制保障。`get_healthy_candidates*` 是 `pub` 且被 prober/prewarmer/测试使用，**保留该 API**，只让数据面不走它。
+  - **差分测试抓到真实不一致**：`weights=[0,0,0,0]` 分支下两版选中项不同。根因——物化版用 `SliceRandom::choose`，而 rand 的 `choose` 内部用 `gen_index`（Lemire 宽化乘法），与 `Rng::gen_range` **不同源**；要复刻就得依赖 rand 内部实现（升级即可能变），属错误的依赖方向。
+  - 处置：先**核实**该分支在生产中**可证明不可达**（`matches` 首句即 `if node.weight == 0 { return false; }` ⇒ 每候选 `weight >= 1` ⇒ `total >= count > 0`），再把测试拆为「加权分支 256×6 组严格对拍」＋「防御分支只验合法性 ＋ 恰好上限必须放行」，并新增 `opt_r11_b1_matches_rejects_zero_weight` **把「不可达」从注释变成断言**。
+  - 零分配契约红测有效性：用 `std::hint::black_box` 确保注入的物化**不被 LLVM 消除**（首版未加 black_box 时只测到 `left: 1`——未使用的 `Vec` 被优化掉了，等于假验证），注入后实测 `left: 65000`（1000 轮 × 65）被精确捕获。
+  - 收益边界诚实标注：这是**分配/缓存局部性**优化，**不改变 asymptot 的 O(N)**（bandit 打分 O(N·d²) 是语义要求）。`ArcSwap::load()` 的 guard 是引用计数而非阻塞锁，两趟遍历不阻塞写侧。
+
+- **C1 `quarantine_map` 外层 key 无界（P1 资源/安全）**：
+  - 已核实：外层 key 是**客户端可控的归一化 `Host`**（写入源自遥测 `domain` 字段）；`apply_delta` 的 Redis PubSub 入口更直接，`parse_delta_message` **只校验 `ttl` 范围与 domain/ip 非空**，长度与条目数一概不设防。sweep 只能回收空内层 map，救不了窗口内（TTL 上限 24h）的外层条目。
+  - 一致性论点：会话表**已有**双层防护（`SESSION_ID_MAX_BYTES=64` ＋ `SESSION_MAX_ENTRIES=8192`），而隔离表两样都没有——**同一仓内两张客户端可影响的表，防护水平不一致**。
+  - 修法：新增 `QUARANTINE_DOMAIN_MAX_BYTES=253`（字节判定、**不截断**）＋ `QUARANTINE_MAX_DOMAINS=8192`（软水位），在 `set_quarantine` 落表前过两道准入；PubSub 解析层**同源**拦一次。**行为显式声明**：超长/超水位即拒绝落表（与超长 session_id 不落表同语义）；**不驱逐**已有 domain（驱逐正在生效的隔离等于放行攻击流量）。水位卡**外层**而非内层（内层为空的外层条目几乎只花钱不办事），且刻意与 `quarantine_len()`（内层 ip 总数，供 metrics gauge）的口径区分。
+  - **修了我自己两个测试缺陷**：①首版用 `const CAP=4` 造满水位，但生产上限是 8192 —— 4 远未达水位，`set_quarantine` 本就应放行。已改为塞满**真实** 8192，让测的是生产上真实会发生的路径（教训：用假阈值测真逻辑，往往能绿一段时间直到逻辑改动才炸，更糟的是它断言的是生产永不触发的场景）。②LLM 生成的测试曾被误插进 `circuit_breaker.rs`（该模块无 `RouterEngine`），已移除并改写为属于它自己的 `parse_delta_message` 长度闸门测试。
+
+- **CI 接入**：`allocation-contract` 步骤扩为**三个**测试的循环（新增 B1 流式选路）。注释里补记 OPT-R11 再次踩中同一坑的实例——新增的第三个测试在加入串行循环前一直是 `ignored`、**从未真正跑过**，首次实跑立刻暴露其自身缺陷（循环内 `rand::thread_rng()` 的首次 TLS 初始化被计入计数窗口，`left: 1`），修法是 rng 提到窗口外并显式预热。这也再次证明「三项参数缺一不可」的注记有实际价值。
+
+- **门禁实测（全部本机执行，非推断）**：
+  - `cargo fmt --check` 绿；`cargo clippy --locked --workspace --all-targets -- -D warnings` 绿（中途被 clippy 抓到并已修：doc 列表续行未缩进、差分测试里 `vec!` 冗余）。
+  - `cargo test --locked --workspace` = **252 passed / 0 failed / 7 ignored**（上轮 237/6；本轮 ＋15 单测 ＋1 ignored 分配契约）。7 ignored ＝ 4 真 live ＋ 3 串行分配契约，已同步 `docs/QUALITY_BASELINE.md`／README／FEATURES 并由 `check_doc_consistency.py` 复验。
+  - 三个分配契约**串行各 1 passed**（`--test-threads=1 --include-ignored --exact`）；`cargo bench --locked --workspace --no-run` 绿；`cargo test --locked --release bandit` = 12 passed（8 臂 <200ns 未回归）。
+  - 9 个 Python 门全绿（attribution/sdk_contract/doc_consistency/go/node/jvm/creds/promql/ps1_bom）＋ `compileall` 绿。
+
+- **明确不做（避免制造不存在的威胁或未授权的行为变更）**：
+  - **API Key 常量时间比较**：代码用 `DashMap::get` 哈希查找，比裸 `==` 安全，不存在时序攻击。加 `subtle` 依赖是为不存在的威胁模型扩大供应链面。
+  - **`default_key` 策略收紧**（深审 Top5 之 5：`default_key` 明文硬编码、qps/并发均 10000、`REQUIRE_API_KEY=0` 一个 env 即可让无头请求获得默认租户）：**属行为变更**，改默认 key 或「缺省即启动失败」会让现有部署升级即挂。**需用户决策**，已记入方案 §5 待办，本轮未擅自改。
+  - Linux `host.docker.internal`（本机无 Linux）、PSScriptAnalyzer（NuGet provider 缺失装不上）、CH Prometheus exporter（需新依赖）——沿 R9/R10 诚实登记。
+  - `circuit_breaker.rs` 的扁平 PubSub/Redis key 用 `:` 拼接：改它会**破坏跨实例互操作**，仅记录不动。
+
+- **诚实标注**：GitHub Actions 尚未实跑，CI 改动（3 个分配契约循环）的真实执行结果未知；Java 侧本轮未改逻辑、`.NET`/Java 编译门本机 skipped（无 SDK）⇒ 不得声称编译通过。
+- **不 commit**：工作树保留 OPT-R6~R11 全部未提交变更，未获授权不提交。
+### [2026-09-29] 步骤 36 补充：OPT-R11 B1 真实网关回归（含 pre-B1/B1 双二进制 A/B 对照）
+
+- **目的**：B1 改写了数据面选路（每请求两次 O(N) 物化 → 流式），单测与差分测试已证等价，但**活流量下的行为一致性未被验证**。用户要求先跑真实网关回归。
+- **环境（按仓库铁律搭建，EXEC_LOG:48 / TASK_PLAN:51）**：
+  - 禁 `Get-NetTCPConnection`（Win11 会卡死 >120s），一律 `curl --max-time` 探活；
+  - 后台进程经 `log/launch_detached.py` DETACHED ＋ 双流重定向；日志落 `log/`（gitignored）；
+  - 核实 `$env:http_proxy` **为空**、`no_proxy=localhost,127.0.0.1` ⇒ 无 Clash 按 Host 头劫持风险（这是历史踩过的坑，验证 200/403 错位时先查它）；
+  - mocks：`log/mock_upstream.py` 起 8888/8889/8890 = mock-a/mock-b/mock-c（与 `main.rs` 初始池三节点对齐：US/residential/100、JP/datacenter/80、GB/mobile/60）；
+  - 网关 release 构建，`METRICS_ADDR=127.0.0.1:9191`（**默认 9090 已被本机其它进程占用（302），故改端口**）、`FREE_ENABLED=0`。
+  - 环境实况（如实记录）：**Redis 实际在线但需认证**（`NOAUTH: Authentication required` ⇒ 未设 `REDIS_URL` 时 PubSub 降级并被 supervisor 重启计数）；**ClickHouse 遥测 flush 全部 broken pipe 失败、事件被丢弃** ⇒ 本轮遥测/CB 链路**不在验证范围内**；Prober 把三节点判 dead（它探测 `https://www.google.com/generate_204`，mock 上游不具备该能力，是烟囱环境固有现象，非缺陷）。
+- **六用例回归（curl，B1 版）**：
+  | 用例 | 期望 | 实测 |
+  |------|------|------|
+  | C1 plain（带 key ＋ Host 指 mock） | 200 | **200** |
+  | C2 无 `X-API-Key` | 403 | **403** |
+  | C3 坏 key | 403 | **403** |
+  | C4 约束 `country=US/JP/GB` | mock-a/b/c | **mock-a / mock-b / mock-c** |
+  | C5 约束 `tier=datacenter/mobile/residential` | mock-b/c/a | **mock-b / mock-c / mock-a** |
+  | C6 鉴权后取体 | 200 | **200**（body `mock-a`） |
+  - sticky：同 `X-Session-Id` ＋ `country=US` 连打两次均返回同一节点（一致绑定）。
+- **⚠️ 一处必须解释的异常：无约束 60 次请求 60/60 全落 mock-b**。
+  - **不是 B1 引入**。为此专门构建了 **pre-B1 二进制**（把 `select_node_excluding` 与 `select_bandit_node_excluding` 两处回退为物化实现后 `cargo build --release`）做 A/B 对照，**同一环境、同一套请求**：
+  | 用例 | pre-B1 | B1 |
+  |------|--------|-----|
+  | 60 次无约束分布 | mock-a 0 / mock-b 60 / mock-c 0 | **完全相同** |
+  | country US/JP/GB | a / b / c | **完全相同** |
+  | tier dc/mobile/res | b / c / a | **完全相同** |
+  | 无 key / 坏 key | 403 / 403 | **403 / 403** |
+  - **根因（pre-existing，已定位到具体算式）**：`compute_ucb_score` = `expected_reward + alpha*variance - 0.05*cost_weight`，而 `cost_weight_for_tier` 为 datacenter 0.1 / residential 1.0 / mobile 3.0。在奖励信号尚未拉开差异时，三臂的 `expected_reward` 与 `variance` 相同，**分数只由 tier 成本决定** ⇒ datacenter（mock-b）恒为 argmax ⇒ LinUCB 的"探索"在此条件下退化为"选最便宜档"。
+  - 附带证据：奖励回写确实存在（`gateway.rs` 的 telemetry 分支调 `arm_for(...).update(&context, compute_reward(status, duration))`），但本环境里 60 次成功请求给三臂的奖励几乎相同，压不过 0.045 的 tier 成本差。
+  - 该现象**另立议题**（不在本轮范围），已记入 OPT-R12 附带项。
+- **B1 性能收益的量化（活流量测不出来，改用 release 基准）**：
+  - 3 节点池里物化只有约 48B，**信号被噪声淹没**（p50 1.58ms vs 1.76ms、p95 2.74ms vs 3.66ms，300 采样且 max 有 25~26ms 离群点）——**这组数字既不能证明 B1 变快，也不能证明变慢，不作为任何结论依据**。
+  - 改用 2000 候选（对齐 `FREE_MAX_NODES` 缺省）release 基准对照物化/流式：
+    `materialized 29.8 us/op` → `streaming 1.7 us/op`，**加速 17.9x**（300 轮）。
+  - 该基准为**临时测量**，取数后即删除（不留在树里做时序断言——共享 runner 上的时序门必然抖动；`docs/QUALITY_BASELINE.md` 的 bandit 200ns 门是既有口径，本轮不动）。
+- **收尾状态**：A/B 期间临时回退的两个源文件已从备份**完整还原**（`cargo fmt --check` 绿、`clippy -D warnings` 绿、`cargo test --locked --workspace` = **252 passed / 7 ignored**）；本轮拉起的网关（PID 18160）与 3 个 mock（20592/28168/21776）已停，ClickHouse 8123 未动；两个 A/B 二进制留在 `log/`（gitignored）：`gw-preB1.exe` / `gw-r11-B1.exe`。
+- **诚实标注**：本回归**未覆盖** SOCKS egress 路径（需 SOCKS5 上游 relayer）、**未覆盖** Redis/ClickHouse 遥测与熔断链路（本环境前者需认证、后者 flush 失败）、**未覆盖** free 池真实抓取。CI 仍尚未实跑。未 commit。
+### [2026-09-29] 步骤 37 完成：OPT-R12 鉴权密钥卫生（A1 危险告警／A2 语义文档＋门／A3 常量单一真源／B1 `API_KEY` 覆盖）
+
+- **风险先实测，不照抄审计结论**：release 二进制 ＋ mocks 实测 `REQUIRE_API_KEY=0` ⇒ **完全不带 `X-Api-Key` 的请求返回 200 ＋ 完整代理服务**（body `mock-b`）。机制已核实 `request_filter`：`should_reject_missing_api_key` 门关时放行，随后 `unwrap_or_else(|| DEFAULT_API_KEY.to_string())` 把无头请求**静默补成默认租户**，而 `main.rs` 启动即 `register_tenant("default", DEFAULT_API_KEY, 10_000, 10_000, ...)`。
+- **故本项的真正定性（与初审措辞不同）**：问题**不是**「默认值太弱」，而是**弱默认值的失败模式从来没被写下来**。文档写「`REQUIRE_API_KEY=0` 显式关闭鉴权门」，运维读来即"没有鉴权"，代码实际给的是"**全网共享一个 qps=10000 的满额身份**"——差一个量级。**不准确文档比没有文档更糟**，它给的是虚假安全感。方案因此把 A2（补语义）列为与代码改动同级。
+- **用户拍板（两档）**：A1 取 **warn 档**（零行为变更，不因配置拒绝启动）；B1 取 **立即引入 `API_KEY` 且设置后 `default_key` 直接失效**（不做双 key 并存过渡）。二者组合后的语义：设了 `API_KEY` 的部署旧客户端立刻 403；未设时保留本地开发可用 + 响亮告警。
+- **A1 危险组合告警**（新增 `tenant::weak_auth_warning` 纯函数）：判定条件是**三者同时成立**——弱默认 Key ＋ 满配额（哨兵常量 `TENANT_SENTINEL_QUOTA`）＋ **非回环**监听。**三者缺一不告警**是刻意设计：本机开发（弱默认＋满配额＋**回环**）与生产正确配置（强 key＋满配额＋非回环）都**不该**被这条打扰，否则它会被当成噪音弃用。告警文本逐条给出三条整改动作。
+- **A2 语义文档 ＋ 新门 `tools/check_auth_docs.py`**：断言 5 个要点（`REQUIRE_API_KEY=0` ≠ 无鉴权／无头落满额默认租户／`API_KEY` 可覆盖／设置后 `default_key` 立即 403／误配 fail-closed），并含**反向断言**（检出"关掉鉴权门＝无鉴权"这类旧失实表述即判红）。中英双语写入 `docs/OPERATION.md` ＋ `docs/USAGE.md`。**双向验证**：正向 2 文档 5 要点齐全；反向把澄清句改回"关闭鉴权门，即无鉴权"⇒ exit 1 精确报出行号；恢复 ⇒ 绿。
+- **A3 常量单一真源**：`DEFAULT_API_KEY` ＋ 新增 `TENANT_SENTINEL_QUOTA` 从**数据面**模块 `gateway.rs` 迁到 `tenant.rs`（密钥的持有者本就是 `TenantManager`；留在数据面会让"改数据面的人以为碰不到鉴权"）。`gateway.rs` 保留 `pub use` 转发以免破坏既有引用点。纯搬迁、行为不变。
+- **B1 `API_KEY` env**：`resolve_api_key` 三态——未设 ⇒ `Ok(None)`（回退开发默认）；设为强值 ⇒ `Ok(Some)`（用它，且 `default_key` **不再注册** ⇒ 立即 403）；**误配（空串／纯空白／显式等于 `default_key`）⇒ `Err` 且 fail-closed**（不注册任何默认租户、全部 403）。fail-closed 的理由：接受一个"等于没配"的 key 会让运维以为配好了，实际仍在用**公开的弱默认值**——那比拒绝服务更危险。
+- **⚠️ 修了两个我自己造成的门禁/实现缺陷（均已写入注释）**：
+  1. **`is_loopback_listen` 把裸 `::1` 误判为非回环**：首版直接 `rsplit_once(':')` 剥端口，`::1` 被切成 host=`:` / port=`1` ⇒ 解析失败 ⇒ 判成非回环 ⇒ 对**合法的回环绑定**误发危险告警。而这条函数的价值恰恰是"不该响时不响"，被自身误判破掉就沦为噪音门。改为**先整体解析 IP**（裸 IPv6 唯一正确读法）再剥端口。
+  2. **`check_auth_docs.py` 把正确澄清句判红**：反向断言做朴素子串匹配，于是本轮刚写对的「⚠️ **不等于「无鉴权」**」因含"无鉴权"被判成失实。这类门禁的假阳性**比没有门更坏**——它会逼人把正确的澄清句改回模糊表述（"不写就不过"），恰好毁掉门禁想守住的东西。已加**否定感知**（`NEGATION_MARKERS` 窗口检测），只罚断言、不罚澄清。
+- **活流量实测（3 档配置，全部符合设计）**：
+  | 场景 | 配置 | 实测 | 预期 |
+  |------|------|------|------|
+  | S1 | 未设 `API_KEY` ＋ **回环** | 无 key **403**／`default_key` **200** | 与 OPT-R11 完全一致（零行为变更） |
+  | S2 | 设 `API_KEY` ＋ 非回环 | `default_key` **403**／新 key **200**／无 key **403**；**未误报**危险告警 | `default_key` 已失效、告警不扰人 |
+  | S3a | 未设 `API_KEY` ＋ **非回环** | `default_key` **200**（服务不中断）＋ **INSECURE 告警触发**（含三条整改动作全文） | 响亮失败但零行为变更 |
+  | S3b | `API_KEY="   "`（误配） | `default_key` **403** ＋ `ERROR ... refusing to fall back to the public default key` | fail-closed |
+- **门禁实测（本机执行，非推断）**：`cargo fmt --check` 绿；`cargo clippy --locked --workspace --all-targets -- -D warnings` 绿（中途被 clippy 抓到并已修：测试里一个未用 import，且 `cargo fmt` 折行导致我第一次整行替换没命中、按行号重做）；`cargo test --locked --workspace` = **255 passed / 0 failed / 7 ignored**（上轮 252；本轮 ＋3）；`cargo bench --locked --workspace --no-run` 绿；`cargo test --locked --release bandit` = 12 passed；三个分配契约串行各 1 passed；**10 个 Python 门全绿**（新增 `check_auth_docs.py`）＋ `compileall` 绿。已同步 `docs/QUALITY_BASELINE.md`（255／10 个静态门）与 README／FEATURES，`check_doc_consistency.py` 复验通过。
+- **新门接入 CI**：`auth config docs state the real semantics` 步骤。
+- **明确不做（已写入方案 §5）**：**常量时间比较**——已核实 `tenant.rs` 用 `DashMap::get` 哈希查找，攻击者须先猜中 SipHash 才有 key 比较，比裸 `String ==` 安全；加 `subtle` 会为一个**不存在的威胁模型**扩大供应链面。**直接拒绝 `default_key` 启动**——会让存量部署升级即挂，且会打断本仓全部自检（本轮实测 60 次回归全用它）。
+- **升级提示（已写进 OPERATION）**：设置 `API_KEY` 后 `default_key` 立即 403，**升级前须确认所有调用方（含 5 个 SDK，SDK 缺省仍带 `default_key`）都已改为传新 Key**。
+- **诚实标注**：GitHub Actions 尚未实跑，CI 新步骤（`check_auth_docs.py` ＋ R11 的三契约循环）真实执行结果未知；`.NET`/Java 编译门本机 skipped（无 SDK）⇒ 不得声称编译通过；回归环境沿用 OPT-R11 那套烟囱（ClickHouse 遥测 flush broken pipe、Redis 需认证故 PubSub 降级），**本轮未覆盖**遥测/熔断链路。未 commit。
+### [2026-09-30] 步骤 38 完成：OPT-R13 LinUCB 永久锁死修复（补回 UCB 时间项，恢复 anytime 性质）
+
+- **根因（数值仿真复现，非推断）**：`score = expected_reward + alpha*variance - 0.05*cost`，其中两个不等式同时成立构成**数学上的永久锁死**：
+  - **利用项无上界**：`b` 随 update 线性增长，ridge 估计 `A⁻¹b` **未对量级做正则**，实测 2000 次后 `expected_reward` 达 **3.98** 且仍在涨；而 `compute_reward` 的真实值域只有 `[0,1]`（`compute_reward` 三分支：2xx ⇒ `1.0-延迟/2000` 上限 0.5、403/429 ⇒ 0.0、其余 ⇒ 0.2），**超过 1.0 的是量纲假象**。
+  - **探索项有上界且递减**：`variance = sqrt(x'A⁻¹x)` 对未拉过的臂恒为 `‖x‖`，**永不增长**；被反复拉取的臂随 `A⁻¹→0` 塌缩。探索加成**封顶在 `0.4×‖x‖`**。
+  - **探索有界 ＋ 利用无界 ⇒ 一旦某臂被选中就永远赢。** 2000 步仿真分布 `{a:0, b:2000, c:0}`，与真实网关 60/60 命中同一点一致。
+  - 本质：当前 `variance` 形式**丢掉了 UCB「随全局 t 增长」这一半**，只保留「随 n_i 衰减」的一半 ⇒ 这个"bandit"**不具备 anytime 性质**。
+- **5 候选 A/B（各 2000 步仿真），两个"显然做法"被证伪**：
+  | 候选 | 分布 | 新优臂发现耗时 | 判定 |
+  |------|------|----------------|------|
+  | A 现状 | b=2000(100%) | 从未被发现 | 基线 |
+  | B 仅裁剪 `expected_reward` | b=2000(100%) | 从未被发现 | ❌ 无效（1.0 仍压过 0.58） |
+  | C 探索项 ×`sqrt(ln(1+t)/(1+n))` | b=1982,a=14,c=4 | **1 步**，拿 49.5% | ✅ 有效 |
+  | D=B+C | 同 C | 1 步 | 冗余 |
+  | E 调小遗忘频率 | b=2000(100%) | 从未被发现 | ❌ 无效（赢家下一轮学回，锁死重现） |
+- **实施**：`compute_ucb_score` 增 `t: u64` 参数并补 `exploration = alpha*variance*sqrt(ln(1+t))/sqrt(1+n_i)`（`n_i` 读已有 `state.updates`）；`expected_reward` 裁剪到 `[0,1]`（**可观测性**修正，非修复手段——注释已写明二者理由必须分开）；`LinUCBEngine` 加 `AtomicU64 selections` 与 `next_selection_step()`。
+  - ⚠️ **计数器必须在候选循环外取**：`t` 若在 `compute_ucb_score` 内自增会按**候选数**增长（池 2000 时一请求 +2000），`t` 失去"请求数"含义、探索项失真。已在两处注释。
+- **红测有效性**（去掉时间因子后）：`opt_r13_exploration_breaks_permanent_lock_in` 与 `opt_r13_new_better_arm_is_discovered` **立即判红**。
+- **新增单测（7 项）**：锁死回归（三臂 2000 次都被选中）、anytime（新优臂有界步内发现）、不稀释最优（>90% 流量）、边界有限性（t=0/大 t）、expected_reward 裁剪、**网关层**（同活流量路径 300 次覆盖三节点）、**候选过滤**（三节点都过 `matches`）、**加权路径分布**（实测 `[129,102,69]` ≈ 43/34/23%，正合 100/80/60）。
+- **⚠️ 活流量验收曾因样本不足误判失败（诚实记录）**：
+  - 首次 300 次无约束请求仍 100% mock-b，**一度以为修复无效**。经网关层单测（通过）排除接线问题后，加临时诊断打印活体 `t/各臂 n_i,var,rew,score`，实测 t=96 时 `8888 score=0.8584` vs `8889 score=0.9943` ⇒ **交叉点在 t≈424**（解 `0.4252*sqrt(ln(1+t))−0.05 = 0.9943`），**300 次尚未到交叉点**。改用 **1500 次**复验：**三 mock 均命中（3/3，修复前 1/3）**，锁死解除。
+  - 教训：`sqrt(ln t)` 增长很慢，**短样本不足以验证"慢收敛"性质**；验收样本量必须匹配被验证机制的时间尺度。
+- **诚实标注的弱点：分布仍极度偏斜（mock-b 99.7%、mock-a 0.3%、mock-c 0.1%）**。结构性锁死已破（不再 0%），但实际重分布很弱。这是 `sqrt(ln t)` 的固有性质，与"不稀释最优"的设计目标一致，**已登记为可调项**（若生产需更快重分布，可调大 `alpha` 或改探索项时间尺度，但需重跑 A/B）。
+- **门禁实测**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace` = **262 passed / 0 failed / 7 ignored**（上轮 255；本轮 ＋7）；`release bandit` 8 臂 **avg=82ns**（预算 200ns，未回归）；三个分配契约串行各 1 passed；**10 个 Python 门全绿**；已同步 `docs/QUALITY_BASELINE.md`（262）＋ README/FEATURES。
+- **过程记录**：本轮一度因 Docker daemon 未运行（ClickHouse 8123 refused）导致整环境（网关/mocks）退出，首轮 300 次全部空响应——**那次测量无效，已明确标注不作为结论**。
+- **未覆盖（诚实）**：SOCKS egress 路径、遥测/熔断链路（CH 需 Docker）、free 池真实抓取；GitHub Actions 仍未实跑；未 commit。
+### [2026-09-30] 步骤 38 补充：free 池真实抓取验证（结论——抓取/验证成立，但**重分布未能测得**，且发现一个更严重的 P0）
+
+- **用户要求**：先验证 free 池真实抓取下的重分布（而非先调探索强度）。
+- **前提核实**：Docker daemon **未运行**（ClickHouse 8123 refused）；但**公网可达**（Geonode 200、httpbin 200），而 free 池的抓取与验证是纯 HTTP 路径 ⇒ 不依赖 CH，可独立验证。GitHub raw 源全部失败（旧 EXEC_LOG 已记 000，本轮复现）。
+- **✅ 已验证成立：真实 free 池抓取与验证在本机可用**（两轮独立复现）：
+  | 项 | 第 1 轮 | 第 2 轮 |
+  |----|---------|---------|
+  | Geonode 抓取候选 | **11275**（intake 截到 4000） | 同量级 |
+  | `gh1`(monosans) 产出 | 3939 | — |
+  | TCP 验证失败 `tcp_fail` | 2649 | 2962 |
+  | **验证 healthy 并入池** | **30 个真实免费代理**（如 `120.232.115.170:17981 healthy 238ms`、`114.252.13.224:8888 healthy 316ms`、`101.32.65.42:8888 healthy 1257ms`） | **22 个** |
+  - ⇒ free 池**能真实抓到、验证并合并**公网免费代理。这修正了"公网存活率极低 ⇒ 池恒为 0"的旧认知：在本轮实测中**每轮有 22~30 个通过**。
+- **❌ 未能测得：重分布**。原因有二，均为环境/可观测性限制，**不是本轮代码缺陷**：
+  1. **网关在本环境存活期只有约 5~6 分钟**便自行退出（日志尾 `All runtimes exited, exiting now`，**无 panic**、`.err` 为空）。本轮共复现 4 次（`vfree`/`vfree2` 各 2 行退出消息）。而 free 池首个 healthy 节点需约 5 分钟才出现 ⇒ 测量窗口与进程寿命几乎重合，**没有稳定窗口可采样**。
+  2. **Docker/ClickHouse 不可用 ⇒ 遥测链路降级**（`flush failed (broken pipe)`、事件丢弃），因此**无法把每个请求归因到具体出口节点**；缺 per-node 选择指标，只能靠临时诊断（需重新构建）才能测，而我判断在当时预算下不应再为一个尚未确认的指标改动构建流程。
+- **⚠️ 顺带发现一个更严重的 P0（本轮最高价值产出）**：上述"无 panic 的 `All runtimes exited`"与 **2026-09-23 旧日志**（`log/gw-demo-end.err`）里同名的
+  `thread 'main' panicked at tokio-1.53.1/src/runtime/blocking/shutdown.rs:51: Cannot drop a runtime in a context where blocking is not allowed. This happens when a runtime is dropped from within an asynchronous context.`
+  是**同一现象的两个面**：网关在退出路径上**于异步上下文内 drop 了一个 tokio runtime**。后者是明确的 panic（abort 语义下会直接终止进程），前者是其"恰好没炸"的变体。
+  **这意味着网关可能在任意时刻自行终止，且原因与业务无关** —— 属可用性 P0，优先级高于探索强度调参。已登记为 OPT-R14 主体（本轮**未修**，因其涉及退出路径/生命周期，需要独立勘察）。
+- **诚实标注**：
+  - 本条**不构成**"重分布已验证"的结论；恰恰相反，重分布在真实 free 池下的表现**仍属未测**。
+  - R13 的锁死修复在 mock 三节点下的结论（1500 次 ⇒ 3/3 命中）**仍然有效**，但**能否外推到 2000 规模的 free 池未经验证**。
+  - 单臂时间尺度差异需注意：free 池 `forget_every_for_tier("free") = 1000`（付费线 10000），churn 高 ⇒ 臂寿命短 ⇒ 探索窗口比 mock 场景**更宽**，理论上比 99.7% 更有利于重分布——但这是推断，非实测。
+- **环境变更记录**：本轮 Docker daemon 中途退出（`docker info` 报 pipe 不存在），曾导致 ClickHouse 与整批 detached 进程消失；该次测量**已标注无效**，未用于任何结论。
+- **门禁未受影响**：本条为纯验证活动，未改代码；步骤 38 的 262 passed / 四门绿 / bandit 82ns 结论不变。进程与端口已全部清理。
+### [2026-09-30] 步骤 38 补充二：free 线「供给侧可重复验证」（A1 报告式探针 + A2 确定性契约门）
+
+- **用户选择**：先看 free 线（不先调探索强度）。做法上取「只做抓取+验证的可重复门禁，不碰重分布」。
+- **A1 `tools/probe_free_pool.py`（报告式探针，非门禁）**：把步骤 38 补充一那次**约 40 分钟人工盯日志**的验证收敛成**一条命令**，输出四类结构化判定（`VERIFIED` / `DEGRADED_ZERO` / `FETCH_FAIL` / `INCONCLUSIVE`）。
+  - **最重要的设计约束：刻意不做「healthy ≥ N」数量门。** 依据是本轮实测数据本身——两轮分别 30 / 22 个通过验证、逐轮波动。**任何数量门都会周期性假红，而假红门禁会被运维学会忽略，那比没有门更糟**（本仓 R11 已记录「并发测试整轮不命中就永远绿」的教训）。数量验证交给本探针，门禁只锁确定性项。
+  - `INCONCLUSIVE` 是**一等公民**：本机网关约 5~6 分钟自行退出，硬报 FAIL 等于用环境问题污染代码结论。
+  - 明确**声明本探针不回答重分布**，且不提供任何间接结论。
+- **A2 `tools/check_free_pool_contract.py`（确定性契约门，进 CI）**：只锁四类不随时间波动的东西——verify 分类集合 / 5 个指标名 / intake 下限 `.max(100)` / 3 条文档口径。**不依赖公网**。
+  - **双向验证三类违规全被精确捕获**：①新增未登记分类 `waf_fail` ⇒ exit 1 并打印「多出 ['waf_fail']」；②去掉 `.max(100)` ⇒ exit 1 并说明后果（`FREE_MAX_NODES` 小时 intake 退化成个位数）；③抹掉文档「重分布未验证」口径 ⇒ exit 1 并指名该项；恢复后 exit 0。
+- **门禁抓到一个真实缺陷：`backoff_skip` 是死标签。** 期望集合里我一度写了 5 个分类，门禁首跑即报「缺 backoff_skip」。核实源码：**该分类无任何调用点发出**——`backoff_until` 机制存在却不记账。`metrics.rs` 两处注释（L94/L259）都把它列为合法分类，会让运维误以为「被 backoff 跳过的节点在统计」。**已从注释删除**并把门禁期望值定为**实际的 4 个**（`pass/tcp_fail/full_fail/geo_fail`），注释里写明未来若要发出它需同时加调用点与更新本门。
+  - 这正是契约门该抓的东西：不是崩溃，是**会误导人的过期文档**。
+- **修了探针自身 3 个自坑**（都是首次端到端跑出来的）：
+  1. `--metrics-port` 与 `--metrics` **未联动** ⇒ `--metrics-port 9230` 只改被拉起网关的监听口，探针仍轮询默认 9221 ⇒ 必然 INCONCLUSIVE。已改为由 `--metrics-port` 推导。
+  2. 只等「端口可连」⇒ 网关刚启动的**空样本**被当成结论 → 误报 DEGRADED_ZERO（把「还没开始抓」误报成「抓不到」）。已改为等到**产出或验证至少一项 > 0**。
+  3. 判定文案未区分「验证尚未开始」与「验证跑完 0 通过」；底部参考行仍列着死标签 `backoff_skip`。均已修。
+  - 教训值得留档：**同一条信息的两个表述必须联动**（不报错、只安静给错误答案，比崩溃更糟）。
+- **探针端到端实测（本轮）**：`--launch --wait 420` 成功拉起并自动判定，输出 `源产出 4000（api0 63 / gh1 3937）`、`intake 截断 7114`、`验证 200 次全 tcp_fail`、`入池 0` ⇒ `DEGRADED_ZERO`，退出码 0。修正后可正确区分「验证还没开始」与「跑完 0 通过」。
+- **文档**：`docs/OPERATION.md` 新增「免费线供给侧可重复验证」小节——四类判定表、churn 说明、INCONCLUSIVE 说明、以及**「bandit 在真实 free 池规模下的重分布尚未验证」**的显式声明（含量纲差异说明：free 臂遗忘节拍 1000 vs 付费线 10000，臂寿命更短 ⇒ 探索窗口更宽，但**这是推断非实测**）。
+- **门禁状态（本轮未改 Rust 逻辑）**：`fmt`/`clippy -D warnings` 绿；`test --locked --workspace` = **262 passed / 7 ignored**（不变，仅注释变更）；**11 个 Python 门全绿**（新增 1 个）；`docs/QUALITY_BASELINE.md` 的 Python 门计数 10 → 11。
+- **仍未解决 / 已诚实登记**：①重分布未验证（依赖 CH 遥测归因）；②网关约 5~6 分钟自行退出的 P0 疑似根因（异步上下文内 drop tokio runtime）未修；③GitHub raw 源在本机全挂（复现旧记录）。**未 commit**。
+### [2026-09-30] 步骤 39 完成：OPT-R14 Windows 网关 300 秒自杀（P0，已修并活流量验证）
+
+- **根因定位到依赖源码行（非推断）**：`pingora-core 0.6.0` `src/server/mod.rs` 的 `Server::run()`：
+  ```rust
+  let shutdown_type = server_runtime.get_handle().block_on(self.main_loop(run_args));
+  #[cfg(windows)]
+  let shutdown_type = ShutdownType::Graceful;      // ① Windows：无条件
+  if matches!(shutdown_type, ShutdownType::Graceful) {
+      thread::sleep(Duration::from_secs(exit_timeout));  // ② 然后 sleep(grace)
+  }
+  ```
+  `main_loop` 那段是 `#[cfg(unix)]` ⇒ **Windows 上从不等待信号**，`shutdown_type` 被硬编码为 Graceful ⇒ 必然 `sleep(grace)` 后 `process::exit(0)`。本仓把 `GATEWAY_GRACE_SECS` 默认设为 300（Unix 上合理的优雅停机窗口）⇒ **Windows 上网关寿命上限 300s**。
+- **实测证据（跨 FreePool 开关均复现，寿命稳定 305~308s）**：`vfree` 308 / `vfree2` 308 / **`r13gw` 307（无 FreePool）** / **`gw-r11` 305（无 FreePool）**；其余 245~270s 的日志是**我手动 kill**，未到 300s。
+- **⚠️ 纠正我自己先前的误判（留档以免重犯）**：我一度断言"退出与 FreePool 相关"（只有开了 FreePool 的 `vfree*` 出现退出）。那是**伪相关**——只是那几次恰好跑得够久；跨 FreePool 开关的四例都退出后，相关性被证伪。
+- **⚠️ 排除一个疑似（避免下一个人重查）**：2026-09-23 旧日志 `log/gw-demo-end.err` 末尾的 `Cannot drop a runtime in a context where blocking is not allowed`，**当前代码不会触发**——`main()` 是 `let server = runtime.block_on(setup_gateway()); let _keep_alive = runtime; server.run_forever();`，`run_forever()` 跑在**同步** `main` 上下文，`server_runtime` 的 drop 不在 async 上下文内。那句 panic 属**旧代码状态**的产物，**本轮不据此改代码**。
+- **修法（平台感知默认值，Unix 行为零变化）**：新增纯函数 `default_grace_secs(is_windows) -> u64`：**Windows 86400**（1 天，仅为绕过框架限制）／**Unix 300**（不变）。Windows 启动打 `WARN` 写明限制、实测数据与覆盖方式。
+  - 明确**不做**：改 0（Windows 立刻退出，更糟）／升级 Pingora（需联网解析新版本并重验整条数据面，风险成本不成比例，**登记为长期修法**）／自己重写 server 驱动（等于 fork 框架）。
+  - **行为影响声明**：Windows 寿命由"≤300s"变为"≤86400s"，是**有意的行为变更**（用"可用"换"5 分钟自杀"）；Unix **零变化**。
+- **✅ 决定性活流量验证（本项核心证据）**：修复后 release 二进制，**t=8s 403（已监听）→ t=348s 仍 403**（穿越原必死区间）→ `/metrics` 200 → 实际代理请求返回 `mock-a`、无 key 仍 403。**失败即等于没修**，本轮通过。
+- **新增单测 4 个**（`default_grace_secs` Unix=300／Windows>300 且非 0／两平台不等／当前平台非 0）——全绿。
+- **新增契约门 `tools/check_windows_lifetime.py`（已进 CI）**：锁"平台感知默认值不被静默回退"。理由是这类修复的**典型死法**——有人看到「Windows 默认 86400 看着奇怪」就清理回 300，**Unix 侧一模一样、全绿**，而 Windows 上又开始自杀。
+  - **双向验证四类违规全被精确捕获**：改回 300／生产调用点改硬编码／删文档「升级 Pingora」／文档 86400→300；恢复后绿。
+  - **修了本门自己 3 个洞（均由它自己的双向测试抓出，值得留档）**：
+    1. 全文搜 `default_grace_secs(cfg!(windows))` **匹配到了测试里的同形调用** ⇒ 把生产调用点改成硬编码仍绿。修法：只扫生产段。
+    2. 生产段分界符用 `#[cfg(test)]` ⇒ `main.rs` 里**单个函数**的 `#[cfg(test)]` 在 1KB 处、远早于 38KB 处的赋值点，导致**正向就误判红**。修法：分界用 `mod tests`。
+    3. 文档口径用 `(\u5347\u7ea7|upgrade)` 匹配 ⇒ 文档**其它层**的"升级"二字掩盖了 R14 那段被删的事实。修法：匹配**完整短语**且只在 R14 小节内找。
+    - 另修一处我引入的**过严**检查：代码用中间变量 `grace_default`，赋值处只出现 `grace_secs`，而我要求赋值表达式里含函数名 ⇒ 正向红。已改为"生产段出现该调用 + 赋值存在"。
+- **文档**：`docs/OPERATION.md` 新增「网关在 Windows 上的生命周期限制（OPT-R14 B，P0）」小节——现象（无 panic/无错误码、仅一句 `All runtimes exited`，故极难定位）、根因、修复、覆盖方式（`GATEWAY_GRACE_SECS=1`）、长期修法（升级 Pingora）、以及回归防护门。
+- **门禁实测**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace` = **266 passed / 7 ignored**（上轮 262，＋4）；`release bandit` 16 passed；三个分配契约此前已验（本轮未改相关代码）；**12 个 Python 门全绿**（新增 `check_windows_lifetime.py`）；`docs/QUALITY_BASELINE.md` 同步（266／12 个静态门）＋ README/FEATURES。
+- **解锁的下一步**：本缺陷正是此前**重分布验证做不成**的直接原因（free 池需约 5 分钟才出验证通过节点，而网关寿命上限恰好 300s，卡在边缘）。现解除，可重跑 `tools/probe_free_pool.py` 与重分布测量——**本轮未做**。
+- **未 commit**；进程与端口已清理；GitHub Actions 仍未实跑。
+### [2026-09-30] 步骤 40 完成：free 池重分布补测（零改码精确归因；R13 anytime 性质在真实池规模下证实）
+
+- **前置**：OPT-R14 修复了 300s 自杀后本项才可做——free 池需约 195s 才出 26 个 `full_pass` 节点，而修复前网关寿命上限恰为 300s，卡在边缘。本轮网关实测存活 **327s**（>300s 必死点），修复在生产式运行中二次实证。
+- **环境**：Docker daemon 已恢复（29.3.0）；`ipproxy-clickhouse`、`ipproxy-redis` 从 Exited 拉起。CH 凭据 `proxy`/`123456`/DB `proxy`（`SELECT/INSERT` 权限实测具备）。
+- **✅ 方法论关键突破：零改码即可逐请求归因到出口节点**。无需插桩、不必造带诊断的构建——网关既有 INFO 行本身已带完整归因：
+  ```
+  [Telemetry] client=... target=redistrib-probe2.local out=<出口IP> status=<码> cost=<耗时>
+  ```
+  加上 CH `proxy_telemetry_log` 的 `out_ip` / `tier` / `status_code` 列（`target_domain` 用独特值精确过滤本轮请求），归因手段**零侵入**。这也是为什么本轮没有新增任何诊断代码。
+- **两轮递进测量**（第二轮 CH 全量，1500/1500 行落地、`telemetry_dropped_total 0`）：
+  - 第一轮（日志归因，仅错误路径 59 条可归因）：**9 个真实免费代理**被选中并尝试（`120.232.115.170`、`165.154.162.73`、`189.51.168.165` 等）⇒ 已足以证伪"只在 3 mock 下才重分布"。
+  - 第二轮（CH 全量归因，池内 3 付费 + 26 免费 = 29 臂）：**distinct 出口节点 = 15（14 免费 + 1 付费）**。
+- **核心结论（证实 R13）**：修复后的 anytime 性质在真实池规模下成立——1500 个请求触达 **14/26 个免费臂**（R13 三 mock 时是 3/3）。免费臂命中分布 8/7/7/5/5/4/3/3/1…（Top: `120.76.101.238` 8 次、`189.51.168.165` 与 `3.68.36.133` 各 7 次），**没有锁死在单个免费节点上**。R13 要杀的那个"永久 ε 衰减锁死"在真实池里不复现。
+- **⚠️ 必须写明的测量局限（否则结论会被误读）**：本轮 **48 次免费尝试 0 次成功**（400×22 / 502×20 / 405×5 / 404×1），但这**不是免费代理不可用**——26 个节点是通过对**真实公网端点**的 `full_pass` 验证才入池的；失败原因是**测试目标是回环 `127.0.0.1:8888`，公网代理物理上到不了本机 loopback**。所以本轮证明的是**探索广度**，**不是免费供给的服务能力**。后者仍需改用公网目标重测（未做）。
+- **⚠️ 另一项如实记录（是特性不是缺陷，但用户该知道）**：前 **1310 个请求（≈87%）集中于单一付费臂、免费占比 0%**，直到 13:47:32 才开始持续采样免费臂（末 22s 内分片免费占比在 2.9%~100% 间来回）。这是 bandit 对"100% 成功臂"的**正确 exploitation**，与 R13 的锁死缺陷是两件事：R13 修的是"永远无法切换"，这里证明的是"能切换、但不会早切"。冷启动期的先利用后探索属预期行为。
+- **🔴 顺带查出一个真缺陷（此前未暴露）——遥测在 Redis/CH 鉴权失败时静默丢数据**：
+  - 现象：第一轮 1500 请求仅 59 条可归因，`telemetry_dropped_total` 爬到 1516，CH 无新行。
+  - **我最初的假设（CH 凭据错）被证伪**：用**同凭据** curl 直连 `INSERT` 成功落行。
+  - 真因：错误原文 `Protocol error: unauthenticated multibulk length` 看似 ClickHouse，实为 **Redis 协议错误**；同批日志 `[Sync] PubSub subscribe failed: NOAUTH: Authentication required` 指向同一根因——`REDIS_URL` 未带密码。
+  - **可诊断性陷阱（值得单独记）**：Redis 密码 `123456` 是以**容器启动参数** `--requirepass 123456` 传入的，**不出现在容器环境变量里**，所以 `docker inspect --format '{{range .Config.Env}}'` 查不到，只能从 `.Config.Cmd` 读。compose 注释亦声明凭据应由 `.env` 注入（`.env.example` 缺样本）。⇒ 下一个部署者极易在此静默丢光全部遥测。
+  - 补上 `REDIS_URL=redis://:123456@127.0.0.1:6379/` 后：`1500/1500` 行落地、`telemetry_dropped_total 0`。
+  - 正面评价：`telemetry_dropped_total` 这个指标**救了整件事**——它是唯一可编程察觉的信号。缺口在于尚无"遥测落地端不健康"的告警语义与文档口径，已登记为候选项（见下）。
+- **门禁**：本轮**未改动任何源码**，故无需重跑编译门；上轮基线 266 passed / 12 Python 门不变。
+- **清理**：诊断期手工插入的假遥测行（`target_domain='ins-test'`）已 `ALTER TABLE ... DELETE` 删除（复验 0 行）；网关与 3 个 mock 进程全部停止，端口 8888/8889/8890/8970/9250 全部释放。
+- **未 commit**。CH/Redis 容器保持运行以便后续复测。
+- **剩余未测项（唯一）**：免费供给的**服务能力**（公网目标下的成功率）——这是 free 线最后一块拼图，需换公网可达目标重跑。
+### [2026-09-30] 步骤 41 完成：free 供给「服务能力」实测（公网目标）—— 45.9% 成功率，且交叉验证吻合
+
+- **目标**：补上步骤 40 唯一未测项——免费供给的**服务能力**（步骤 40 的 0/48 只能证明「探索广度」，且已声明其失败源于回环不可达）。
+- **目标选择与机制确认**：`Host: icanhazip.com` + `/` ⇒ `bridge_url_for` 走 origin-form 分支构造 `http://icanhazip.com/`（`gateway.rs:294-301`）。已实测本机可达（回显 `27.18.27.155`）；`api.ipify.org` 与 `ifconfig.me` 本机不可达，故弃用。
+- **✅ 完整性检查设计（本轮质量要害）**：付费臂是本地 mock，**恒返回 `mock-x`、永不是 IP**，故响应体本身即判别器。两条独立校验：
+  1. 响应体为 IP ⇒ 该请求确实由该出口代理服务（归因真实）；
+  2. **本机公网 IP `27.18.27.155` 出现次数必须为 0** —— 若出现即说明代理被绕过直连，200 是假的。
+- **结果（3400 请求，free 尝试 85 次）**：
+  | 项 | 值 |
+  |---|---|
+  | 2xx 且响应体为真实出口 IP（**免费代理成功**） | **39** |
+  | 2xx 且 `mock-*`（本地付费臂） | 3315 |
+  | 非 2xx（免费代理失败） | 46 |
+  | 校验 | 39+3315+46 = 3400 ✓ |
+  | **免费成功率** | **39/85 = 45.9%** |
+  | distinct 出口身份 | **12**（IPv4 9 + IPv6 3） |
+  | **代理绕过检查** | **`27.18.27.155` 出现 0 次 ✓** |
+  | 失败细分 | 502×26 / 400×13 / 405×6 / 403×1 |
+- **✅ 双源交叉验证精确吻合**：客户端观测的"响应体为 IP 的 2xx" = **39**；服务端 ClickHouse `tier='free' AND status_code=200` 独立统计 = **39**。两者一致 ⇒ 归因与响应体互证，不是自说自话。
+- **✅ 受控实验闭环了步骤 40 的存疑**：同一批 free 节点在**回环目标上 0/48 全败**，在**公网目标上大量成功**——`122.246.4.30` 在 `icanhazip.com` 上 5 次全 200；`123.57.0.163` 在 `redistrib-probe2.local` 上 502、在 `icanhazip.com` 上 3 次 200。**同一节点换目标即由败转成 ⇒ 步骤 40 的失败确实源于目标可达性，而非节点失效**，步骤 40 的表述得到证实而非被推翻。
+- **⚠️ 我自己的一个统计错误（已被交叉验证抓住，留档）**：首遍统计用 IPv4-only 正则 `^\d{1,3}(\.\d{1,3}){3}$`，把 `2408:8719:1100:23:3c::5` 这类 **`::` 压缩的 IPv6** 误判为"其它"，得出 28。补 IPv6 判定后为 39，与遥测精确吻合。**若不做双源交叉验证，就会把 37.8% 当成结论发出去**——错 8 个百分点。教训：客户端观测与服务端归因必须互校。
+- **⚠️ 未解释的观测：探索拐点 ≈1300 个请求**。首次 1200 请求（4.9s 内跑完）**零** free 选路；步骤 40 的时间序列显示 free 自第 ~1310 个请求起才开始被采样；本轮补 2200 请求后 free 正常参与。**但我的 LinUCB 解析模型预测不出这个拐点**（按 `sqrt(ln(1+t)/(1+n_i))`，未拉取的自由臂在 t=2 就该碾压均值 1.0 的付费臂）。⇒ **如实标记为「已观测、未解释」**，不编机制。
+- **⚠️ 范围边界（未绕过，如实登记）**：`gateway.rs:280` 硬编码 `is_tls = false`，注释明写 "GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays out of scope (frozen)"。⇒ **本轮只能测「免费代理的 plain-HTTP 转发能力」**；仅支持 HTTPS CONNECT 的免费代理无法纳入测量，除非解冻 TLS 范围。未擅自解冻。
+- **P0 第三次实证**：本轮网关存活 **447s**（修复前上限 300s）。
+- **门禁**：本轮**未改动任何源码**，基线 266 passed / 12 Python 门不变。
+- **清理**：测试进程全部停止，端口 8888/8889/8890/8980/9260 释放，诊断产物 `log/pubrun.json` 已删；CH/Redis 容器保持运行。未 commit。
+- **剩余未测/未解释项（三项，均已登记）**：
+  1. 探索拐点 ≈1300 请求的**机制未解释**（观测为真，机制待查）；
+  2. **HTTPS/CONNECT 的免费转发能力**——受 `is_tls=false` 冻结范围限制，未测；
+  3. **遥测落地端健康告警**（步骤 40 发现：鉴权失败静默丢数据）。
+### [2026-09-30] 步骤 42 完成：查清 free 臂「可及性拐点」机制（此前标记未解释，现已解释并加回归测试）
+
+- **起点**：步骤 41 遗留「探索拐点 ≈1300 请求机制未解释」。本步把它从"观测到的怪现象"变成**有公式、有实测、可回归**的性质。
+- **打分公式（`bandit.rs` `compute_ucb_score` 实读）**：
+  `score = expected_reward + alpha*variance*sqrt(ln(1+t))/sqrt(1+n_i) − 0.05*cost_weight`，free 再 `− FREE_RISK_PREMIUM`。
+  常量：`DEFAULT_ALPHA=0.4`、`FREE_RISK_PREMIUM=0.15`、`MAX_MEAN_REWARD=1.0`、`cost(free)=0.0`、`cost(dc)=0.1`。
+- **⚠️ 我第一版解析推导是错的，已纠正**：我最初写 `ln(1+t) > 8.34 ⇒ t > 7`——**漏了取指数**，正确是 `1+t > e^8.34`。同时我第一版按 `|x|=1`、付费臂吃满 `1.0` 估算，得 `t ≈ 4.2e3`。**这两个数都不能直接用**。
+- **✅ 真实公式与实测（`fixed_context()` 实测 `|x|=1.1747`，付费臂岭估计收敛到 `0.994`，非 1.0）**：
+  `t ≈ exp(((reward_ceiling + 0.005 + 0.15)/(alpha*|x|))²) − 1`
+  - 单测配置：`|x|=1.1747`、`ceiling=0.994` ⇒ **t ≈ 376**（逐点扫描确认：t=100 时 free=0.8594 < paid=0.9953；t=500 时 free=1.0216 > paid=0.9957）
+  - 活流量实测：**t ≈ 1.3e3**（context 逐请求变化、竞争臂非单一）
+  - 假设 `|x|=1` 且吃满 `1.0`：`t ≈ 4.2e3`
+  - ⇒ **该阈值不是常数，对「奖励上限」与「上下文范数」指数敏感**。三组数同机制、量级随输入漂移，**不能把拐点当固定常数去反推 alpha**。这也解释了为何我最初的解析值与活流量观测差 3.5 倍——不是模型错，是我取了错的输入。
+- **机制结论**：free 臂**不是被某个门槛挡住**，而是 UCB 的标准性质——探索项封顶 `alpha*|x|=0.47`，而完美付费臂的 `expected_reward` 被 R13 裁剪到接近 `1.0`，于是必须等 `sqrt(ln(1+t))` 涨到能把 `0.15` 溢价与 `0.155` 成本差一并补齐，`t` 才够大。**没有任何代码 bug**。
+- **✅ 真正的用户可见后果（这才是值得记的）**：**free 供给在冷启动的前数百至数千个请求里完全不参与选路**。请求量低于该量级的部署，free 池等于白建。这是 R13 两个决策（裁剪上限 + alpha 调小）**耦合**出来的代价：裁剪修好了 R13 的失控，代价是压低了探索项能追平的奖励上限。
+- **新增回归测试 `free_arm_eventually_beats_perfect_paid_arm`（`bandit.rs`）**：只锁**可达性**这一个不变量——`t=1` 与 `t=100` free 必须落后（写死以免被后人当"顺手修掉的回归"），`t=200000` free 必须胜出。后者若失败，说明 alpha / 裁剪 / 溢价被调成了让 free 供给**永久不可达**——那才是真 bug，且是**静默的**：路由照常工作，只是免费供给永不参与选路。
+- **✅ 该测试做了双向验证（非空断言）**：把 `FREE_RISK_PREMIUM` 故意从 `0.15` 调到 `5.0` ⇒ 测试变红（正是 `free_wins(200_000)` 那条），还原 `0.15` ⇒ 变绿。
+- **过程留档（两条自查，均已修）**：
+  1. 首跑新测试时用了 `cargo test --lib`，但本 crate 是**二进制 crate、无 library target**，命令直接报 `no library targets found`；而我的输出过滤又把错误吞了 ⇒ **看起来像"跑过了"，实际一次都没执行**。改用 `--bin pingora-proxy-gateway` 后才拿到真实结果。**这条差点让我把未验证的测试当已验证。**
+  2. 首个断言写的是"`t=1000` free 仍应落后"，实测 **FAILED**——因为单测里 free 在 `t≈376` 就已翻盘。**没有改断言去迁就实现，而是先加临时探针打印真实分数**，发现是 `|x|=1.1747` 与 `ceiling=0.994` 两个假设错了，随后按实测值重写断言与文档，并删除探针。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace` = **267 passed / 7 ignored**（上轮 266，＋1）；`release bandit` 17 passed；**12 个 Python 门全绿**；`docs/QUALITY_BASELINE.md` 及 README/FEATURES 同步为 267。
+- **未 commit**。本步**只加了一个测试与文档注释，未改任何生产逻辑**（alpha / 裁剪 / 溢价一律不动）——因为调它们等于改路由经济性，属需显式决策的范围，不是本步该顺手做的事。
+- **剩余未解决项（两项，均需显式决策，本步不擅自动）**：
+  1. 冷启动 warm-up 成本（数百至数千请求）**是否要消**？可选方向：给 free 档单独抬高探索系数、或引入分档最小探索配额、或降低 `FREE_RISK_PREMIUM`。**三者都改变路由经济性**，需你定方向。
+  2. HTTPS/CONNECT 的免费转发能力——受 `gateway.rs:280` `is_tls=false` 冻结范围限制未测。
+- 遥测落地端健康告警缺失（步骤 40 发现）仍待处理。
+### [2026-09-30] 步骤 43 完成：遥测落地端健康可观测（③）——把「静默丢光遥测」变成可编程告警
+
+- **修的问题（步骤 40 实测复现，非推演）**：`REDIS_URL` 少写密码 ⇒ 遥测**静默丢光**，
+  网关照常服务、指标上看不出异常。报错原文 `Protocol error: unauthenticated multibulk length`
+  **看着像 ClickHouse 错误、实为 Redis 协议错误**，第一直觉必然查错方向。
+  当时唯一线索是 `telemetry_dropped_total` 在涨——它只说"丢了多少"，
+  **不说是哪一级落地、也不说还通不通**。
+- **落地：三个新指标（`metrics.rs`，`backend` = `redis` | `clickhouse`）**：
+  - `telemetry_sink_up{backend}`：最近一次写入尝试成功=1／失败=0；
+  - `telemetry_sink_failures_total{backend}`：失败次数（**恢复后不清零**，保留故障史）；
+  - `telemetry_sink_last_ok_unixtime_seconds{backend}`：最近一次**成功**写入的 Unix 秒。
+  - 上报点：`TelemetryWorker`（Redis 级，XADD 成功/失败处）与 `ChSinkWorker`（ClickHouse 级，
+    `insert_batch` 成功/失败处）。两级互相独立，Redis 好而 CH 坏时只有 CH 那条转 0。
+- **两条刻意的口径设计（都是被测试/实跑逼出来的，不是先想好的）**：
+  1. **序列懒出现**：未配置/未跑过的落地端**不渲染样本行**，而不是渲染 `up=0`。
+     否则「ClickHouse 压根没配」的部署会被告警直接误伤——告警默认状态必须是"沉默"。
+  2. **首次失败即建 `last_ok=0` 序列**：否则「试过、一直失败、从未成功」与「压根还没试过」
+     长得一样，一次都没成功的后端会永远沉默。**这条是单测 FAILED 后改生产代码补上的，
+     不是改断言迁就实现。**
+- **不把序列化失败算成落地端不健康**：JSON 序列化失败是网关自己的 bug，标到
+  Redis/ClickHouse 上会把责任指错方向、也无法靠改依赖解决。`ch_sink` 读 stream 失败
+  同理归 Redis 那条，不记到 CH 上，否则两级互相掩盖。
+- **✅ 活流量双向验证（复现真实故障，非单测）**：
+  - 阶段 A（`REDIS_URL` 无密码，打 20 次请求）：`telemetry_sink_up{backend="redis"} = 0`、
+    `failures_total = 21`、`last_ok = 0`、`dropped_total = 20` ⇒ **以前只能翻日志发现的故障，
+    现在有 gauge 直接指向**。
+  - 阶段 B（正确凭据重启，打 20 次请求）：`up{redis}=1`、`up{clickhouse}=1`、
+    `last_ok=1790781750`（真实 Unix 秒）、`dropped_total=0`；且 **ClickHouse 独立确认
+    近 3 分钟落库 21 行** ⇒ 恢复路径正确（up 回升 / last_ok 刷新 / 丢弃归零），
+    数据真的持久化，而非只把指标刷成好看的。
+- **新增告警（`deploy/prometheus/rules.yml`，3 条）**：
+  `TelemetrySinkDown`（critical 2m）、`TelemetrySinkNeverSucceeded`（critical 10m）、
+  `TelemetrySinkStale`（warning 5m，`up=1` 但 10 分钟无成功写入 = 假活）。
+  第三条的 `> 0` 条件用于排除「一次都没成功」，否则与第二条重复误报。
+  与既有 `TelemetryStreamBacklogHigh` 的分工：那条依赖 `redis_exporter`（compose profile 门控，
+  **未接时静默不发**），本组只依赖网关 `/metrics`、**默认可用**，是它的兜底。
+- **🔴 顺带修掉 `tools/check_promql_metrics.py` 自身的一个缺陷**（被新规则暴露）：
+  它把手维护的 `FUNCS` 白名单当函数名判据，于是 `TelemetrySinkStale` 里的 `time()`
+  被当成"metrics.rs 未渲染的指标"而**假阳性判红**。
+  **修法不是往白名单里补 `time`**（那样 `timestamp`/`clamp`/`label_replace` 会继续踩），
+  而是改成**语法判定**：正则剥掉一切 `标识符(` 形式的函数名，参数原样保留。
+  `FUNCS` 里剩下的 `and/or/by/without/bool/offset/group_left` 是运算符与关键字，仍需白名单兜底。
+  **该修复做了双向验证**：注入 `telemetry_sink_upp` 与 `some_bogus_metric` 两个不存在的指标
+  ⇒ 门均判红（exit 1）；还原 ⇒ `OK: 15 alert rule(s) consistent with 31 rendered metric(s)`。
+  ⇒ 修好了假阳性，同时没削弱真阳性检出。
+- **新增单测 2 个**：`sink_health_is_lazy_per_backend`（懒出现语义）、
+  `sink_health_tracks_failure_then_recovery_per_backend`（失败→恢复状态机、失败史保留、
+  `last_ok` 必须是真实 Unix 秒而非占位值）。
+- **过程留档（两条自查）**：
+  1. 两次 Edit 因锚点未带缩进，把字段/注释插进了**同名构造函数参数列表**而非结构体定义，
+     编译报 `documentation comments cannot be applied to function parameters`。
+     连带修掉 `pump_metrics` 的 move 冲突（`supervise_until` 要一份、worker 闭包要一份 ⇒ clone 两次）。
+  2. 告警 `describe` 里用了 ASCII 双引号包中文，破坏 YAML 双引号标量 ⇒ `yaml.safe_load` 报错。
+     改用文件既有风格的 `「」`。（`promtool` 本机不可用，YAML 语法由该门自身的 `yaml.safe_load` 覆盖。）
+- **文档**：`docs/OPERATION.md` 新增「遥测落地端静默丢数据：怎么发现、怎么修（OPT-R15）」小节
+  ——三指标表、三告警、两条口径、按 backend 排查（含 **Redis 密码是容器启动参数
+  `--requirepass`、`.Config.Env` 查不到只能读 `.Config.Cmd`** 这个诊断陷阱）、以及
+  "为什么序列化失败不算落地端不健康"。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace`
+  = **269 passed / 7 ignored**（上轮 267，＋2）；`release bandit` 17 passed；
+  **12 个 Python 门全绿**；基线同步为 270。进程与端口已清理。
+- **未 commit**。本步**改了生产逻辑**（三个指标 + 两处上报点 + 门的函数名判定），
+  与步骤 42「只加测试」性质不同，故在此明确标出。
+- **剩余**：① 冷启动 warm-up 成本的方向待定（步骤 42 结论：数百至数千请求内 free 供给不参与选路）；
+  ② HTTPS/CONNECT 免费转发仍受 `gateway.rs:280` `is_tls=false` 冻结范围限制。
+### [2026-09-30] 步骤 44 完成：① 分档最小探索配额（B 方案）——free 供给从第 1 个请求起可参与选路
+
+- **问题（步骤 42 实测）**：完美付费臂 `expected_reward` 被 R13 裁剪到 1.0，UCB 探索项封顶 `alpha*|x|` ≈ 0.47，
+  于是 free 档在 t < ~376~1300 时**永远无法在分数上追平**付费臂——低流量部署的 free 池等于白建。
+- **方案 B：分档最小探索配额**。在 `SmartProxyGateway` 加 `tier_quota_window: Mutex<VecDeque<String>>`，
+  记录最近 `TIER_QUOTA_WINDOW=100` 次选路的 tier。若某 tier 有候选但缺席窗口，则强制本次选路落到该 tier
+  （选候选数最少的缺席 tier，最小化干扰）。窗口仅在初始选路（`excluded.is_empty()`）时更新，重试不重复计数。
+- **语义保证**：每个有候选的 tier 在任意 100 次选路中**至少被选中一次** ⇒ free 供给从第 1 个请求起
+  就可被评估（anytime 保证），不再受"探索加成追不上完美付费臂"的冷启动陷阱。
+- **代价**：每个 tier 至少获得 1% 流量份额。对 free 档（45.9% 成功率）来说，1% 探测流量是可接受的代价。
+- **实现要点**：
+  - `tier_quota_forced_tier()`：第一遍扫描收集候选 tier 集合，检查窗口中缺席的 tier，
+    返回候选数最少的缺席 tier（或 `None`）。
+  - `select_bandit_node_excluding()`：若 `forced_tier` 为 `Some`，在候选循环中跳过非该 tier 的节点。
+  - 窗口更新在选路完成后（`best` 有值时推入 `node.tier`）。
+  - 只有一个 tier 有候选时，配额无意义（无处可切），直接返回 `None`。
+- **新增单测 3 个**（`gateway.rs`）：
+  - `tier_quota_forces_free_tier_when_absent_from_window`：dc 填满窗口后，验证 free 被强制选中。
+  - `tier_quota_no_force_when_all_tiers_present`：所有 tier 都在窗口中时，不强制（正常 UCB 选路）。
+  - `tier_quota_noop_when_single_tier`：只有一个 tier 时，配额无意义。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace`
+  = **272 passed / 7 ignored**（上轮 269，＋3）；`release bandit` 17 passed；
+  **12 个 Python 门全绿**；基线同步为 272。
+- **未 commit**。本步**改了生产逻辑**（选路主循环加入配额检查），与步骤 42/43 性质不同。
+- **剩余**：② HTTPS/CONNECT 免费转发仍受 `gateway.rs:280` `is_tls=false` 冻结范围限制，待解冻后测试。
+### [2026-09-30] 步骤 45 完成：② 解冻 `is_tls=false`——支持端口 443 的 HTTPS 代理
+
+- **问题（步骤 41 遗留）**：`gateway.rs` 的 `build_http_peer` 硬编码 `is_tls = false`，
+  注释写"GW-3 still plain-HTTP forward upstream; TLS/SNI customization stays out of scope (frozen)"。
+  这导致端口 443 的 HTTPS 代理**无法使用**——网关到代理节点之间必须用 TLS，但代码写死了明文。
+- **解冻方案**：按端口判断——443 → TLS，其他 → 明文。这是最小改动，
+  支持 HTTPS 代理的同时保持对明文代理的兼容。
+- **实现**：
+  - 新增 `pub fn is_tls_for_node(node: &ProxyNode) -> bool`，返回 `node.addr.ends_with(":443")`。
+  - `build_http_peer` 改用 `is_tls_for_node(node)` 替代硬编码 `false`。
+  - 注释更新：说明解冻原因（端口 443 的 HTTPS 代理无法使用）与 TLS 证书校验策略
+    （使用 Pingora 默认行为，跳过验证，与明文代理的零校验一致）。
+- **新增单测 1 个**：`is_tls_for_node_port_443`——验证端口 443 → TLS，8080/80 → 明文。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace`
+  = **273 passed / 7 ignored**（上轮 272，＋1）；`release bandit` 17 passed；
+  **12 个 Python 门全绿**；基线同步为 273。
+- **未 commit**。本步**改了生产逻辑**（`build_http_peer` 的 TLS 判断）。
+- **剩余**：HTTPS/CONNECT 免费转发的**活流量验证**（需构造端口 443 的 HTTPS 代理节点）。
+### [2026-09-30] 步骤 46 完成：② 端到端验证——TLS 确实发起，但握手完成被框架能力边界阻断（已定性、按 A 收口）
+
+- **目标**：完成步骤 45 遗留的「HTTPS/CONNECT 免费转发活流量验证」。前置障碍是节点池由 `ArcSwap` 持有、无运行时注入 API，故先按用户拍板的方案 A 加测试通道。
+- **新增 `TEST_POOL_NODES` 测试节点注入通道（`main.rs`）**：格式 `ip:port:tier:country:provider:weight`，逗号分隔。
+  刻意收紧、避免变成生产后门：**默认空 ⇒ 零影响**；**仅接受回环地址**（复用单一判定口径 `is_loopback_addr`，公网条目直接拒绝并 `warn`）；解析失败跳过并 `warn`、**不 panic**（测试通道不该有能力打挂网关）。
+- **✅ 活流量已确证的部分（真实证据，非推断）**：
+  1. 注入通道可用：`[TEST_POOL_NODES] injected test node 127.0.0.1:443`，`X-Proxy-Country: HX` 成功唯一锁定该节点。
+  2. **`is_tls=true` 确实生效**：日志出现 `TLSHandshakeFailure` / `tls connect() failed: invalid peer certificate: UnknownIssuer`。
+     **明文连接绝不会走到证书校验阶段** ⇒ 该证据足以判定解冻后的 TLS 路径真的发起了握手。
+  3. 握手真实到达证书校验阶段（而非连接被拒/协议错配）。
+- **🔴 阻断根因（框架能力边界，非本仓缺陷）**：`pingora-core-0.6.0` 的 **rustls** 连接器**不支持关闭证书校验**。
+  `connectors/tls/rustls/mod.rs` 中 `peer.verify_cert()` **只参与 hostname 匹配**，证书链校验是硬编码的；作者在同一处留了 TODO 原文：
+  `"for consistent behavior between TLS providers some additions are required - allowing to disable verification"`，
+  且 `d_conf.set_certificate_verifier(...)` **仍是注释**。本项目 `Cargo.toml` 用 `features = ["proxy","lb","rustls"]`，正落在这个后端上。
+- **⚠️ 我犯的一个错误，已纠正并留档**：先按方案 B 加了「仅测试节点跳过证书校验」——
+  加临时诊断日志实测 `is_tls=true loopback=true test_chan=true verify_cert=false sni=icanhazip.com`，
+  证明**门控全部生效、`verify_cert` 字段确已置 false**，但握手**仍报 UnknownIssuer**。
+  ⇒ 该代码在 rustls 下**完全无效**。按用户拍板的 A **已删除**，不留在代码里当无效逻辑；
+  `build_http_peer` 注释改为如实记录框架边界与那条 TODO 原文（并把引文里的 `///` 改成 `//`，否则会被当成 doc comment 触发 clippy `unused doc comment`——这个坑是 clippy 实报后修的）。
+- **⇒ 仍然成立的推论**：**用受信 CA 签发证书的 443 代理可正常工作**；自签名证书在本仓当前 TLS 后端下走不通。根治途径只有升级 Pingora 到实现了该 TODO 的版本。
+- **过程中我自己的失误（留档）**：① 一度误以为「目标不可达所以 mock 不会被选中」，据此写了错误的判定逻辑，实测才发现 bandit 一直优选 mock 臂（40 次全打 mock），说明**"没命中 443 节点"是我测试方法错，不是功能错**；② 中途因新 shell 不继承 `$env:TEST_POOL_NODES` 而误判"变量没传到进程"，白排查一轮——真因是二进制与门控都正确，问题在 rustls 不读该开关。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace`
+  = **274 passed / 7 ignored**（上轮 273，＋1）；`release bandit` 17 passed；
+  **12 个 Python 门全绿**；基线同步为 274。进程与端口（含 443）已全部清理。
+- **未 commit**。本步新增生产代码：`TEST_POOL_NODES` 注入通道 + `is_loopback_addr`（默认关闭、零影响）。
+- **剩余未验证项（如实登记，不掩盖）**：**② 的「TLS 握手完整走通并成功转发」仍未端到端验证**，
+  原因是框架 rustls 后端不支持关闭证书校验，而本机无受信 CA 可签发覆盖目标域名的测试证书。
+  复现/后续验证需：受信任 CA 签发对应 SAN 的证书，**或**升级 Pingora。
+### [2026-10-01] 步骤 47 完成：② 端到端**完整通过** —— TLS 握手走通并成功转发（推翻步骤 46 的"框架无法绕过"结论）
+
+- **突破点**：步骤 46 我由「rustls 不支持关闭证书校验」推出「只能靠受信 CA 或升级 Pingora」，
+  **结论虽对，但把"框架不支持关闭校验"当成了终点 —— 漏了框架的正规通道**。
+  真因在 `pingora-rustls-0.4/0.6` 的 `load_platform_certs_incl_env_into_store`：
+  它会处理 **`SSL_CERT_FILE` / `SSL_CERT_DIR`** 环境变量，而 rustls 的 root store
+  正在 `TlsConnector::build_connector` 里由该函数填充 ⇒ **零生产代码改动**即可信任自建 CA。
+  （此前只盯着 `PeerOptions::ca`，没往上翻到 `ConnectorOptions`/root store 的构造处。）
+- **✅ 端到端双向对照确证（同一二进制、同一节点、只改一个环境变量）**：
+  - 正向 `SSL_CERT_FILE=<ca.pem>`：**50/50 次全部 `200`**，响应体均为**真实公网出口 IP**
+    `27.18.27.155`；复验一次亦 `27.18.27.155|200`。
+  - 反向 不设 `SSL_CERT_FILE`：`|503` + `TLSHandshakeFailure`。
+  - ⇒ **关键**：成功**不是**靠关闭校验（代码里确实没有任何放宽，`verify_cert = false` 残留已为 0），
+    而是靠**正确的 CA 信任**。反向对照正是为排除"校验被偷偷关掉"这一可能。
+- **证书链的两个坑（都会让 openssl 误报"没问题"而 rustls 拒绝，已写入脚本与文档）**：
+  - **必须带 SKI + AKI**：缺 `AuthorityKeyIdentifier` 时 `openssl s_client -brief` 仍显示
+    `Verification: OK`，但 Python 严格模式报 `Missing Authority Key Identifier`
+    ⇒ **不能依赖校验器宽松**。
+  - **叶证书 SAN 必须覆盖目标域名**：SNI 取的是 **target_host**（不是代理地址），
+    故只签 `localhost` 的证书访问任何真实目标都会失败。
+- **新增可复现脚本 `tools/verify_tls_egress.py`（189 行）**：生成 CA+叶证书（含 SKI/AKI）、
+  校验本地 443 代理链路（把"代理坏了"与"网关坏了"分开）、并在 CA 与代理证书不配对时
+  给出明确提示（该场景由脚本自身跑出——它先新生 CA、代理仍在用旧叶证书，
+  说明这个错误组合很常见，值得让脚本报得显眼）。**已实测 exit 0 通过。**
+- **文档**：`docs/OPERATION.md` 新增两节——「端口 443 的 HTTPS 代理：TLS 证书怎么配」
+  （严格校验默认、SNI 取目标域名、`SSL_CERT_FILE` 正规通道、两个证书坑、明确"不要用关闭校验绕过"）
+  与「测试节点注入通道 `TEST_POOL_NODES`」（格式、回环限定、默认零影响、
+  并说明必须配 `X-Proxy-Country` 才能唯一锁定，否则会误以为"没命中"实为被优选臂抢走）。
+- **代码**：`build_http_peer` 注释已改为记录**完整**结论并**纠正步骤 45/46 两处错误说法**
+  （45 的"默认跳过验证"错；46 的"框架无法绕过"漏了 `SSL_CERT_FILE` 通道）。
+  无效代码残留已清零：`test_pool_nodes_active` / `verify_cert = false;` / `verify_hostname = false;` / `TLS-DIAG` 各 0 处。
+- **门禁**：`fmt`/`clippy -D warnings`/`bench --no-run` 全绿；`test --locked --workspace`
+  = **274 passed / 7 ignored**；`release bandit` 17 passed；**12 个 Python 门全绿**。基线未变（本步无新增测试）。
+- **未 commit**。
+- **至此三项全部闭环**：P0 Windows 300s 自杀（步骤 39，活流量 t=348s/447s 实证）、
+  ① 分档最小探索配额（步骤 44）、③ 遥测落地端健康告警（步骤 43，活流量双向验证）、
+  ② 端口 443 TLS 转发（步骤 45+47，**端到端 50/50 通过**）。
+- **唯一长期遗留**：升 Pingora（可消除 `allow(dead_code)` 与若干 API 反复，
+  属收益/风险比低的后台项）；GitHub Actions 仍未实跑；JDK/.NET 仍缺。

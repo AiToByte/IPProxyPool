@@ -51,7 +51,17 @@ class IPPClient:
         return h
 
     def get(self, url, extra_headers=None, retries=1):
-        """经网关 GET 公网 URL。返回 (status, body_bytes)。503 延迟 1s 重试一次。"""
+        """经网关 GET 公网 URL。返回 (status, body_bytes)。503 延迟 1s 重试一次。
+
+        错误契约（OPT-R10 C1，与 Java/Node/Go/.NET SDK 一致）——**本 SDK 是基准实现**：
+
+        - **编程错误**（调用方把 url 用错了）⇒ 抛 ``ValueError``。当前一种：
+          scheme 非 ``http``（网关不做 CONNECT 隧道，见 ``docs/SPIKE_R2.md`` 的
+          E7 结论）。不重试——重试一个永远不可能成功的请求只是浪费配额。
+        - **网络/网关失败**（连接失败、超时、503 重试耗尽）⇒ **不抛**，返回
+          ``(0, <诊断信息>)``。可预期的瞬时故障，退避/重试策略由调用方决定；
+          不要写成 catch-all 吞掉，那会丢掉可观测性。
+        """
         t = urlsplit(url)
         if t.scheme != "http":
             raise ValueError("only plain http targets are supported (no CONNECT tunneling)")

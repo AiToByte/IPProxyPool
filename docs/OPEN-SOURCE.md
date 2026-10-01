@@ -34,7 +34,7 @@
 
 ### 3. 数据与库许可
 
-- **MaxMind GeoLite2**（可选库文件，不在仓内）：CC BY-SA 4.0——使用需署名（OPERATION 有署名行），库更新脚本 `deploy/geoip_update.py` 需自备 license key（禁进仓）。
+- **MaxMind GeoLite2**（可选库文件，不在仓内）：CC BY-SA 4.0——**使用即须署名**。署名的**可复制文本**在 [`OPERATION.md` §第三方数据署名](OPERATION.md#第三方数据署名--third-party-data-attribution)（CC BY-SA 4.0 §3(a) 要求的四要素：提供者 / 许可+链接 / 免责声明 / 数据来源）。> OPT-R10 更正：本条此前写「OPERATION 有署名行」，但该文件实际**只有 GeoLite2 的操作步骤、没有任何署名**——属本仓的**不实陈述**，已于 OPT-R10 补齐。库更新脚本 `deploy/geoip_update.py` 需自备 license key（禁进仓）。
 - **免费代理源数据**（Geonode/openproxylist/monosans/relayglass 等公网列表）：仅做连通性验证＋匿名度分级，不做归因承诺；遵守各源 robots/用量礼貌（分页上限、ETag 304、失败熔断）。
 
 ### 4. 本仓开源 posture

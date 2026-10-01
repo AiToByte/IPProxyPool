@@ -202,3 +202,49 @@ groups:
         annotations:
           summary: "遥测 Stream 积压持续 > 1000 条"
           describe: "stream 长度 10 分钟内持续超 1000（消费组 ch_sink_group 跟不上）；查 ClickHouse insert 延迟与 `supervisor_restarts_total{worker=\"ch_sink\"}`。注：MAXLEN~100000 修剪策略下健康稳态长度应远低于此值。"
+
+      # ---- 遥测落地端健康（OPT-R15 新增）----
+      #
+      # 为什么需要这组（实测依据，非推演）：步骤 40 复现过一次**静默丢光全部遥测**的故障——
+      # `REDIS_URL` 少写密码，flush 报 `Protocol error: unauthenticated multibulk length`（看着像
+      # ClickHouse 报错，实为 **Redis** 协议错误），当时只有翻日志才发现，指标上唯一线索是
+      # `telemetry_dropped_total` 在涨：它只说"丢了多少"，**不说是哪一级落地、也不说还通不通**。
+      #
+      # 三条规则分工（刻意不合并，避免一个阈值同时承担两种语义）：
+      #   1. Down      —— 最近一次尝试失败。持续 2m 才报，过滤单次网络毛刺。
+      #   2. NeverOk   —— 该 backend 序列存在但 `last_ok=0`，即"试过、一次都没成功过"。
+      #   3. Stale     —— `up=1` 但很久没有成功写入（挂起/假活）。必须排除 `last_ok=0`，
+      #                    否则「一次都没成功」会被算成"已经 N 百年没写"，两条规则同时误报。
+      #
+      # 与 `TelemetryStreamBacklogHigh` 的关系：那条依赖 `redis_exporter`（compose 里 profile 门控），
+      # **未接 exporter 时静默不发**；本组只依赖网关 `/metrics`，**默认就可用**，是兜底。
+      # 两级 backend 互相独立：Redis 好、ClickHouse 坏时 `backend="redis"` 仍为 1，只有 CH 那条转 0。
+      - alert: TelemetrySinkDown
+        expr: telemetry_sink_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "遥测落地端 {{ $labels.backend }} 持续失败"
+          describe: "backend={{ $labels.backend }} 最近一次写入尝试失败且已持续 2 分钟；遥测正在丢弃（累计 `telemetry_dropped_total`）。按 backend 排查：redis=检查 `REDIS_URL` 是否含密码（密码来自容器启动参数，`docker inspect .Config.Env` 查不到，需看 `.Config.Cmd`）；clickhouse=检查 `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD`。"
+
+      - alert: TelemetrySinkNeverSucceeded
+        expr: telemetry_sink_last_ok_unixtime_seconds == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "遥测落地端 {{ $labels.backend }} 从未成功写入过"
+          describe: "backend={{ $labels.backend }} 的 `last_ok=0`：序列已出现（说明该级被实际调用过）但**一次都没写成功**。这比 `TelemetrySinkDown` 更严重——不是「曾经好过现在坏了」，而是「从上线起就没通过」，通常是凭据/网络从未配对。"
+
+      - alert: TelemetrySinkStale
+        expr: |
+          telemetry_sink_last_ok_unixtime_seconds > 0
+          and
+          (time() - telemetry_sink_last_ok_unixtime_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "遥测落地端 {{ $labels.backend }} 已 10 分钟无成功写入"
+          describe: "backend={{ $labels.backend }} 的 `up=1` 但最近成功写入距今超 600 秒：假活/挂起（例如 ClickHouse 插入长期卡住而未报错）。注意 `> 0` 条件用于排除「一次都没成功」（由 `TelemetrySinkNeverSucceeded` 负责），否则两条规则会同时误报。"

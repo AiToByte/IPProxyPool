@@ -44,7 +44,7 @@ pub fn valid_quarantine_target(domain: &str, ip: &str) -> bool {
 }
 
 pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
-    use crate::router::QUARANTINE_MAX_TTL_SECS;
+    use crate::router::{QUARANTINE_DOMAIN_MAX_BYTES, QUARANTINE_MAX_TTL_SECS};
     let mut parts = payload.split('|');
     match (
         parts.next(),
@@ -58,6 +58,15 @@ pub fn parse_delta_message(payload: &str) -> Option<(String, String, u64)> {
             .ok()
             .filter(|t| *t > 0 && *t <= QUARANTINE_MAX_TTL_SECS)
             .filter(|_| valid_quarantine_target(domain, ip))
+            // OPT-R11 C1：domain 长度上限。此前**只校验非空**——Redis 可达者
+            // 发一个 `QUARANTINE|<任意长字符串>|ip|600` 报文即可直接往隔离表
+            // 外层灌入超长 key，绕过数据面的一切约束。这里在**解析层**拦
+            // （而非只靠 `set_quarantine` 兜底），是为了让毒报文尽早被拒。
+            // 上限与 `set_quarantine` 同源单一真源（`QUARANTINE_DOMAIN_MAX_BYTES`）。
+            //
+            // 另注：此前 sweep 回收空内层 map 也救不了——外层条目在窗口内存活，
+            // 而 TTL 窗口上限可达 24h。
+            .filter(|_| domain.len() <= QUARANTINE_DOMAIN_MAX_BYTES)
             .map(|t| (domain.to_string(), ip.to_string(), t)),
         _ => None,
     }
@@ -576,5 +585,27 @@ mod tests {
         .await;
         assert!(r.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- OPT-R11 C1：PubSub 入口的 domain 长度闸门 ----
+
+    /// 超长 domain 的增量报文必须在**解析层**就被拒（不得依赖
+    /// 下游 `set_quarantine` 兜底）——Redis 可达者可绕过数据面一刀注入任意长度。
+    #[test]
+    fn opt_r11_c1_parse_delta_rejects_overlong_domain() {
+        use crate::router::QUARANTINE_DOMAIN_MAX_BYTES;
+        let long = "a".repeat(QUARANTINE_DOMAIN_MAX_BYTES + 1);
+        let payload = format!("QUARANTINE|{long}|10.0.0.1|600");
+        assert!(
+            parse_delta_message(&payload).is_none(),
+            "超长 domain 的 PubSub 报文必须在解析层被拒"
+        );
+        // 恰好上限仍应通过（不得多拒）。
+        let exact = "b".repeat(QUARANTINE_DOMAIN_MAX_BYTES);
+        let ok = format!("QUARANTINE|{exact}|10.0.0.1|600");
+        assert!(
+            parse_delta_message(&ok).is_some(),
+            "恰好上限的 domain 必须仍然可用"
+        );
     }
 }

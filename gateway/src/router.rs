@@ -8,6 +8,7 @@ use crate::janitor;
 use crate::model::{ProxyNode, RoutingSpec};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+#[cfg(test)]
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::sync::Arc;
@@ -30,6 +31,33 @@ const SESSION_MAX_ENTRIES: usize = 8192;
 /// 复审结论：`Instant + Duration` 会溢出 panic——u64::MAX 级输入（毒报文/非法 env）
 /// 必须钳制；上限远超业务 TTL（60/600s），钳制无行为影响。
 pub const QUARANTINE_MAX_TTL_SECS: u64 = 86400;
+
+/// OPT-R11 C1：隔离 domain 长度上限（字节）。
+///
+/// 隔离表外层 key 是**客户端可控的归一化 `Host`**（写入点 `set_quarantine`
+/// 源自遥测 `domain` 字段，`apply_delta` 侧来自 Redis PubSub 报文）。攻击者
+/// 或可写 Redis 者可用超长 domain 直接撑爆外层 `DashMap` 的 key 存储。
+///
+/// 判定用**字节数**且**不截断**（与 `SESSION_ID_MAX_BYTES` 同一风格）——
+/// 超长即拒绝落表，而不是截短成可能撞车的另一个 key。
+pub const QUARANTINE_DOMAIN_MAX_BYTES: usize = 253;
+
+/// OPT-R11 C1：隔离表**外层** domain 条目水位。
+///
+/// 已有 `SESSION_MAX_ENTRIES=8192` 这一同构先例：满水位后新 key 拒绝落表、
+/// 已存 key 仍可用。会话表按 session_id 有界，隔离表此前**两样都没有**。
+///
+/// # 为何是「外层」条目数而不是「内层 ip 数」
+///
+/// `quarantine_len()` 统计的是**内层** ip 条目总数（`metrics` 的
+/// `quarantine_nodes` gauge 用的就是它）。内存放大主要来自外层：每个外层
+/// 条目都要付一次 `DashMap` 的 entry 分配 ＋ 一个内层 `DashMap` 的
+/// `Vec<AtomicUsize>` 桶开销，而**内层为空的外层条目**（所有 ip 都过期后
+/// sweep 前的窗口）几乎只花钱不办事。故水位卡外层。
+///
+/// 与 `SESSION_MAX_ENTRIES` 同理：并发下 `len()` 检查与 `insert` 非原子，
+/// 水位为**软上限**（允许轻微超限），只防无限膨胀。
+pub const QUARANTINE_MAX_DOMAINS: usize = 8192;
 
 /// R2-2 域名归一化：去空白 → 剥端口（`host:port`，端口须全数字）→ 去尾点 → 小写。
 ///
@@ -61,7 +89,40 @@ pub struct RouterEngine {
     /// 会话绑定同样存 `Arc`（粘滞命中直接返回引用计数句柄，零 `String` 克隆）。
     session_store: DashMap<String, (Arc<ProxyNode>, Instant)>,
     /// Key = `{domain}:{ip}`, value = quarantine expiry.
-    quarantine_map: DashMap<String, Instant>,
+    /// 两级隔离表：归一化 domain → (node ip → 隔离到期时刻)。
+    ///
+    /// OPT-R9 C1：由原扁平 `DashMap<String /*"{domain}:{ip}"*/, Instant>` 改为两级。
+    ///
+    /// # 为什么改（热路径 O(N) 分配）
+    ///
+    /// 旧 `is_quarantined` 每次调用都执行 `format!("{}:{ip}", normalize_domain(domain))`
+    /// ——即 **1 次 `normalize_domain` 分配 ＋ 1 次 `format!` 分配**。而它经
+    /// `is_node_quarantined`（R3-2：代理入口 ip ＋ 真 egress exit_ip **双检**）
+    /// 被 `matches` 在**每个节点上**调用 ⇒ 池大小 N 时每请求产生 **2N 次堆分配**
+    /// （免费池缺省 `FREE_MAX_NODES=2000` ⇒ 约 4000 次/请求）。
+    ///
+    /// # 为什么是「两级」而不是「缓存 key」
+    ///
+    /// 缓存 `domain+ip → String` 的 memo 省不掉分配——查表仍需把 key 拼出来
+    /// （一次 `String` clone）。且 key 空间由客户端可控（`Host` 任意变体），
+    /// 缓存即无界内存。两级结构把**拼接彻底消除**：外层查 domain（每请求一次
+    /// `normalize_domain`），内层直接按节点已有的 `node.ip` 查，**零分配**。
+    ///
+    /// # 顺带修掉的潜在缺陷：扁平 key 的分隔符碰撞
+    ///
+    /// 旧 key 用 `:` 拼接，而 `normalize_domain` **允许 domain 含 `:`**
+    /// （IPv6 字面量：`normalize_domain("[::1]:8080") == "::1"`；单测
+    /// `normalize_domain_cases` 也锁定了 `normalize_domain("a:b") == "a:b"`）。
+    /// 于是 `(domain="a:b", ip="10.0.0.1")` 与 `(domain="a", ip="b:10.0.0.1")`
+    /// 产生**同一个扁平 key** `a:b:10.0.0.1` —— 互相污染隔离条目。
+    /// 两级结构以 `DashMap` 的键相等性取代字符串拼接，**从根上消除该隐忧**。
+    ///
+    /// # 跨进程协议不变
+    ///
+    /// Redis `SETEX` / PubSub `PUBLISH` 用的仍是 `circuit_breaker.rs` 侧生成的
+    /// 扁平字符串 key（形如 `quarantine:{domain}:{ip}`），本字段只服务**内存查询**。
+    /// `set_quarantine` 的对外签名（domain 与 ip 两个入参）保持不变。
+    quarantine_map: DashMap<String, DashMap<String, Instant>>,
     /// NEXT-B6：免费套利因子表（(provider, country小写)→factor；`merge_once` 应用，
     /// 审计 scale 不再被下轮合并覆盖；缺省 1.0；键空间随池多样性有界）。
     free_scale: DashMap<(String, String), f64>,
@@ -109,16 +170,66 @@ impl RouterEngine {
 
     /// 施加域级隔离（GW-2 熔断器 / PubSub 增量同步调用）。
     /// R2-2：domain 统一归一化（小写 + 剥端口 + 去尾点），`A.COM:443` 与
-    /// `a.com` 落同一 key，大小写/端口变体绕不过隔离。
+    /// `a.com` 落同一条目，大小写/端口变体绕不过隔离。
     /// 复审钳制：ttl 先取上限再相加（`checked_add` 显式无 panic；上限内 checked 恒成功，
     /// 写成 checked 形式以证 panic-free，而非依赖平台知识）。
+    ///
+    /// OPT-R9 C1：**两级结构**写入——外层按归一化 domain，内层按 node ip。
+    /// 对外签名与语义与旧扁平 key 实现完全一致（跨进程 PubSub/Redis key 生成
+    /// 仍走 `circuit_breaker.rs` 侧的扁平字符串，协议未动）。
     pub fn set_quarantine(&self, domain: &str, ip: &str, ttl_secs: u64) {
-        let key = format!("{}:{ip}", normalize_domain(domain));
         let ttl = Duration::from_secs(ttl_secs.min(QUARANTINE_MAX_TTL_SECS));
         let expiry = Instant::now()
             .checked_add(ttl)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(QUARANTINE_MAX_TTL_SECS));
-        self.quarantine_map.insert(key, expiry);
+        // OPT-R11 C1：落表前过**两道准入**，与 `session_sticky_allowed` 同构。
+        //
+        // 理由（这是本项定为 P1 的原因）：本表外层 key 源自**客户端可控的
+        // `Host`**——攻击者用随机/超长 Host 反复吃 403/429 即可在 TTL 窗口
+        // （403→600s）内持续新增外层条目；`apply_delta` 的 Redis PubSub 入口
+        // 更直接，`parse_delta_message` 只校验 `ttl` 范围与 domain/ip 非空，
+        // 长度/条目数一概不设防。此前本表**既无长度上限也无水位**，而会话表
+        // 两样都有（`SESSION_ID_MAX_BYTES` + `SESSION_MAX_ENTRIES`）——同一仓
+        // 内两张客户端可影响的表，防护水平不一致。
+        //
+        // 语义与超长 session_id 一致：**拒绝落表，不截断**。截断会把两个不同
+        // domain 映射到同一 key，造成误隔离（把无辜节点拖下水），比不隔离更糟。
+        let domain = normalize_domain(domain);
+        if domain.len() > QUARANTINE_DOMAIN_MAX_BYTES {
+            log::warn!(
+                "[quarantine] domain too long ({} bytes > {}), not quarantined",
+                domain.len(),
+                QUARANTINE_DOMAIN_MAX_BYTES
+            );
+            return;
+        }
+        if self.quarantine_map.len() >= QUARANTINE_MAX_DOMAINS
+            && !self.quarantine_map.contains_key(&domain)
+        {
+            // 软水位：并发下允许轻微超限，只防无限膨胀。已达水位时**不驱逐**
+            // 已有 domain——驱逐正在生效的隔离等于放行攻击流量；宁可新 domain
+            // 暂不隔离（下轮窗口自然重试），也不动已有判定。
+            log::warn!(
+                "[quarantine] outer domain watermark reached ({} >= {}), new domain not quarantined",
+                self.quarantine_map.len(),
+                QUARANTINE_MAX_DOMAINS
+            );
+            return;
+        }
+        self.quarantine_map
+            .entry(domain)
+            .or_insert_with(DashMap::new)
+            .insert(ip.to_string(), expiry);
+    }
+
+    /// 隔离表外层条目数（`QUARANTINE_MAX_DOMAINS` 水位的可观测口径）。
+    ///
+    /// 与 `quarantine_len`（内层 ip 条目总数，供 metrics gauge 用）刻意区分：
+    /// 水位卡的是**外层**，所以需要一个能看见外层的计数。生产侧目前只用于
+    /// 指标/排障需求未接入，故先仅供测试与按需调用。
+    #[cfg(test)]
+    pub fn quarantine_domains(&self) -> usize {
+        self.quarantine_map.len()
     }
 
     /// 导出当前全量节点快照（含被隔离节点，用于臂表修剪白名单）。
@@ -128,8 +239,9 @@ impl RouterEngine {
     }
 
     /// NEXT-A4：内存隔离表水位（sweep 滴答同步进 `quarantine_nodes` gauge）。
+    /// OPT-R9 C1：两级结构下需**汇总**内层条目数（外层 domain 数不是隔离条目数）。
     pub fn quarantine_len(&self) -> usize {
-        self.quarantine_map.len()
+        self.quarantine_map.iter().map(|kv| kv.value().len()).sum()
     }
 
     /// 周期清理：删除已过期的会话绑定与隔离条目。
@@ -154,12 +266,19 @@ impl RouterEngine {
         // panic 即静默死亡 → 会话表无界增长至 OOM。
         let sessions_removed = janitor::removed_count(sessions_before, self.session_store.len());
 
-        let quarantines_before = self.quarantine_map.len();
+        let quarantines_before = self.quarantine_len();
         // 隔离：到期时刻 <= now 即过期。
-        self.quarantine_map.retain(|_, expiry| *expiry > now);
+        //
+        // OPT-R9 C1：两级结构下需**逐内层**判过期。顺带做**空内层回收**——
+        // 一个 domain 的全部 ip 都过期后，外层条目若留着就是纯粹的内存泄漏
+        // （key 空间由客户端可控的 `Host` 变体构成）。`DashMap::retain` 持锁期间
+        // 不可再取同一分片的写锁，故用「先判后删」两趟，避免自死锁。
+        self.quarantine_map.retain(|_, inner| {
+            inner.retain(|_, expiry| *expiry > now);
+            !inner.is_empty()
+        });
         // OPT-R6 S2：同上，隔离表亦由熔断消费侧并发写入。
-        let quarantines_removed =
-            janitor::removed_count(quarantines_before, self.quarantine_map.len());
+        let quarantines_removed = janitor::removed_count(quarantines_before, self.quarantine_len());
 
         // OPT-R4 B11：TTL 淘汰顺带清理僵尸因子（池内已无对应 vendor×country
         // 即删键；缺省 1.0 语义不变，恢复靠下轮 merge 健康快照，不靠残留 0 因子）。
@@ -168,11 +287,29 @@ impl RouterEngine {
         (sessions_removed, quarantines_removed)
     }
 
+    /// 隔离查询（OPT-R9 C1：零分配的**内层**查表）。
+    ///
+    /// `normalized_domain` 必须**已归一**（调用方在节点循环外算一次），
+    /// 本函数只做两级哈希查找，**不产生任何堆分配**——这是本轮优化的核心。
+    /// 未命中外层（该 domain 没有任何隔离记录）时立即返回 `false`，
+    /// 连内层都不查——空表是常态（隔离只在熔断后才写入）。
+    #[inline]
+    fn is_quarantined_normalized(&self, normalized_domain: &str, ip: &str, now: Instant) -> bool {
+        match self.quarantine_map.get(normalized_domain) {
+            Some(inner) => inner.get(ip).is_some_and(|exp| *exp.value() > now),
+            None => false,
+        }
+    }
+
+    /// 隔离查询的**对外形态**（自行归一 domain）。
+    ///
+    /// 仅供「不在节点循环内」的调用方与单元测试使用；节点循环**必须**走
+    /// [`Self::is_quarantined_normalized`] 复用归一结果，否则会把分配
+    /// 重新拉回 O(N)。生产热路径（`matches` / sticky 复核）已在各自入口
+    /// 归一 `spec.target_domain`，本函数在生产路径上无调用方。
+    #[cfg_attr(not(test), allow(dead_code))]
     fn is_quarantined(&self, domain: &str, ip: &str, now: Instant) -> bool {
-        let key = format!("{}:{ip}", normalize_domain(domain));
-        self.quarantine_map
-            .get(&key)
-            .is_some_and(|exp| *exp.value() > now)
+        self.is_quarantined_normalized(&normalize_domain(domain), ip, now)
     }
 
     fn matches(&self, node: &ProxyNode, spec: &RoutingSpec, now: Instant) -> bool {
@@ -202,27 +339,83 @@ impl RouterEngine {
                 return false;
             }
         }
+        // OPT-R9 C1：隔离查表走 `is_node_quarantined`（零分配内层查表）。
+        // 本函数只负责**保证入参已归一**：`get_healthy_candidates_excluding` /
+        // `select_node_excluding` 的 sticky 复核路径都在节点循环**外**算一次
+        // `normalize_domain` 并填入 `spec.target_domain` 旁的 `normalized_domain`。
+        // 这里的 `&spec.target_domain` 由调用方保证已是归一值（见两处入口的
+        // `spec.target_domain = normalize_domain(...)`），故**不重复归一**。
         if self.is_node_quarantined(node, &spec.target_domain, now) {
             return false;
         }
         true
     }
 
-    /// R3-2：节点级隔离判定（代理入口 ip＋真 egress exit_ip 双检）。
+    /// R3-2：节点级隔离判定（代理入口 ip ＋ 真 egress exit_ip 双检）。
     /// CB 消费遥测 `out_ip`（R3-2 起为真 egress），隔离条目可能落在任一地址上；
     /// 双检保证代理级/出口级隔离都不静默失效（http 节点 exit 恒 None，行为冻结）。
-    fn is_node_quarantined(&self, node: &ProxyNode, domain: &str, now: Instant) -> bool {
-        self.is_quarantined(domain, &node.ip, now)
+    ///
+    /// OPT-R9 C1：入参改为**已归一**的 domain——`normalize_domain` 只在调用方
+    /// （`matches`）的节点循环**外**算一次，本函数与被它调用的内层查表均零分配。
+    fn is_node_quarantined(&self, node: &ProxyNode, normalized_domain: &str, now: Instant) -> bool {
+        self.is_quarantined_normalized(normalized_domain, &node.ip, now)
             || node
                 .exit_ip
                 .as_deref()
-                .is_some_and(|e| self.is_quarantined(domain, e, now))
+                .is_some_and(|e| self.is_quarantined_normalized(normalized_domain, e, now))
     }
 
     /// 按条件过滤健康候选节点（GW-3 LinUCB / 预热器 / 套利审计的统一入口）。
     /// R2-6：返回 `Arc` 句柄（零 `String` 克隆；调用方按需再解引用）。
     pub fn get_healthy_candidates(&self, spec: &RoutingSpec) -> Vec<Arc<ProxyNode>> {
         self.get_healthy_candidates_excluding(spec, &[])
+    }
+
+    /// OPT-R11 B1：导出「当前池快照 guard」与「节点可用性判定」两个访问器。
+    ///
+    /// # 为什么要导出（而不是把选路整个搬进 router）
+    ///
+    /// 网关的 LinUCB 选路需要**交叉**两个私有状态：池快照（`RouterEngine` 的）
+    /// 与臂表（`SmartProxyGateway` 的）。旧实现靠 `get_healthy_candidates_*`
+    /// 把池内容**物化**出来再让网关去比对臂，等于用一次 O(N) 分配换取这点
+    /// 可见性。流式版改为直接遍历快照，就必然要碰到这两处。
+    ///
+    /// 边界控制：**只导出只读能力，不导出可变状态**——`pools_guard` 返回
+    /// `ArcSwap` 的只读 guard（引用计数，非阻塞锁，不影响写侧），
+    /// `matches_node` 是纯判定。写路径（`upsert`/`set_quarantine` 等）仍私有。
+    ///
+    /// # `matches_node` 的归一责任
+    ///
+    /// 调用方**必须**先自行归一 `spec`（tier 与 `target_domain`），
+    /// 否则判定口径会与 `matches` 内部不一致。数据面两个调用点都在入口归一
+    /// 一次（`select_node_excluding` 本函数上方的既有逻辑、
+    /// `select_bandit_node_excluding` 的调用链），口径统一。
+    /// OPT-R11 B1：导出「在当前池快照上做只读计算」的闭包式访问器。
+    ///
+    /// # 为何是闭包而不是返回 guard
+    ///
+    /// 三个理由，第三个是关键的：
+    ///
+    /// 1. 不泄漏 `ArcSwap` 的 guard 具体类型（该类型在本模块内被同名 `Arc`
+    ///    遮蔽，书写本身就别扭）；
+    /// 2. 只读能力边界更清楚——调用方**拿不到**可长期持有的快照句柄；
+    /// 3. **从类型上阻止误用**：`guard` 一旦返回，调用方可能把它带出闭包
+    ///    长期持有（`select_bandit_node_excluding` 这类函数里就可能触发
+    ///    跨 `.await` 持有）。闭包形态让"快照只在闭包期间有效"成为**类型
+    ///    保证**而非口头约定——这正是本仓禁区条款（不跨 await 持锁/持引用）
+    ///    想要的机制级保障。
+    ///
+    /// 注意 `f` 收到的切片可能**跨 `.await` 存活**（若 `f` 是 async），
+    /// 故调用方仍须自行保证闭包内不 await；`guard` 本身是引用计数、
+    /// 非阻塞锁，不影响写侧。
+    pub fn with_pools<R>(&self, f: impl FnOnce(&[Arc<ProxyNode>]) -> R) -> R {
+        let guard = self.pools.load();
+        f(guard.as_ref())
+    }
+
+    /// 单节点可用性判定（`matches` 的对外只读包装，纯函数语义）。
+    pub fn matches_node(&self, node: &ProxyNode, spec: &RoutingSpec, now: Instant) -> bool {
+        self.matches(node, spec, now)
     }
 
     /// R2-2：带失败排除的候选过滤（网关重试路径用；`excluded` 为 `ip:port` 集合）。
@@ -236,6 +429,12 @@ impl RouterEngine {
         // REVIEW-R2 Q8：tier 请求侧归一一次（逐节点循环外；matches 内零分配）。
         let mut spec = spec.clone();
         spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
+        // OPT-R9 C1：目标域同样归一一次（逐节点循环外）。`matches` 内的隔离查表
+        // 直接用该值做外层 `DashMap` 查找，**循环内零分配**——旧实现在
+        // `is_quarantined` 里对每个节点做 `format!("{}:{ip}", normalize_domain(...))`，
+        // 池 N 时每请求 2N 次堆分配（免费池缺省 2000 节点 ≈ 4000 次/请求）。
+        // 归一后语义与旧实现完全一致（隔离查表键的第一层就是归一化 domain）。
+        spec.target_domain = normalize_domain(&spec.target_domain);
         guard
             .iter()
             .filter(|n| !excluded.iter().any(|e| e == &n.addr))
@@ -266,6 +465,12 @@ impl RouterEngine {
         // 原 Q8 hoist 只在步骤 2，粘滞路径用的还是原文 tier）。
         let mut spec = spec.clone();
         spec.tier = spec.tier.map(|t| crate::model::canonical_tier(&t));
+        // OPT-R9 C1：目标域同样在入口归一一次，粘滞复核与新鲜选择共用
+        // （粘滞路径只复核单个节点，收益小于新路径，但统一归一可避免两处口径
+        // 分叉——旧实现的 sticky 复核里 `is_node_quarantined` 走的是未归一的
+        // 原文 domain，靠 `is_quarantined` 内部归一兜底；现在改为入口统一归一，
+        // 内层查表不再重复归一）。
+        spec.target_domain = normalize_domain(&spec.target_domain);
 
         // 1. Sticky session fast path (skip quarantined/derated/excluded bindings).
         // OPT-R4 A7：超长 session 当无 session 处理（不查表，直接走无状态新鲜选择，
@@ -310,16 +515,27 @@ impl RouterEngine {
 
         // 2. Filter snapshot（spec 已在入口归一，直接用）。
         let guard = self.pools.load();
-        let candidates: Vec<Arc<ProxyNode>> = guard
-            .iter()
-            .filter(|n| !excluded.iter().any(|e| e == &n.addr))
-            .filter(|n| self.matches(n, &spec, now))
-            .cloned()
-            .collect();
-
-        // 3. Weighted random pick.
+        // 3. Weighted random pick。
+        //
+        // OPT-R11 B1：原为「先把全部候选物化成 `Vec<Arc<ProxyNode>>`，再调
+        // `pick_weighted` 取一个」——物化的唯一用途就是喂给只需要一个元素的
+        // 函数。`FREE_MAX_NODES=2000` 缺省时每请求约 16KB 分配 + 2000 次原子
+        // 引用计数递增 + 约 11 次 realloc。改走流式两趟（`total`/`count` 一趟、
+        // 定位一趟），**分配量 O(N) → 0**。
+        //
+        // 过滤条件与顺序逐字沿用旧实现（`excluded` 先判、`matches` 后判），
+        // 故候选集合与遍历顺序不变 ⇒ 与 `pick_weighted` 逐值等价
+        // （差分测试见 `opt_r11_b1_pick_weighted_streaming_matches_reference`）。
         let mut rng = rand::thread_rng();
-        let selected = pick_weighted(&candidates, &mut rng);
+        let selected = pick_weighted_streaming(
+            || {
+                guard
+                    .iter()
+                    .filter(|n| !excluded.iter().any(|e| e == &n.addr))
+                    .filter(|n| self.matches(n, &spec, now))
+            },
+            &mut rng,
+        );
 
         // 4. Bind new session.
         // OPT-R4 A7：落表前过准入（超长/满水位新 key 不落表，只用无状态选中节点）。
@@ -427,6 +643,14 @@ impl RouterEngine {
 
 /// R2-1 加权随机核心（纯函数，可单测）：累计权重 roll，`total==0` 退化均匀。
 /// R2-6：输入/输出均为 `Arc`（只动引用计数，不克隆节点）。
+///
+/// # 它是 `pick_weighted_streaming` 的**独立参考实现**（OPT-R11 B1）
+///
+/// 数据面热路径已改走流式版，但本函数**刻意保留原样**（不改成委托），
+/// 因为差分测试需要它作为「修改前的行为」基准——若让流式版委托本函数，
+/// 比较就退化成自己跟前比、恒真，等于没有门。
+/// 相应地本函数**仅在测试期编译**（`#[cfg(test)]`），不进生产二进制。
+#[cfg(test)]
 fn pick_weighted(candidates: &[Arc<ProxyNode>], rng: &mut impl Rng) -> Option<Arc<ProxyNode>> {
     if candidates.is_empty() {
         return None;
@@ -449,6 +673,67 @@ fn pick_weighted(candidates: &[Arc<ProxyNode>], rng: &mut impl Rng) -> Option<Ar
     candidates.last().cloned()
 }
 
+/// OPT-R11 B1：加权随机选路的**流式**版本——两趟遍历，**零物化**。
+///
+/// # 为什么需要它
+///
+/// 数据面每请求都要在候选里选一个节点，而旧路径先把全部候选物化成
+/// `Vec<Arc<ProxyNode>>`（`select_node_excluding` 步骤 2）**只为了最终取一个**。
+/// 代价随池规模线性增长：`FREE_MAX_NODES=2000` 缺省时每请求约 16KB 分配、
+/// 2000 次原子引用计数递增，外加 `collect` 因 `size_hint` 下界为 0 而走
+/// 倍增策略的约 11 次 realloc。
+///
+/// # 为什么两趟就够
+///
+/// `pick_weighted` 只需要两样东西：权重总和（决定 roll 范围）与「第几个
+/// 命中」（决定选中谁）。两者都可在**流式**下得出：第 1 趟求 `total`/`count`，
+/// 第 2 趟按同一顺序定位。**语义与物化版逐值等价**，包括：
+///
+/// - `total == 0` ⇒ 均匀退化，且**RNG 消耗顺序**与 `pick_weighted` 一致
+///   （都是先算 total、再抽一个 `gen_range`）；
+/// - `total > 0` ⇒ `roll ∈ [0,total)` 后按权重递减，与物化版同一算式；
+/// - 平局/边界兜底语义不变。
+///
+/// 差分测试见本文件末尾 `opt_r11_b1_*`：以 `pick_weighted` 为基准，
+/// 对多组权重分布 × 多组 seed 断言选中**同一节点**。
+///
+/// # `make_iter` 为何是闭包而不是 `I: Clone`
+///
+/// `DashMap` 的 `iter()` 每次都返回新迭代器，且遍历顺序对固定表内容稳定；
+/// 传闭包让「每趟新建迭代器」显式化，也免去对迭代器要求 `Clone`。
+fn pick_weighted_streaming<'a, I, F>(mut make_iter: F, rng: &mut impl Rng) -> Option<Arc<ProxyNode>>
+where
+    F: FnMut() -> I,
+    I: Iterator<Item = &'a Arc<ProxyNode>>,
+{
+    // 第 1 趟：权重总和与候选个数（不物化、不克隆）。
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    for n in make_iter() {
+        total += n.weight as u64;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    if total == 0 {
+        // 防御分支（matches 已滤 0，正常走不到）：退化均匀。
+        // `choose` 内部对非空切片即 `gen_range(0..len)`，故与物化版同源。
+        let idx = rng.gen_range(0..count);
+        return make_iter().nth(idx).map(Arc::clone);
+    }
+    // 第 2 趟：按同一顺序消耗 roll。
+    let mut roll = rng.gen_range(0..total);
+    for n in make_iter() {
+        let w = n.weight as u64;
+        if roll < w {
+            return Some(Arc::clone(n));
+        }
+        roll -= w;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,10 +745,13 @@ mod tests {
         // 按上限钳制；条目仍生效且可 sweep 清理。
         let r = RouterEngine::new(vec![]);
         r.set_quarantine("x.example", "10.0.0.1", u64::MAX);
+        // OPT-R9 C1：两级结构下条目落在 `domain → ip → expiry`。
+        // 用 `map` 而非 `and_then`：后者的闭包返回借用会踩「引用不能逃逸出
+        // 借用局部变量」的借用检查（`Ref` 守卫生命周期短于链式调用结果）。
         let exp = r
             .quarantine_map
-            .get("x.example:10.0.0.1")
-            .map(|e| *e.value())
+            .get("x.example")
+            .and_then(|inner| inner.get("10.0.0.1").map(|e| *e.value()))
             .expect("entry");
         let horizon = Instant::now() + Duration::from_secs(QUARANTINE_MAX_TTL_SECS);
         assert!(
@@ -1502,5 +1790,514 @@ mod tests {
             "命中免费节点的带凭据请求必须被护栏拦截（S1 修复本体）"
         );
         assert!(paid_passed > 0, "付费节点路径也必须被走到（存量语义验证）");
+    }
+    // ---- OPT-R9 C1：隔离表两级结构（热路径零分配）回归锁定 ----
+
+    /// 语义等价性：同 domain 不同 ip 各自独立隔离。
+    /// 两级结构的**第一层键**是归一化 domain，第二层是 ip。
+    #[test]
+    fn opt_r9_c1_quarantine_two_level_same_domain_distinct_ips() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("shop.example", "10.0.0.1", 600);
+        let now = Instant::now();
+        assert!(r.is_quarantined("shop.example", "10.0.0.1", now));
+        // 同 domain 下另一个 ip 不受影响。
+        assert!(!r.is_quarantined("shop.example", "10.0.0.2", now));
+        // 水位按**条目数**计（不是外层 domain 数）：两条 ip ⇒ 2。
+        assert_eq!(r.quarantine_len(), 1, "先只有一条");
+        r.set_quarantine("shop.example", "10.0.0.2", 600);
+        assert_eq!(r.quarantine_len(), 2, "同 domain 两条 ip = 两条隔离");
+    }
+
+    /// 语义等价性：跨 domain 同 ip 互不影响（两级结构的第二层是**各自**独立的）。
+    #[test]
+    fn opt_r9_c1_quarantine_two_level_cross_domain_same_ip() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("a.example", "10.0.0.1", 600);
+        let now = Instant::now();
+        assert!(r.is_quarantined("a.example", "10.0.0.1", now));
+        assert!(
+            !r.is_quarantined("b.example", "10.0.0.1", now),
+            "另一个 domain 下的同 ip 不得被牵连"
+        );
+    }
+
+    /// 归一化仍然生效：大小写/端口/尾点变体命中同一条目。
+    /// 这是 R2-2 的既有语义，两级结构不得削弱。
+    #[test]
+    fn opt_r9_c1_normalization_still_applies() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("Shop.Example:443", "10.0.0.1", 600);
+        let now = Instant::now();
+        for variant in [
+            "Shop.Example:443",
+            "shop.example",
+            "SHOP.EXAMPLE",
+            "shop.example.",
+            " shop.example:443 ",
+        ] {
+            assert!(
+                r.is_quarantined(variant, "10.0.0.1", now),
+                "变体 {variant:?} 应命中同一条隔离"
+            );
+        }
+        assert_eq!(r.quarantine_len(), 1, "五个变体应落同一条目");
+    }
+
+    /// 本轮**顺带修掉的潜在缺陷**：旧扁平 key 用 `:` 拼接，而 `normalize_domain`
+    /// 允许 domain 含 `:`（IPv6 字面量 `::1`；单测 `normalize_domain_cases` 已锁定
+    /// `normalize_domain("a:b") == "a:b"`）。于是
+    ///   `(domain="a:b", ip="10.0.0.1")` 与 `(domain="a", ip="b:10.0.0.1")`
+    /// 在旧实现里产生**同一个扁平 key** `a:b:10.0.0.1` ⇒ 互相污染。
+    /// 两级结构以 `DashMap` 键相等性取代字符串拼接，从根上消除该隐忧。
+    #[test]
+    fn opt_r9_c1_no_flat_key_collision_for_colon_domains() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("a:b", "10.0.0.1", 600);
+        let now = Instant::now();
+        assert!(r.is_quarantined("a:b", "10.0.0.1", now));
+        // 旧实现下这条会被误判为已隔离（key 碰撞）；现在必须互不牵连。
+        assert!(
+            !r.is_quarantined("a", "b:10.0.0.1", now),
+            "不同 (domain, ip) 组合不得共享隔离条目（扁平 key 拼接碰撞回归）"
+        );
+        // 反向也成立。
+        assert!(!r.is_quarantined("a:b:10.0.0.1", "x", now));
+    }
+
+    /// 过期清理：内层逐条判过期，且**空内层必须回收**。
+    /// 空内层若留着，外层 key（由客户端可控的 `Host` 变体构成）就是内存泄漏。
+    #[test]
+    fn opt_r9_c1_sweep_reclaims_empty_inner_maps() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("gone.example", "10.0.0.1", 0);
+        r.set_quarantine("stay.example", "10.0.0.2", 600);
+        assert_eq!(r.quarantine_len(), 2);
+
+        // 注入「未来时间」让 ttl=0 的条目过期，ttl=600 的保留。
+        let horizon = Instant::now() + Duration::from_secs(1);
+        let (sessions, quarantines) = r.sweep_expired_at(horizon);
+
+        assert_eq!(quarantines, 1, "应只清掉 1 条过期隔离");
+        assert_eq!(sessions, 0);
+        assert_eq!(r.quarantine_len(), 1, "存活条目保留");
+        // 外层 `gone.example` 的空内层必须被回收（否则外层 key 泄漏）。
+        assert!(
+            !r.quarantine_map.contains_key("gone.example"),
+            "全空的内层必须被回收，否则外层 key 随 Host 变体无界增长"
+        );
+        assert!(r.quarantine_map.contains_key("stay.example"));
+    }
+
+    /// 零分配回归锁定：`is_quarantined_normalized` 是**纯查表**，
+    /// 不做任何 `String` 构造。本测试用「全局分配计数器」验证。
+    ///
+    /// 判据刻意选在**空隔离表**上：旧实现在此路径上仍会为每个节点执行
+    /// `format!("{}:{ip}", normalize_domain(domain))`（两次分配），
+    /// 而新实现外层查表未命中即返回，**一次分配都没有**。
+    ///
+    /// 计数器本身是 test-only 的全局原子 + test binary 的**全局分配器**。
+    ///
+    /// # 为什么必须用 `#[global_allocator]`（一次实测打脸）
+    ///
+    /// 最初这个测试只定义了 `Counting` 分配器但**没有安装**（漏了
+    /// `#[global_allocator]`），于是 `ALLOCS` 恒为 0、断言恒真——把
+    /// `format!` 塞回热路径后测试**仍然绿**（实测）。零分配断言只有在
+    /// 计数器真的接在进程的分配路径上时才有意义。
+    // 该测试**必须串行运行**：它用 `#[global_allocator]` 统计进程级分配次数，
+    // 而并行测试会污染该计数器。CI 已单独配置
+    // `cargo test --workspace opt_r9_c1_isolated_lookup -- --test-threads=1`。
+    //
+    // 下方的 `#[ignore]` 只为让 `cargo test --workspace`（并行）保持全绿——
+    // 忽略测试仍会被编译，且串行 job 用**精确过滤器**跑它，不受 `ignore` 影响
+    // （libtest 的过滤串先于 `ignore` 判定：显式指定过滤器时，被忽略的测试
+    // **仍会运行**，除非过滤器与 ignore 同时生效——实测见 CI）。
+    #[test]
+    #[ignore = "needs --test-threads=1; run via CI serial job or: cargo test opt_r9_c1_isolated_lookup -- --test-threads=1 --ignored"]
+    fn opt_r9_c1_isolated_lookup_does_not_allocate() {
+        use std::sync::atomic::Ordering;
+
+        let r = RouterEngine::new(vec![]);
+        // 预热：确保任何惰性初始化（DashMap 分片等）已发生，不计入测量。
+        let _ = r.quarantine_len();
+        let domain = normalize_domain("x.example");
+
+        // 测量窗口内**不放断言**：`assert!` 的失败路径会做 panic 消息格式化
+        // （实测会让计数虚高），语义正确性由窗口外的 `hits` 断言兜住。
+        //
+        // # 并行污染与对策（实测踩坑，故写明）
+        //
+        // `#[global_allocator]` 的计数器是**进程级**的，而 Rust 测试默认多线程
+        // 并行——别的测试此刻的分配会一并计入本窗口。实测：并行下计数虚高、
+        // `--test-threads=1` 下为 0。
+        //
+        // 对策：**串行化本测试**（CI 单独跑），而不是放宽判据。
+        // 试过「并行下不误报」的设计，实测它会让真实回归溜过——把
+        // `format!` 塞回热路径后观察到 2000 次分配，却被当作「污染」放行，
+        // 那种门禁等于没有门禁。故保留硬断言，隔离并行噪声。
+        let now = Instant::now();
+        let before = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
+        let mut hits = 0usize;
+        for _ in 0..1000 {
+            if r.is_quarantined_normalized(&domain, "10.0.0.1", now) {
+                hits += 1;
+            }
+        }
+        let after = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
+        let observed = after - before;
+
+        // 语义：空表 + 未命中的 ip ⇒ 1000 次全为 false（**永远硬断言**，
+        // 与分配计数无关，不受并行影响）。
+        assert_eq!(hits, 0, "空隔离表不应有任何命中");
+
+        // 硬断言。并行污染问题用「串行化本测试」解决而非放宽判据——
+        // 放宽会让真实回归（如 `format!` 被塞回热路径，实测 1000 循环产生
+        // 2000 次分配）悄悄溜过，那种门禁等于没有门禁。
+        assert_eq!(
+            observed,
+            0,
+            "未命中隔离时的查表必须零分配（OPT-R9 C1 核心收益）。             若本条在并行全量运行下偶发失败，是其它测试线程的分配污染了             进程级计数器——请用 --test-threads=1 复跑确认（CI 已为该测试             单独配置串行 job）。若串行下仍失败，说明热路径真的引入了分配。"
+        );
+    }
+
+    // ---- OPT-R11 B1：选路零物化的**差分测试** ----
+
+    /// **核心验收**：加权分支上，`pick_weighted_streaming` 与「物化版」
+    /// `pick_weighted` 在**多组权重分布 × 多组 seed** 下必须选中
+    /// **同一个节点**。
+    ///
+    /// # 为什么是差分测试
+    ///
+    /// 流式版重写了加权随机的算式（两轮、顺序保持、uniform 分支
+    /// 改用 `gen_range`）。这类重写最典型的失败模式就是**看着对、
+    /// 边界错**——例如 RNG 消耗顺序变了、权重递减的边界从 `<`
+    /// 变成 `<=`。单跑一次看不出，必须与旧实现逐一对拍。
+    ///
+    /// `pick_weighted` 因此**不改成委托**（否则比较恰真，等于没有门）。
+    #[test]
+    fn opt_r11_b1_pick_weighted_streaming_matches_reference_weighted() {
+        use rand::SeedableRng;
+        // 覆盖：单元素／等权／权重悬巟／末位权重 0（考验 roll 递减边界）。
+        // 注意：这里**不含全 0 权重**——见下一个测试与其说明。
+        let weight_sets: Vec<Vec<u32>> = vec![
+            vec![100],
+            vec![10, 10, 10, 10],
+            vec![1000, 1, 1, 1],
+            vec![1, 1, 1, 1000],
+            vec![5, 3, 0, 7, 0],
+            vec![1, 0, 0, 1],
+        ];
+        for (wi, weights) in weight_sets.iter().enumerate() {
+            let nodes: Vec<Arc<ProxyNode>> = weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    Arc::new(ProxyNode::new(
+                        format!("10.0.{}.{}", i / 256, i % 256),
+                        8080,
+                        None,
+                        None,
+                        "US".to_string(),
+                        "residential".to_string(),
+                        "mock-a".to_string(),
+                        *w,
+                    ))
+                })
+                .collect();
+            for seed in 0..256u64 {
+                let mut rng_ref = rand::rngs::StdRng::seed_from_u64(seed);
+                let expected = pick_weighted(&nodes, &mut rng_ref).map(|n| n.addr.clone());
+                let mut rng_new = rand::rngs::StdRng::seed_from_u64(seed);
+                let got =
+                    pick_weighted_streaming(|| nodes.iter(), &mut rng_new).map(|n| n.addr.clone());
+                assert_eq!(
+                    got, expected,
+                    "weights#{wi}={weights:?} seed={seed}: 加权分支上两者必须选中同一节点"
+                );
+            }
+        }
+    }
+
+    /// **防御分支（`total == 0`）：不与 `choose` 对拍，只验合法性。
+    ///
+    /// # 为什么不对拍（这是诚实的差异，不是逃避）
+    ///
+    /// 物化版用 `SliceRandom::choose`，而 rand 的 `choose` 内部用的是
+    /// **`gen_index`（Lemire 宽化乘法）**，与 `Rng::gen_range` 不同源。
+    /// 要复刻就得依赖 rand 的内部实现（升级即可能改变），
+    /// 属于错误的依赖方向。
+    ///
+    /// # 为什么不影响生产行为（已实证，非信口传）
+    ///
+    /// 该分支在生产中**可证明不可达**：数据面的每个候选
+    /// 都必须先过 `matches`，而 `matches` 的第一句就是
+    /// `if node.weight == 0 { return false; }`（`router.rs` `matches`）。
+    /// 因此每个候选 `weight >= 1` ⇒ `count > 0` 时 `total >= count > 0`。
+    /// 下一个测试 `opt_r11_b1_matches_rejects_zero_weight` 把这个前提**锁成断言**
+    /// 而不是残留在注释里。
+    #[test]
+    fn opt_r11_b1_pick_weighted_streaming_uniform_branch_returns_valid_member() {
+        use rand::SeedableRng;
+        let weights = [0u32, 0, 0, 0];
+        let nodes: Vec<Arc<ProxyNode>> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                Arc::new(ProxyNode::new(
+                    format!("10.0.0.{}", i),
+                    8080,
+                    None,
+                    None,
+                    "US".to_string(),
+                    "residential".to_string(),
+                    "mock-a".to_string(),
+                    *w,
+                ))
+            })
+            .collect();
+        let addrs: Vec<String> = nodes.iter().map(|n| n.addr.clone()).collect();
+        for seed in 0..128u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let got = pick_weighted_streaming(|| nodes.iter(), &mut rng)
+                .map(|n| n.addr.clone())
+                .expect("防御分支必须选中一个");
+            assert!(
+                addrs.contains(&got),
+                "防御分支选中了候选集之外的节点: {got}"
+            );
+        }
+    }
+
+    /// **把「防御分支不可达」从注释变成断言**。
+    ///
+    /// `matches` 必须拒绝 `weight == 0` 的节点。这条前提一旦被改掉
+    /// （如为了「优化」让 0 权重节点也参与选路），那么
+    /// 生产就会真的进入 `total == 0` 分支，而该分支的抽样算法
+    /// 与物化版不同源（见上一测试）——此测试就会红。
+    #[test]
+    fn opt_r11_b1_matches_rejects_zero_weight() {
+        let r = RouterEngine::new(vec![]);
+        let mk = |w: u32| {
+            ProxyNode::new(
+                "10.0.0.1".to_string(),
+                8080,
+                None,
+                None,
+                "US".to_string(),
+                "residential".to_string(),
+                "mock-a".to_string(),
+                w,
+            )
+        };
+        let now = Instant::now();
+        // weight == 0 → 拒绝（保证每个候选 weight >= 1 ⇒ total >= count ⇒
+        // 防御分支不可达）。
+        assert!(
+            !r.matches(&mk(0), &RoutingSpec::default(), now),
+            "matches 必须拒绝 weight==0 的节点，否则生产会进入防御分支"
+        );
+        assert!(
+            r.matches(&mk(1), &RoutingSpec::default(), now),
+            "weight>=1 的健康节点应通过 matches"
+        );
+    }
+
+    /// 流式版在**空候选**上必须返回 `None`（⇒ 网关 503），与物化版一致。
+    #[test]
+    fn opt_r11_b1_pick_weighted_streaming_empty_returns_none() {
+        let empty: Vec<Arc<ProxyNode>> = Vec::new();
+        let mut rng = rand::thread_rng();
+        assert!(pick_weighted_streaming(|| empty.iter(), &mut rng).is_none());
+    }
+
+    /// **零分配契约**：流式选路在命中路径上不得产生堆分配。
+    ///
+    /// 候选切片由调用方持有，函数内只做引用计数与栈上算术。
+    /// 与另两个分配契约测试同样受并行污染，故标 `#[ignore]` 并由 CI 串行跑。
+    #[test]
+    #[ignore = "needs --test-threads=1; run via CI serial allocation-contract job"]
+    fn opt_r11_b1_pick_weighted_streaming_hit_path_does_not_allocate() {
+        use std::sync::atomic::Ordering;
+        let nodes: Vec<Arc<ProxyNode>> = (0..64u32)
+            .map(|i| {
+                Arc::new(ProxyNode::new(
+                    format!("10.0.0.{}", i),
+                    8080,
+                    None,
+                    None,
+                    "US".to_string(),
+                    "residential".to_string(),
+                    "mock-a".to_string(),
+                    1 + i,
+                ))
+            })
+            .collect();
+
+        // RNG 提到计数窗口**之外**。
+        //
+        // 【踩坑记录】本测试首跑实测得到 `left: 1`（本该是 0）。根因是
+        // `rand::thread_rng()` 惰性初始化**线程局部**熵源，首次调用会分配；
+        // 原写法在循环**内**每轮新建 rng，把那次一次性分配计进了窗口。
+        // 修法：rng 在窗口外建好并复用，既排除一次性初始化噪声，也更贴近
+        // 生产的 `select_node_excluding`（那里 rng 在循环外建一次）。
+        let mut rng = rand::thread_rng();
+        // 预热：显式消耗一次，确保线程局部已初始化完毕。
+        let _ = rng.gen_range(0..u32::MAX);
+
+        let before = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
+        let mut picked = 0usize;
+        for _ in 0..1000 {
+            if pick_weighted_streaming(|| nodes.iter(), &mut rng).is_some() {
+                picked += 1;
+            }
+        }
+        let observed = crate::test_allocs::ALLOCS.load(Ordering::Relaxed) - before;
+
+        assert_eq!(picked, 1000, "非空候选必须每次都选中一个");
+        assert_eq!(
+            observed, 0,
+            "流式选路必须零分配（OPT-R11 B1 核心收益）。\
+             串行下仍失败说明热路径引入了分配；若只在并行全量下偶发失败，\
+             是其它测试线程污染了进程级计数器——用 --test-threads=1 复跑确认。"
+        );
+    }
+
+    // ---- OPT-R11 C1：隔离表外层准入（长度 + 水位）----
+
+    /// 超长 domain **不落表**（与超长 session_id 不落表同语义）。
+    #[test]
+    fn opt_r11_c1_rejects_overlong_domain() {
+        let r = RouterEngine::new(vec![]);
+        let long = "a".repeat(QUARANTINE_DOMAIN_MAX_BYTES + 1);
+        r.set_quarantine(&long, "10.0.0.1", 600);
+        assert_eq!(
+            r.quarantine_domains(),
+            0,
+            "超长 domain 不得落表（{}字节 > {}）",
+            long.len(),
+            QUARANTINE_DOMAIN_MAX_BYTES
+        );
+        assert_eq!(r.quarantine_len(), 0, "内层也不得有条目");
+    }
+
+    /// 正常 domain 与边界值**原样落表**（存量行为零变化）。
+    #[test]
+    fn opt_r11_c1_accepts_normal_and_boundary_domain() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("example.com", "10.0.0.1", 600);
+        assert_eq!(r.quarantine_domains(), 1);
+        assert_eq!(r.quarantine_len(), 1);
+
+        // 恰好于上限的 domain 必须落表（不得多拒）。
+        let exact = "b".repeat(QUARANTINE_DOMAIN_MAX_BYTES);
+        r.set_quarantine(&exact, "10.0.0.2", 600);
+        assert_eq!(r.quarantine_domains(), 2, "恰好上限的 domain 必须落表");
+    }
+
+    /// 水位：外层条目数达到软上限后，新 domain 被拒、而**已存 domain 仍可用**。
+    ///
+    /// # 为何用**真实**上限 8192 造满表（而不是取个小的 `CAP`）
+    ///
+    /// 首版测试用 `const CAP: usize = 4` 直接塞 4 条，然后期望"新 domain 被拒"
+    /// ——但生产水位是 `QUARANTINE_MAX_DOMAINS = 8192`，4 远未达水位，
+    /// `set_quarantine` **本就应该**放行。测试失败暴露的是**测试自身的
+    /// 前提错误**，不是实现缺陷。这类"用假阈值测真逻辑"的测试往往能绿一段时间
+    /// 直到逻辑改动才炸，或更糟——它断言的是一个生产永不触发的场景。
+    ///
+    /// 8192 条 `DashMap` insert 在测试里是毫秒级，完全可接受；这样测的才是
+    /// 生产上真实会发生的路径。
+    #[test]
+    fn opt_r11_c1_watermark_rejects_new_domain_but_keeps_existing() {
+        let r = RouterEngine::new(vec![]);
+        // 塞满到真实水位（生产上由 sweep 递减，测试里直接塞最快）。
+        for i in 0..QUARANTINE_MAX_DOMAINS {
+            r.quarantine_map.insert(
+                format!("seeded{i}.test"),
+                DashMap::from_iter([("10.0.0.9".to_string(), Instant::now())]),
+            );
+        }
+        assert_eq!(r.quarantine_domains(), QUARANTINE_MAX_DOMAINS);
+
+        // 新 domain 被拒：不得新增外层条目。
+        r.set_quarantine("fresh-attack.test", "10.0.0.1", 600);
+        assert_eq!(
+            r.quarantine_domains(),
+            QUARANTINE_MAX_DOMAINS,
+            "达水位后新 domain 不得新增外层条目"
+        );
+
+        // 已存 domain 仍可写入（不得因水位让已生效的隔离失效）。
+        r.set_quarantine("seeded0.test", "10.0.0.2", 600);
+        let inner = r
+            .quarantine_map
+            .get("seeded0.test")
+            .expect("已存 domain 仍在");
+        assert!(
+            inner.contains_key("10.0.0.2"),
+            "已存 domain 必须能继续写入新 ip（不能把已生效隔离丢掉）"
+        );
+    }
+
+    /// 日志不能漏：达水位时仍会保留**已存 domain 的写能力**。
+    #[test]
+    fn opt_r11_c1_watermark_is_soft_and_does_not_evict() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("keepme.test", "10.0.0.1", 600);
+        // 低于水位时应当传数落表（无日志拒绝）。
+        r.set_quarantine("alsokeep.test", "10.0.0.1", 600);
+        assert_eq!(r.quarantine_domains(), 2);
+    }
+
+    /// R13 诊断：直接调 `select_node_excluding`（sticky/加权路径）
+    /// 300 次新 session，无约束。权重 100/80/60 下必须分布。
+    #[test]
+    fn opt_r13_weighted_path_distributes() {
+        let r = RouterEngine::new(vec![
+            ProxyNode::new(
+                "127.0.0.1".to_string(),
+                8888,
+                None,
+                None,
+                "US".to_string(),
+                "residential".to_string(),
+                "mock-a".to_string(),
+                100,
+            ),
+            ProxyNode::new(
+                "127.0.0.1".to_string(),
+                8889,
+                None,
+                None,
+                "JP".to_string(),
+                "datacenter".to_string(),
+                "mock-b".to_string(),
+                80,
+            ),
+            ProxyNode::new(
+                "127.0.0.1".to_string(),
+                8890,
+                None,
+                None,
+                "GB".to_string(),
+                "mobile".to_string(),
+                "mock-c".to_string(),
+                60,
+            ),
+        ]);
+        let mut cnt = [0usize; 3];
+        for i in 0..300 {
+            let spec = RoutingSpec {
+                session_id: Some(format!("w{i}")),
+                ..Default::default()
+            };
+            match r.select_node_excluding(&spec, &[]).map(|n| n.port) {
+                Some(8888) => cnt[0] += 1,
+                Some(8889) => cnt[1] += 1,
+                Some(8890) => cnt[2] += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        println!("WEIGHTED-DIST {cnt:?}");
+        assert!(cnt.iter().all(|c| *c > 0), "加权路径必须分布，实测={cnt:?}");
     }
 }

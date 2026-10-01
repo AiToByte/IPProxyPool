@@ -58,6 +58,147 @@ impl std::fmt::Debug for TenantAccount {
     }
 }
 
+// =====================================================================
+// OPT-R12：鉴权密钥卫生（常量单一真源 ＋ 策略纯函数）
+// =====================================================================
+//
+// # 为何把 `DEFAULT_API_KEY` 搬到 `tenant.rs`
+//
+// 它此前定义在 `gateway.rs`（**数据面**模块），却被 SDK／脚本／文档当**鉴权
+// 公共约定**引用——结构性错位：改数据面的人会以为碰不到鉴权，改鉴权的人却要
+// 去数据面找常量。鉴权常量的归属地就是租户模块（key 的持有者正是
+// `TenantManager`）。**纯搬迁，行为不变。**（本仓惯例：新模块 2026-09-28
+// 单独成文件而非塞进既有模块，故沿用。）
+//
+// # `REQUIRE_API_KEY=0` 的真实语义（此前**没有任何地方这样写**）
+//
+// 关掉鉴权门**不等于**"无鉴权"：无头请求会被
+// `unwrap_or_else(|| DEFAULT_API_KEY.to_string())` **静默补成默认租户**，
+// 而默认租户是 qps/并发 10000/10000。实测（release 二进制）：不带任何
+// `X-API-Key` 的请求返回 **200** ＋ 完整代理服务。
+//
+// 也就是说 `REQUIRE_API_KEY=0` 的语义是"**全网共享一个满额身份**"，
+// 而不是"没有鉴权"。这才是本项定级为 P1 的真正理由——**弱默认值的失败
+// 模式没有被写下来**，运维读文档以为关掉了鉴权，实际是敞开。
+//
+// # 三条不变式（本组全部改动都必须保持）
+//
+// 1. `API_KEY` **未设置** ⇒ 仍注册 `default_key`（本机开发与本仓自检依赖它，
+//    改动会让存量部署升级即挂）。
+// 2. `API_KEY` **已设置** ⇒ 只注册它，`default_key` **立即失效**（请求 403）。
+//    这是本轮用户明确选择的最强档，不再做双 key 并存过渡。
+// 3. 任何情况下都不因配置而**拒绝启动**；风险一律以 `warn!` 表达
+//    （fail-closed 只用于**误配**这一条，见 `resolve_api_key`）。
+
+/// 兜底 API Key（**仅本机开发/自检**）。生产必须用 `API_KEY` 覆盖。
+pub const DEFAULT_API_KEY: &str = "default_key";
+
+/// 默认租户的哨兵配额（qps 与并发同值）。用于识别"满配额"。
+///
+/// 单独成为常量而非内联 `10_000`：A1 的告警判定必须引用**同一份**数值，
+/// 否则改了注册处的配额而忘了改判定，告警就成了永远不触发的死代码。
+pub const TENANT_SENTINEL_QUOTA: u32 = 10_000;
+
+/// 从 `API_KEY` env 解析生效的默认租户 key。
+///
+/// # 语义
+///
+/// - `Ok(None)` ⇒ 未设置 ⇒ 调用方回退 [`DEFAULT_API_KEY`]（开发默认）。
+/// - `Ok(Some(k))` ⇒ 使用 `k`，且**此时 `default_key` 失效**。
+/// - `Err(_)` ⇒ 误配（空串／纯空白／显式等于 `default_key`）⇒ **fail-closed**：
+///   宁可不注册任何默认租户（全部 403），也不接受一个等于"没配"的 key——
+///   后者会让运维以为配好了，实际仍在用公开的弱默认值。
+///
+/// 纯函数（不读 env 本身，只吃入参）以便单测穷举；env 读取在 `main.rs`。
+pub fn resolve_api_key(raw: Option<&str>) -> Result<Option<String>, &'static str> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Err("API_KEY is set but empty/whitespace; refusing to fall back to the public default key");
+            }
+            if t == DEFAULT_API_KEY {
+                return Err(
+                    "API_KEY is set to the public default value; refusing — set a strong random value instead",
+                );
+            }
+            Ok(Some(t.to_string()))
+        }
+    }
+}
+
+/// A1：判定当前默认租户配置是否属于「危险组合」并给出告警文本。
+///
+/// 危险 = **同时**满足：弱默认值 ＋ 满配额 ＋ 非回环监听。三者缺一不告警——
+/// 这是"防噪音"的关键：本机开发（弱默认值 ＋ 满配额 ＋ **回环**）与
+/// 生产正确配置（强 key ＋ 满配额 ＋ 非回环）都**不该**被这条告警打扰。
+///
+/// # 为何只是 `warn!` 而非拒绝启动
+///
+/// 满足三条件确实是真实事故组合，但直接 panic 会让存量部署**升级即挂**，
+/// 违反本轮"存量行为零变化"铁律。`warn!` 能在零行为变更前提下把"静默敞开"
+/// 变成"日志里明写敞开"，并逐条给出整改动作。
+///
+/// 返回 `None` 表示无需告警（**不要**返回空串占位——那会让调用方难以区分
+/// "不告警"与"告警但无内容"）。
+pub fn weak_auth_warning(
+    key_is_default: bool,
+    qps: u32,
+    max_concurrency: usize,
+    listen: &str,
+) -> Option<String> {
+    if !key_is_default {
+        return None; // 已用 API_KEY 覆盖，不是弱默认值。
+    }
+    let full_quota =
+        qps >= TENANT_SENTINEL_QUOTA && max_concurrency >= TENANT_SENTINEL_QUOTA as usize;
+    if !full_quota {
+        return None; // 配额已收窄，风险已被限制。
+    }
+    if is_loopback_listen(listen) {
+        return None; // 只监听回环 ⇒ 仅本机可达，外部无法滥用。
+    }
+    Some(format!(
+        "INSECURE DEFAULT AUTH: tenant 'default' is using the public key {DEFAULT_API_KEY:?} \
+         with sentinel quota {qps} qps / {max_concurrency} concurrent, listening on {listen} \
+         (non-loopback). Anyone who can reach this port shares ONE full-rate identity. \
+         Remediation (do at least 1): 1) set API_KEY to a strong random value \
+         (default_key then stops working); 2) narrow the quota below {TENANT_SENTINEL_QUOTA}; \
+         3) bind loopback (GATEWAY_ADDR=127.0.0.1:8916) and front the port with a WAF/mTLS proxy."
+    ))
+}
+
+/// 监听地址是否回环（`127.0.0.0/8`、`::1`、`localhost`）。
+///
+/// 保守取向：**只**认这些明确的回环写法；`0.0.0.0`／`::`／空串／任何无法
+/// 解析出 ip 的字符串都**不**算回环（宁可多告警一次，也不要漏掉真实暴露）。
+pub fn is_loopback_listen(listen: &str) -> bool {
+    let s = listen.trim();
+    // 先尝试把**整串**直接当 IP 解析——这是裸 IPv6（如 `::1`）唯一正确的读法。
+    //
+    // 【踩坑记录】首版直接 `rsplit_once(':')` 剥端口，于是 `::1` 被切成
+    // host=`:` / port=`1`，解析失败 ⇒ 判成"非回环" ⇒ 对**合法的回环绑定**
+    // 误发告警。而本函数的价值恰恰在于"不该响的时候不响"，被自己的误判
+    // 破掉就等于噪音门。故必须先试整体解析。
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    // 带端口（或带方括号）的写法：剥掉端口再解析。
+    let host = match s.rsplit_once(':') {
+        Some((h, _port)) => h,
+        None => s,
+    };
+    let host = host.trim().trim_matches('[').trim_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 impl TenantManager {
     pub fn new() -> Self {
         Self {
@@ -338,5 +479,101 @@ mod tests {
         assert_eq!(err, "Insufficient balance");
         // 拒绝路径不取槽。
         assert_eq!(a.in_flight.load(Ordering::Relaxed), before);
+    }
+
+    // ---- OPT-R12：鉴权密钥卫生 ----
+
+    /// B1：`API_KEY` 解析三态，且**误配 fail-closed**。
+    #[test]
+    fn opt_r12_resolve_api_key_states() {
+        use super::{resolve_api_key, DEFAULT_API_KEY};
+        // 1) 未设置 → None（调用方回退开发默认）。
+        assert_eq!(resolve_api_key(None).unwrap(), None);
+        // 2) 设置为强值 → 使用它，且不得等于默认值。
+        let k = resolve_api_key(Some("  s3cret-value  ")).unwrap().unwrap();
+        assert_eq!(k, "s3cret-value", "应 trim");
+        assert_ne!(k, DEFAULT_API_KEY);
+        // 3) 误配：空串 / 纯空白 / 显式等于 default_key → 全部 Err（不回退）。
+        assert!(
+            resolve_api_key(Some("")).is_err(),
+            "空串必须拒（否则等于没配）"
+        );
+        assert!(resolve_api_key(Some("   \t\n")).is_err(), "纯空白必须拒");
+        assert!(
+            resolve_api_key(Some(DEFAULT_API_KEY)).is_err(),
+            "显式设为 default_key 必须拒（否则运维不变且误以为已配）"
+        );
+    }
+
+    /// A1：危险组合判定——**三条同时才响**。
+    ///
+    /// 重点是「**不该响的不响**」：本机开发与生产正确配置
+    /// 都不应被这条告警扰动——否则它会被当成噪声而弃用。
+    #[test]
+    fn opt_r12_weak_auth_warning_only_for_genuine_risk() {
+        use super::{weak_auth_warning, DEFAULT_API_KEY, TENANT_SENTINEL_QUOTA};
+        let q = TENANT_SENTINEL_QUOTA;
+        let conc = TENANT_SENTINEL_QUOTA as usize;
+
+        // 应响：弱默认 key 且满配额且**非回环**监听。
+        let w = weak_auth_warning(true, q, conc, "0.0.0.0:8916");
+        assert!(w.is_some(), "0.0.0.0 上的弱默认 key 必须告警");
+        let msg = w.unwrap();
+        assert!(msg.contains("API_KEY"), "告警必须给出整改动作（API_KEY）");
+        assert!(
+            msg.contains("loopback") || msg.contains("127.0.0.1"),
+            "告警必须给出绑回环的动作"
+        );
+        assert!(
+            msg.contains(DEFAULT_API_KEY),
+            "告警必须明说用的是公开默认值"
+        );
+
+        // 不应响 1：本机开发（弱默认 但回环监听）。
+        assert!(
+            weak_auth_warning(true, q, conc, "127.0.0.1:8916").is_none(),
+            "回环监听时不应告警（本机开发场景）"
+        );
+        // 不应响 2：已用 API_KEY 覆盖（非弱默认）。
+        assert!(
+            weak_auth_warning(false, q, conc, "0.0.0.0:8916").is_none(),
+            "已用 API_KEY 时不应告警"
+        );
+        // 不应响 3：配额已收窄（危险已被限制）。
+        assert!(
+            weak_auth_warning(true, 100, 100, "0.0.0.0:8916").is_none(),
+            "配额低于哨兵时不应告警"
+        );
+    }
+
+    /// 回环判定：只认明确回环写法，**保守取向**。
+    #[test]
+    fn opt_r12_is_loopback_listen_conservative() {
+        use super::is_loopback_listen;
+        for yes in [
+            "127.0.0.1:8916",
+            "127.0.0.1",
+            " 127.0.0.1:1 ",
+            "localhost:8916",
+            "LOCALHOST:8916",
+            "127.5.5.5:8916",
+            "[::1]:8916",
+            "::1",
+        ] {
+            assert!(is_loopback_listen(yes), "应判为回环: {yes:?}");
+        }
+        for no in [
+            "0.0.0.0:8916",
+            "0.0.0.0",
+            "::",
+            "[::]:8916",
+            "10.0.0.5:8916",
+            "192.168.1.9:8916",
+            "example.com:8916",
+            "",
+            "   ",
+        ] {
+            assert!(!is_loopback_listen(no), "不应判为回环: {no:?}");
+        }
     }
 }

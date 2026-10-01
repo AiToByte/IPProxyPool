@@ -2,14 +2,28 @@
 //!
 //! # 为什么要单列一个模块
 //!
-//! 网关有三处结构完全相同的「淘汰并报告删除个数」逻辑：
+//! 网关有**四处**结构完全相同的「淘汰并报告删除个数」逻辑：
 //! `RouterEngine::sweep_expired_at`（会话表＋隔离表）、`SocksBridge::evict_idle`、
-//! `CanaryProber::evict_idle_clients_older_than`。三处都踩了同一个并发缺陷，
-//! 因此修复也必须是同一份——**单一真源，杜绝「改了一处忘了另两处」**。
+//! `CanaryProber::evict_idle_clients_older_than`，以及
+//! `gateway::prune_stale_arms`（LinUCB 臂表，**OPT-R11 A1 补入**）。
+//! 四处都踩了同一个并发缺陷，因此修复也必须是同一份——**单一真源，杜绝
+//! 「改了一处忘了另几处」**。
+//!
+//! # 教训：单一真源也会漏收编
+//!
+//! OPT-R6 S2 建立本模块时把当时的写法**枚举成了「三处」并写进注释**，
+//! 结果第 4 处（`prune_stale_arms`）因为「当时没被枚举到」而一直没人改，
+//! 直到 OPT-R11 全量深审才暴露——而它恰恰是**写入方在数据面**（`arm_for`
+//! 冷路径 `arms.insert`）的那一处，危害不低于前三者。
+//!
+//! **这条教训的普适含义:** 用「列举已知实例」的方式收敛同构缺陷时，
+//! 注释里的那份清单本身会变成**误导**——下一个读者会以为「清单已全」。
+//! 本轮已把「四处」与各自位置写进模块头，并要求新增同构写法时
+//! **同步更新本注释**。
 //!
 //! # 缺陷本体（P0，OPT-R6 S2 根因）
 //!
-//! 这三处的计数写法都是：
+//! 这四处的计数写法都是：
 //!
 //! ```text
 //! let before = map.len();   // ① 读长度
@@ -21,7 +35,8 @@
 //! 具体链路：
 //!
 //! - `session_store` 由数据面 `RouterEngine::select_node_excluding` 落表（新会话粘滞绑定）；
-//! - `clients`（socks 桥 / prober 的 Client 缓存）由数据面 `client_for` 在首次用到某节点时建缓存。
+//! - `clients`（socks 桥 / prober 的 Client 缓存）由数据面 `client_for` 在首次用到某节点时建缓存；
+//! - `bandit_arms` 由数据面 `gateway::arm_for` 冷路径 `insert`（首次见某节点时建臂）。
 //!
 //! 若有写入恰好落在 ① 与 ③ 之间，则 `after > before`，
 //! `usize` 的普通减法在 debug 下 **panic（`attempt to subtract with overflow`）**，

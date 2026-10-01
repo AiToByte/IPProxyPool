@@ -1,6 +1,6 @@
 # OPERATION — GW-R1 企业网关运维手册
 
-> 跟踪表：`plan/2026年9月19日-GW-R1实施计划.md`；方法底座：banyan-skills P1-P5。
+> 跟踪表：`plan/2026年9月19日-GW-R1实施计划.md`；方法底座：banyan-skills（**独立仓库，不随本仓分发**，见文末「方法论底座说明」）。
 > 本轮 Windows 记功能、Linux 记性能；eBPF/io_uring/MASQUE 只做 spike（§5）。
 
 ## 1. 一键起依赖
@@ -32,9 +32,47 @@ curl.exe -s http://127.0.0.1:9091/metrics                # Prometheus exposition
 探活用 `curl --max-time`。
 
 OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
-有头（即使错 Key）走租户鉴权（403/429）；`REQUIRE_API_KEY=0` 显式关闭时
-无头走 `default_key` 宽限额（GW-1~GW-4 旧行为）。本机开发带默认 Key
+有头（即使错 Key）走租户鉴权（403/429）。本机开发带默认 Key
 `default_key`（SDK/脚本已默认带，curl 手工加 `-H`）。
+
+> ### ⚠️ `REQUIRE_API_KEY=0` 的真实语义 ≠「没有鉴权」（OPT-R12 实测澄清）
+>
+> 关掉鉴权门**不等于**放开匿名访问。实测（release 二进制，2026-09-29）：
+> `REQUIRE_API_KEY=0` 时，**完全不带 `X-Api-Key` 的请求返回 200 并获得完整
+> 代理服务**。机制是网关把无头请求**静默补成默认租户**
+> （`unwrap_or_else(|| DEFAULT_API_KEY.to_string())`），而默认租户是
+> **qps 10000 / 并发 10000** 的满额配额。
+>
+> 也就是说：`REQUIRE_API_KEY=0` 的语义是「**全网共享一个满额身份**」，
+> 而不是「没有鉴权」。凡能连到该端口的人，都拿到同一个满额租户。
+>
+> **因此它只适用于本机开发或隔离网络，绝不可用于生产。**
+
+> ### `API_KEY`：生产必须覆盖默认 Key（OPT-R12 B1）
+>
+> 启动时读 `API_KEY` env：
+>
+> | 配置 | 生效的默认租户 Key | `X-Api-Key: default_key` |
+> | ---- | ------------------ | ------------------------ |
+> | 未设 `API_KEY` | `default_key`（公开弱值，仅供开发） | 有效 |
+> | `API_KEY=<强随机值>` | 该值 | **立即 403 失效** |
+> | `API_KEY` 为空／等于 `default_key` | **不注册任何默认租户**（全部 403） | 403 |
+>
+> - **一旦设置 `API_KEY`，`default_key` 立刻失效**（不再注册），旧客户端
+>   会收到 403。升级前请确认所有调用方（含 5 个 SDK，SDK 默认带
+>   `default_key`）都已改为传新 Key。
+> - 误配（空串／纯空白／显式等于 `default_key`）**fail-closed**：不注册默认
+>   租户、全部请求 403 —— 宁可拒绝服务，也不接受一个"等于没配"的 Key。
+> - 生产取强随机值，例如
+>   `API_KEY=[System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N')`
+>   （Linux：`head -c 48 /dev/urandom | base64`）。注意 Key 经 `X-Api-Key` 头
+>   传输，请确保不落进 shell 历史与日志。
+>
+> ### 危险组合的启动告警（OPT-R12 A1）
+>
+> 「弱默认 Key ＋ 满配额 ＋ **非回环**监听」三者同时成立时，网关启动会打
+> 一条 `WARN`，并逐条给出整改动作。三者缺一不告警，因此本机开发与生产
+> 正确配置都不会被这条打扰。
 
 ## 3. 三家真 Key 灰度（GW-R2，用户给 Key 后执行）
 
@@ -63,6 +101,70 @@ OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
 | 免费线水位 | `free_pool_nodes_total` / 日志`[FreePool] tick` | 默认关闭（`FREE_ENABLED=1` 开）；水位突降=源站熔断（`free_pool_source_suspended{source}=1`）或质检门限过严（`free_pool_verify_total` 看 fail 分布）；country 缺省 ZZ，只服务无归属要求的流量；`FREE_REQUIRE_ELITE=1` 时仅 Elite 进池 |
 | 免费线健康 | `free_pool_source_yield_total` / `free_pool_anonymity_total` | yield 骤降=源站挂；transparent 占比突增=源站质量恶化，考虑开 REQUIRE_ELITE；单节点转发延迟看 registry 日志（debug） |
 | SOCKS 桥 | `free_pool_nodes_by_proto{proto}` / 日志`[SocksBridge]` | P2 起仅显式 `X-Proxy-Proto: socks5/socks4` 请求走桥；默认流量永不命中 socks（router 默认隔离＋peer 守卫＋粘滞 proto 复核三保险）；body 超 `SOCKS_MAX_BODY_BYTES`（默认 10MB）按失败计＋warn＋换节点重试 |
+
+
+#### 网关在 Windows 上的生命周期限制（OPT-R14 B，P0）
+
+> **Windows 上网关会在约 300 秒后自进退出（已修，请了解历史）。**
+
+根因**不在本仓**，而在依赖：`pingora-core 0.6.0` 的
+`Server::run()` 里有一行 `#[cfg(windows)] let shutdown_type = ShutdownType::Graceful;`。
+Windows 上 `main_loop` 从不被 await（那段是 `#[cfg(unix)]`），
+**没有信号等待**，`shutdown_type` 被硬编码为 Graceful ⇒
+网关先 `sleep(grace_period)` 再 `process::exit(0)`。
+
+- **现象：无 panic、无错误码，只有一句 `All runtimes exited, exiting now`**。
+  本仓实测退出存活 **305~308s**（跨 FreePool 开关均复现）。
+  正因如此难以定位，很容易被误以为“随机崩溃”。
+- **修复：** `GATEWAY_GRACE_SECS` 改为**平台感知默认值**——
+  **Windows 默认 86400s（1 天）**（仅为绕过框架限制），
+  **Unix 仍为 300s**（那里是真正的优雅停机等待窗口，**行为零变化**）。
+  Windows 上启动会打 `WARN` 写明该限制。
+- **覆盖方式：** 需短命进程（如测试）显式设
+  `GATEWAY_GRACE_SECS=1` 即可立退；Unix 上该变量仍是优雅停机窗口。
+- **长期正确的修法：升级 Pingora** 到修复 Windows `main_loop`
+  路径的版本。本仓未做（需联网解析新版本并重验整条数据面）。
+- 回归防护：`python tools/check_windows_lifetime.py`（已进 CI）。
+  把默认值“清理”回 300 在 review 中几乎看不出问题，但 Windows 上网关
+  会重新开始自杀——这道门就是为防它。
+
+#### 免费线供给侧可重复验证（OPT-R14 A）
+
+```bash
+# 探一个已在跑的网关
+python tools/probe_free_pool.py --metrics http://127.0.0.1:9221/metrics
+# 或顺带拉起网关、等一个抓取周期后自动判定
+python tools/probe_free_pool.py --launch --wait 420
+```
+
+判定分四类，**刻意不含"节点数阈值"**：
+
+| 判定 | 含义 | 该怎么办 |
+| ---- | ---- | -------- |
+| `VERIFIED` | 有节点通过验证并入池 | 供给侧链路完好 |
+| `DEGRADED_ZERO` | 抓到候选但 0 个入池 | **不是缺陷**，见下方 churn 说明 |
+| `FETCH_FAIL` | 没有任何源产出候选 | 抓取链路坏了，值得查（本机无公网 / 源全挂） |
+| `INCONCLUSIVE` | 指标不可达 / 进程中途退出 | **不下代码结论**，见下方说明 |
+
+> **公网免费代理存在天然 churn，池为 0 属常态而非缺陷。** 2026-09-30 实测两轮：
+> Geonode 抓取 11275 个候选（intake 截到 `2000×2=4000`）、`tcp_fail` 2649/2962，
+> 而**通过验证入池的分别是 30 个和 22 个**真实代理。逐轮波动明显。
+> 正因如此，**本仓刻意不做"healthy ≥ N"的数量门**——那种门会周期性假红，
+> 而假红门禁会被运维学会忽略，比没有门更糟。数量验证用上面的报告式探针。
+
+> **`INCONCLUSIVE` 是一等公民，不是失败。** 本机实测网关在 detached 环境下约
+> 5~6 分钟后自行退出（日志尾 `All runtimes exited`，无 panic），而免费代理首个
+> 验证通过节点需约 5 分钟出现，两者窗口几乎重合。此时脚本若硬报 FAIL，等于用
+> 环境问题污染代码结论。**该现象另有一个更严重的疑似 P0 根因**（异步上下文内
+> drop tokio runtime，见 `log/gw-demo-end.err` 的历史 panic），已单独立项。
+
+> **⚠️ 尚未验证：bandit 在真实 free 池规模（约 2000 节点）下的重分布。**
+> 探针只覆盖**供给侧**（抓取→验证→入池）。重分布需要把每个请求归因到具体出口
+> 节点，依赖 ClickHouse 遥测；本机 Docker/ClickHouse 不可用时遥测降级、无法归因。
+> 已验证的结论仅限于 mock 三节点场景（1500 次请求 ⇒ 三节点均命中）。
+> 另需注意量纲差异：free 臂的遗忘节拍是 1000 次（付费线 10000），churn 更高 ⇒
+> 臂寿命更短 ⇒ 探索窗口比 mock 场景更宽——但这是**推断，非实测**。
+
 | 免费套利 | `free_pool_action()` 函数分档（P3，非指标，无 exposition） | 池级成功率<50 摘除（TTL/复检自愈）/50~80 半权/≥80 hold；free 永不自动抬权（恢复走复检/health）；付费 80/95 冻结不动；Grafana 第 5 面板看水位＋verify 分布＋mismatch |
 | GeoIP 画像 | `geoip_lookups_total{result}` / `geoip_mismatch_total` | 无库 Disabled 只观察不执法（首 tick 记一次 disabled）；mismatch 突增＝源站地理造假或库陈旧，先查库版本再定；执法留 Phase 4 |
 
@@ -92,6 +194,7 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - 复检基址必须 https（启动校验，非法回落默认）；抓取源仅 http/https（file/dict/gopher 一律过滤，防 SSRF）；
 - SOCKS 桥零信任延续：socks 节点同样禁敏感流量（与免费线同规）；握手/CONNECT 只连验证与请求目标，不做扫描；relay 只在 E2E 脚本出现，不进生产；
 - GeoLite2 配库（P3）：MaxMind 账号取 license→下 GeoLite2-City.mmdb→挂载进容器/宿主→`GEOIP_MMDB_PATH` 指向→重启网关（热加载不做）；无库默认 Disabled，免费线行为不变（`geoip_lookups_total{result="disabled"}` 可见）；
+  - **使用 GeoLite2 即须随部署附带下列署名**（见本节末「第三方数据署名」块）。
 - GeoLite2 自动更新（P4，每周三 03:00 UTC）：`MAXMIND_LICENSE_KEY` 环境传入（不要落盘）后跑
   `python deploy/geoip_update.py --out-dir ./data`（干跑验证：无 key 时 exit 2＋usage）；
   Linux cron 例：`0 3 * * 3 cd /opt/IPProxyPool && MAXMIND_LICENSE_KEY=$KEY python3 deploy/geoip_update.py`；
@@ -106,8 +209,162 @@ OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节�
 - CH 查不到数：流式泵已上线（`ch_sink_group` 常驻，batch 5000/1s），查
   `SELECT count() FROM proxy.proxy_telemetry_log` 应随流量涨；不动则看
   网关日志 `[ChSink]`（insert 失败会 hold 住 ack 等 CH 恢复）；
+
+### 端口 443 的 HTTPS 代理：TLS 证书怎么配（OPT-R15）
+
+网关对端口 **443** 的 HTTP 节点走 **TLS**（`is_tls_for_node`），其他端口走明文。
+
+**证书校验默认是严格的**（`PeerOptions::verify_cert` 缺省 `true`）——代理证书必须由
+**受信任 CA 签发**，且 SAN 必须覆盖 SNI。SNI 取的是**目标域名**（请求的 `Host`），
+不是代理地址，所以一个只签了 `localhost` 的证书会在访问任何真实目标时失败，
+报错形如：
+
+```
+tls connect error cause: invalid peer certificate: UnknownIssuer, SNI: <你的目标域名>
+```
+
+**让网关信任自建 CA（零代码改动，框架正规通道）**：`pingora-rustls` 的
+`load_platform_certs_incl_env_into_store` 会处理 **`SSL_CERT_FILE`** / `SSL_CERT_DIR`，
+rustls 的 root store 在连接器构建时由它填充。启动前设置即可：
+
+```powershell
+$env:SSL_CERT_FILE = "C:\path\to\ca.pem"
+```
+
+**自签测试证书的两个坑（都会让 openssl 误报"没问题"、而 rustls 拒绝）**：
+
+- **必须带 SKI + AKI**：缺 `AuthorityKeyIdentifier` 时 `openssl s_client` 仍显示
+  `Verification: OK`，但 rustls / Python 严格模式报
+  `Missing Authority Key Identifier`。别依赖校验器宽松。
+- **叶证书 SAN 必须覆盖目标域名**，否则报 hostname 不匹配而非 UnknownIssuer。
+
+**不要用"关闭证书校验"绕过**：`PeerOptions::verify_cert = false` 在 rustls 后端
+**无效**（它只参与 hostname 匹配，证书链校验是硬编码的；作者在同一处留了
+`allowing to disable verification` 的 TODO），而且即便有效也是不该采用的做法。
+正解就是给代理配受信任证书。
+
+**可复现验证**：`tools/verify_tls_egress.py` 生成 CA+叶证书并校验本地 443 代理链路；
+端到端需再用 `TEST_POOL_NODES` 把 `127.0.0.1:443` 注入池（见下条）。
+
+### 测试节点注入通道：`TEST_POOL_NODES`（仅测试用）
+
+节点池由 `RouterEngine` 的 `ArcSwap` 持有，**没有运行时注入节点的公开 API**，
+端到端验证需要把特定节点放进候选池时用这个变量。格式逗号分隔，每项
+`ip:port:tier:country:provider:weight`，例：
+
+```powershell
+$env:TEST_POOL_NODES = "127.0.0.1:443:residential:HX:https-proxy:100"
+```
+
+**安全边界（刻意收紧）**：**默认空 ⇒ 零影响**（不设即行为不变）；**仅接受回环地址**，
+公网条目直接拒绝并 `warn`（杜绝"用测试通道把任意地址塞进池"）；解析失败跳过并
+`warn`、**不 panic**（测试通道不该有能力打挂网关）。
+
+配合 `X-Proxy-Country: <country>` 可把选路唯一锁定到该节点，避免 bandit 优选其他臂
+——这在验证特定节点行为时是必需的（否则会误以为"没命中"，实为被优选臂抢走）。
+
+### 遥测落地端静默丢数据：怎么发现、怎么修（OPT-R15）
+
+**问题（实测复现，非推演）：** `REDIS_URL` 少写密码 ⇒ 遥测**静默丢光**，而网关照常服务、
+指标上也看不出异常。当时只有翻日志才发现，且报错原文 `Protocol error: unauthenticated
+multibulk length` **看着像 ClickHouse 错误，其实是 Redis 协议错误**——第一直觉必然查错方向。
+
+**现在可编程察觉**（`/metrics`，`backend` = `redis` | `clickhouse`）：
+
+| 指标 | 含义 |
+|---|---|
+| `telemetry_sink_up{backend}` | 最近一次写入尝试成功=1／失败=0 |
+| `telemetry_sink_failures_total{backend}` | 写入失败次数（累计故障史，恢复后**不**清零） |
+| `telemetry_sink_last_ok_unixtime_seconds{backend}` | 最近一次**成功**写入的 Unix 秒；`0` = 试过但从未成功 |
+| `telemetry_dropped_total` | 因落地失败而丢弃的事件数（原有指标） |
+
+**三条告警**（`deploy/prometheus/rules.yml`，已过 `tools/check_promql_metrics.py` 校验）：
+
+- `TelemetrySinkDown`（critical，2m）——`telemetry_sink_up == 0`。持续 2m 才报，过滤单次毛刺。
+- `TelemetrySinkNeverSucceeded`（critical，10m）——`last_ok == 0`。比 Down 更严重：
+  不是「曾经好过现在坏了」，而是「从上线起就没通过」。
+- `TelemetrySinkStale`（warning，5m）——`up=1` 但 10 分钟无成功写入（假活/挂起）。
+  表达式里的 `> 0` 用于排除「一次都没成功」，否则会与上一条重复误报。
+
+**两点口径要记住：**
+
+1. **序列懒出现**：未配置/未跑过的落地端**不渲染样本行**（而非渲染 `up=0`），
+   所以「ClickHouse 压根没配」的部署不会被 Down 规则误伤。告警的默认状态是"沉默"，不是"一片红"。
+2. **两级互相独立**：Redis 好、ClickHouse 坏时 `backend="redis"` 仍为 1，只有 CH 那条转 0。
+   `TelemetryStreamBacklogHigh` 依赖 `redis_exporter`（compose 里 profile 门控，未接时静默不发），
+   本组只依赖网关 `/metrics`、**默认可用**，是它的兜底。
+
+**按 backend 排查：**
+
+- `redis`：查 `REDIS_URL` 是否含密码。**Redis 密码是容器启动参数** `--requirepass`，
+  **不在容器环境变量里** —— `docker inspect --format '{{range .Config.Env}}' <c>` 查不到，
+  只能读 `.Config.Cmd`（`docker inspect <c> --format '{{.Config.Cmd}}'`）。这是最容易踩的诊断陷阱。
+- `clickhouse`：查 `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` / `CLICKHOUSE_DB`；
+  也可能是容器只是 Exited（`docker start ipproxy-clickhouse`）。
+- 两级都 0：优先怀疑网络/凭据根本没配对，而不是网关问题。
+
+**为什么序列化失败不算落地端不健康**：JSON 序列化失败是网关自己的 bug，标到
+Redis/ClickHouse 上会把责任指错方向，也无法靠改依赖解决——故只有**真正与依赖交互**
+成功/失败才更新 `telemetry_sink_up`。
+
 - Windows 传 JSON 给 redis-cli 会丢引号：用 `log/redis_inject.py`（raw RESP）。
 - OPT-R4 C5/C6 凭据：复制 `.env.example` 为 `.env` 后改密码；`tools/ipp.ps1` 自动加载（CI/显式 env 优先）；compose 用 `${VAR:-缺省}` 引用。依赖端口只绑回环（6379/8123/9090/3000），局域网直达已封。
 - Live 测试（`cargo test -- --ignored`）需带密环境：`$env:REDIS_URL="redis://:xxx@127.0.0.1:6379/"`＋`$env:CLICKHOUSE_PASSWORD="xxx"`（与 .env 同值）；CI 用无密 service 走缺省。
 - OPT-R4 C12 备份恢复：`tools/backup.ps1` 产出 `backup/<stamp>/`（redis-dump.rdb＋ch-telemetry-freeze＋clickhouse-data.tar＋grafana-data.tar）。备份口径：Redis 先 BGSAVE 再拷 `dump.rdb`→`redis-dump.rdb`；CH 先 `ALTER TABLE proxy.proxy_telemetry_log FREEZE`→拷 `shadow/<N>` 为 `ch-telemetry-freeze`→`UNFREEZE WITH NAME` 清理（File BACKUP 需服务端白名单，本镜像未配故不用），另加 `clickhouse-data.tar` 卷 tar 全量兜底；Grafana 卷 tar 为 `grafana-data.tar`。恢复：停服（`ipp.ps1 stop`＋`compose stop`）→ 双 tar 回放（`clickhouse-data.tar`/`grafana-data.tar` 解回各自具名卷；rdb→`ipproxy-redis:/data/dump.rdb`；`ch-telemetry-freeze` 按需拷回）→ 起服＋副本表验行数（建临时表对行数再换名，不碰生产表）＋`SELECT count()` 对账。演练建议：季度一次。
 - D2 局域网敞口声明：`GATEWAY_ADDR` 缺省 `127.0.0.1:8916`（D3 已收紧；此前 `0.0.0.0:8916` 局域网可直达）。多机用 WireGuard 组网后绑 WG 地址（如 `GATEWAY_ADDR=10.8.0.1:8916`），密钥走 WG，不改网关代码；容器场景显式覆写 `0.0.0.0:8916`（见 compose）。D3 破坏性收紧（REQUIRE_API_KEY 默认 1＋监听收 127.0.0.1）已按拍板执行（步骤 27），回退置 `REQUIRE_API_KEY=0`＋`GATEWAY_ADDR=0.0.0.0:8916`。
+
+---
+
+## 第三方数据署名 / Third-Party Data Attribution
+
+> **何时适用：** 一旦你在部署中启用了 GeoLite2（即设置了 `GEOIP_MMDB_PATH` 并加载了
+> `.mmdb` 文件），**必须**把下面的署名随部署一并提供。GeoLite2 数据库**不在本仓库内**，
+> 需自行从 MaxMind 获取，署名义务发生在**使用方**。
+>
+> **为何单列一节：** `docs/OPEN-SOURCE.md` 曾声明「OPERATION 有署名行」，但本文件
+> 此前**只有 GeoLite2 的操作步骤、没有任何署名**（OPT-R10 实测发现并补齐）。
+> GeoLite2 采用 **CC BY-SA 4.0**，该许可**强制要求署名**（Attribution 4.0
+> International §3(a)）——这与其他技术债不同，它是**法律风险**而非工程问题。
+
+### GeoLite2（使用即须附带）
+
+```
+This product includes GeoLite2 data created by MaxMind, available from
+https://www.maxmind.com.
+
+GeoLite2 Endpoints / GeoLite2 City databases are provided under the
+Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Copyright © MaxMind, Inc.
+```
+
+署名四要素对照（CC BY-SA 4.0 §3(a) 要求）：
+
+| 要素 | 本项目对应内容 |
+|---|---|
+| 提供者署名 | `Copyright © MaxMind, Inc.` |
+| 许可名称与链接 | `CC BY-SA 4.0` ＋ `https://creativecommons.org/licenses/by-sa/4.0/` |
+| 免责声明 | MaxMind 官方站点（数据「AS IS」，无担保） |
+| 数据来源 | `https://www.maxmind.com` |
+
+**建议的提供方式**（任选其一，或多种并行）：
+
+- 部署环境可见处（如本机 `data/` 目录内放一份 `ATTRIBUTION.txt`）；
+- 你的产品/服务对外的「开源许可 / 数据来源」页面；
+- 对外分发的二进制/容器镜像的 labels 与文档。
+
+**不要做的事：** 不要移除本节，也不要把 GeoLite2 数据库提交进本仓库
+（`.gitignore` 的 `data/` 已覆盖；数据库需 MaxMind 账号与 license key 获取）。
+自动更新脚本 `deploy/geoip_update.py` 只负责下载，**不负责也不应该**自动注入署名
+到你的对外物料——那是部署方的义务。
+
+---
+
+## 方法论底座说明（不随本仓库分发）
+
+`banyan-skills` 是本项目采用的「先落库再执行」方法底座，**位于独立仓库**
+（`https://github.com/AiToByte/Banyan`），**不随本仓库分发**（被 `.gitignore`
+排除，非 git submodule）。它只提供工作流规范文档，不含任何运行时代码——
+**本仓库的构建、测试、部署均不依赖它**。若需查阅该方法论，请另行 clone；
+本仓库的实现与文档不因它缺失而受影响。

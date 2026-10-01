@@ -8,6 +8,64 @@
 //! Redis is optional at boot (degraded: log-only telemetry). ClickHouse is
 //! consumed lazily by the arbitrage worker (query errors hold weights).
 
+/// test-only 的全局分配计数器（供各模块的「零分配契约」测试共用）。
+///
+/// # 归属：crate 级而非模块私有
+///
+/// 初版放在 `router::tests` 里（OPT-R9 C1），OPT-R10 B1 要在 `gateway::tests`
+/// 里做同类的零分配断言时无法访问（模块私有）。两个测试要的是**同一个计数器**
+/// （`#[global_allocator]` 本来就作用于整个 test binary），故提升到 crate 级。
+///
+/// # 已知局限（两个模块的测试都受影响）
+///
+/// 计数器是**进程级**的，而 Rust 测试默认多线程并行——其它测试此刻的分配会
+/// 污染读数。**对策不是放宽判据**（那会让真实回归溜过：实测「并行不误报」
+/// 设计下，把 `format!` 塞回热路径产生的 2000 次分配被当作「污染」放行），
+/// 而是给两个测试都标 `#[ignore]` 并由 CI **串行**跑
+/// （见 `.github/workflows/ci.yml` 的 allocation-contract 步骤）。
+#[cfg(test)]
+pub mod test_allocs {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 进程级分配计数（**全测试共享**）。用其他测试的断言时需自行取差值。
+    pub static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 薄包装：完全委托给系统分配器，只在前面加一次原子加。
+    ///
+    /// # Safety
+    ///
+    /// 满足 `GlobalAlloc` 契约：布局与对齐原样传给 `System`，不缓存任何指针、
+    /// 不改变生命周期语义；`realloc`/`alloc_zeroed` 同样委托。唯一副作用是对
+    /// `ALLOCS` 的原子累加（`Relaxed` 序——测试不需要跨线程顺序保证）。
+    pub struct Counting;
+
+    // SAFETY: 见类型注释——纯委托，无自定义内存管理。
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            System.alloc(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            System.dealloc(p, l)
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            System.alloc_zeroed(l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            System.realloc(p, l, n)
+        }
+    }
+}
+
+// 安装到整个 test binary——**必须**在模块级（不在函数体内）。
+// 放在 main.rs 末尾以确保它是本 binary 唯一的 global_allocator。
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL_ALLOC: test_allocs::Counting = test_allocs::Counting;
+
 mod analytics;
 mod bandit;
 mod ch_sink;
@@ -37,7 +95,7 @@ use free_pool::{
     FreePoolConfig, FreePoolWorker, API_MAX_PAGES, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE,
     DEFAULT_GITHUB_URL, DEFAULT_HTML_URL,
 };
-use gateway::{SmartProxyGateway, DEFAULT_API_KEY};
+use gateway::{is_loopback_addr, SmartProxyGateway};
 use metrics::{serve_metrics, MetricsRegistry, METRICS_ADDR};
 use model::{ProxyNode, RoutingSpec};
 use pingora_core::server::configuration::Opt;
@@ -92,10 +150,68 @@ fn env_secs(key: &str, default_secs: u64) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(default_secs))
 }
 
+/// OPT-R14 B1：`GATEWAY_GRACE_SECS` 的**平台感知默认值**。
+///
+/// # 为什么要分平台（P0，本轮定位到依赖源码行）
+///
+/// `pingora-core 0.6.0` 的 `Server::run()` 里：
+///
+/// ```text
+/// let shutdown_type = server_runtime.get_handle().block_on(self.main_loop(run_args));
+/// #[cfg(windows)]
+/// let shutdown_type = ShutdownType::Graceful;   // ① Windows：无条件置为优雅停机
+/// if matches!(shutdown_type, ShutdownType::Graceful) {
+///     thread::sleep(Duration::from_secs(exit_timeout));   // ② 然后 sleep(grace)
+/// }
+/// ```
+///
+/// ① 的直接后果：**Windows 上 `main_loop` 从不被 await**（那段是
+/// `#[cfg(unix)]`），没有信号等待，`shutdown_type` 被硬编码为 Graceful ⇒
+/// 网关**先 sleep(grace) 再退出**。
+///
+/// 本轮实测（跨 FreePool 开关均复现）：退出存活 **305~308s**
+/// ，正好是 300s sleep 与数秒启动之和。当时被误判为
+/// “与 FreePool 相关”（伪相关：只是那几次跑得够久）。
+///
+/// # 为什么 Windows 取 86400（而不是 0）
+///
+/// - 取 **0** 会让 Windows 上立即退出，比现状更糟。
+/// - 取 **86400（1 天）**：本机用途是开发/验证，“最多活一天”
+///   实际等价于“不会自己死”；且仍**可显式覆盖**
+///   （`GATEWAY_GRACE_SECS=0` 依旧可让它立即退出，便于测试）。
+/// - Unix 保持 **300**：那里它是真正的优雅停机等待窗口，**行为零变化**。
+///
+/// # 长期正确的修法
+///
+/// 升级 Pingora 到修复 Windows `main_loop` 路径的版本。本轮不做（需
+/// 联网解析新版本并重验整条数据面，成本与风险不成比例）。
+#[inline]
+pub fn default_grace_secs(is_windows: bool) -> u64 {
+    if is_windows {
+        // 仅为绕过框架在 Windows 上的自杀行为。
+        86_400
+    } else {
+        300
+    }
+}
+
 /// 复审钳制：FREE_TTL 上限（`now + ttl` 在 upsert/reverify，非法大值即 panic；
 /// 后台任务 panic 在 abort 下带走进程）。30 天远超合理 TTL（默认 30min），钳制无行为影响。
 pub fn clamp_free_ttl(ttl: Duration) -> Duration {
     ttl.min(Duration::from_secs(30 * 86400))
+}
+
+/// OPT-R11 A2 钳制：SOCKS 桥接单跳超时上限。
+///
+/// 背景见 `setup_gateway` 里 `SocksBridge::new` 的注释：该值最终参与
+/// `Instant::now() + budget`，而 `Instant` 内部有符号表示，秒数越过
+/// `i64::MAX` 即 panic。`env_secs` 无上限过滤，所以必须在此钳制。
+///
+/// 上限取 1 天（复用 `QUARANTINE_MAX_TTL_SECS` 的值以避免再造常量语义）——
+/// 远高于默认 20s，对存量部署**行为零变化**；`clamp_free_ttl` 的单测
+/// 同样锁定了「合理值原样通过」，此处保持一致风格。
+pub fn clamp_bridge_timeout(tt: Duration) -> Duration {
+    tt.min(Duration::from_secs(router::QUARANTINE_MAX_TTL_SECS))
 }
 
 /// FreePool 逗号分隔 URL 列表读值（去空白＋去空项＋仅 http/https，file/dict/gopher
@@ -259,18 +375,116 @@ async fn setup_gateway() -> Server {
             60,
         ),
     ];
+    // OPT-R15 步骤 46：测试节点注入通道。
+    //
+    // 存在的原因：节点池由 `RouterEngine` 的 `ArcSwap` 持有，**没有运行时注入节点的
+    // 公开 API**。要端到端验证「网关对端口 443 节点走 TLS」（步骤 45 解冻的 `is_tls`），
+    // 必须能把一个 127.0.0.1:443 的 HTTPS 代理放进候选池——否则该验证只能停在代码级，
+    // 真实 TLS 握手链始终无人验证过（步骤 45 的遗留项）。
+    //
+    // 格式：逗号分隔，每项 `ip:port:tier:country:provider:weight`
+    // 例：`127.0.0.1:443:residential:US:https-proxy:100`
+    //
+    // 安全边界（刻意收紧，避免变成生产后门）：
+    //   - **默认空 ⇒ 零影响**：不设该变量时行为与本改动前逐字节一致。
+    //   - **仅接受回环地址**：非 `127.0.0.1` / `localhost` / `::1` 的条目直接拒绝并告警，
+    //     杜绝"用测试通道把任意公网地址塞进池"这一类误用。
+    //   - 解析失败的条目跳过并 `warn`，不 panic（测试通道不该有能力打挂网关）。
+    let mut initial_nodes = initial_nodes;
+    for spec in std::env::var("TEST_POOL_NODES")
+        .unwrap_or_default()
+        .split(',')
+    {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = spec.split(':').collect();
+        let ok = f.len() == 6
+            && is_loopback_addr(&format!("{}:0", f[0]))
+            && f[1].parse::<u16>().is_ok()
+            && f[5].parse::<u8>().is_ok();
+        if !ok {
+            log::warn!(
+                "[TEST_POOL_NODES] rejected malformed/non-loopback spec {spec:?} \
+                 (want ip:port:tier:country:provider:weight, loopback only)"
+            );
+            continue;
+        }
+        let node = ProxyNode::new(
+            f[0].to_string(),
+            f[1].parse().expect("checked"),
+            None,
+            None,
+            f[3].to_string(),
+            f[2].to_string(),
+            f[4].to_string(),
+            f[5].parse().expect("checked"),
+        );
+        log::info!("[TEST_POOL_NODES] injected test node {}", node.addr);
+        initial_nodes.push(node);
+    }
     let router = Arc::new(RouterEngine::new(initial_nodes));
 
     // 2b. GW-4 tenants: default key with wide limits keeps GW-1~3 curls green.
     // R2-3 burst=qps/10（单源口径，见 `TenantManager::default_burst_for_qps`）。
+    // R2-8：网关监听地址 env 化（D3 起默认 127.0.0.1:8916 回环收紧；
+    // 2026-09-24 由 8080 迁出，起因见 PORT-8916 计划；局域网/容器场景显式覆写
+    // GATEWAY_ADDR=0.0.0.0:8916，见 OPERATION D2 节）。
+    let gateway_addr = env_str("GATEWAY_ADDR", "127.0.0.1:8916");
+
     let tenant_mgr = Arc::new(TenantManager::new());
-    tenant_mgr.register_tenant(
-        "default",
-        DEFAULT_API_KEY,
-        10_000,
-        10_000,
-        TenantManager::default_burst_for_qps(10_000),
-    );
+
+    // OPT-R12 B1：`API_KEY` env 覆盖。**设了它 `default_key` 就立即失效**
+    // （不再注册默认 key ⇒ 旧客户端拿 `default_key` 会 403）——本轮选定的最强档。
+    // 未设置时回退 `default_key`，保持本机开发与本仓自检可用（零行为变更）。
+    // 误配（空串／等于 `default_key`）**fail-closed**：不注册默认租户、全部 403。
+    let api_key_env = std::env::var("API_KEY").ok();
+    let effective_key = match tenant::resolve_api_key(api_key_env.as_deref()) {
+        Ok(Some(k)) => {
+            log::info!(
+                "[OPT-R12] API_KEY set: default tenant uses the operator-supplied key; \
+                 the public default key no longer authenticates"
+            );
+            k
+        }
+        Ok(None) => {
+            log::warn!(
+                "[OPT-R12] API_KEY not set: falling back to the PUBLIC default key {:?}. \
+                 Fine for local dev; set API_KEY for any real deployment.",
+                tenant::DEFAULT_API_KEY
+            );
+            tenant::DEFAULT_API_KEY.to_string()
+        }
+        Err(e) => {
+            // fail-closed：与其接受一个"等于没配"的 key，不如不注册。
+            log::error!("[OPT-R12] {e}; no default tenant will be registered (all requests 403)");
+            String::new()
+        }
+    };
+    // `resolve_api_key` 只在 `Ok(Some)` 分支产出非默认值；空串是 fail-closed 标记。
+    if !effective_key.is_empty() {
+        let qps = tenant::TENANT_SENTINEL_QUOTA;
+        let max_conc = tenant::TENANT_SENTINEL_QUOTA as usize;
+        tenant_mgr.register_tenant(
+            "default",
+            &effective_key,
+            qps,
+            max_conc,
+            TenantManager::default_burst_for_qps(qps),
+        );
+
+        // OPT-R12 A1：危险组合响亮告警（弱默认 ＋ 满配额 ＋ 非回环）。
+        // 三者缺一不告警——本机开发与生产正确配置都不该被这条打扰。
+        if let Some(w) = tenant::weak_auth_warning(
+            effective_key == tenant::DEFAULT_API_KEY,
+            qps,
+            max_conc,
+            &gateway_addr,
+        ) {
+            log::warn!("[OPT-R12] {w}");
+        }
+    }
 
     // 2c. GW-4 Prometheus registry + exposition endpoint.
     // OPT-4：落库丢弃计数由 worker 与 metrics 共享（worker 直写、metrics 只读渲染）。
@@ -428,6 +642,7 @@ async fn setup_gateway() -> Server {
             conn.clone(),
             STREAM_KEY.to_string(),
             telemetry_dropped.clone(),
+            metrics.clone(),
         );
         // OPT-R6 V1：telemetry 此前是裸 spawn。**有意不复用 `supervise_until`**：
         // `TelemetryWorker` 持有 `mpsc::Receiver`，它既非 `Clone` 又**一次性**——
@@ -684,6 +899,9 @@ async fn setup_gateway() -> Server {
         let pump_conn = conn.clone();
         let pump_analytics = analytics.clone();
         let pump_metrics = metrics.clone();
+        // OPT-R15：`ChSinkWorker` 也要上报 ClickHouse 落地端健康，故闭包里需要
+        // 自己一份 `Arc`；`supervise_until` 那份用于重启计数，故这里必须 clone 两次。
+        let pump_metrics_for_sink = pump_metrics.clone();
         tokio::spawn(supervise_until(
             "ch_sink",
             pump_metrics,
@@ -692,6 +910,7 @@ async fn setup_gateway() -> Server {
                     pump_conn.clone(),
                     pump_analytics.clone(),
                     STREAM_KEY.to_string(),
+                    pump_metrics_for_sink.clone(),
                 )
                 .run()
             },
@@ -710,8 +929,21 @@ async fn setup_gateway() -> Server {
     let sweep_metrics = metrics.clone();
     let sweep_interval = env_secs("SWEEP_INTERVAL_SECS", 60);
     // P2 SOCKS 翻译桥（显式 socks 请求出站执行器；env 见计划 §2）。
+    // OPT-R11 A2：桥接超时上限钳制。`env_secs` 只过滤 `<= 0`、**无上限**，
+    // 故 `SOCKS_BRIDGE_TIMEOUT_SECS` 可被设为 `u64::MAX`；该值经
+    // `socks_overall_budget`（只 `saturating_add(8s)`、不封顶）落到
+    // `gateway.rs` 的 `Instant::now() + budget` 即 **panic**（`Instant` 内部
+    // 有符号表示，秒数越过 `i64::MAX` 溢出）。触发只需一个 env ＋ 一个
+    // `X-Proxy-Proto: socks5` 请求，**无需任何权限**——比 A1 更易触发。
+    //
+    // 钳在**读入处**（而非使用处）以杜绝多处防漏：`SocksBridge::new` 是这个
+    // 值的唯一入口，钳一次即覆盖全部下游算式。
+    //
+    // 复用 `QUARANTINE_MAX_TTL_SECS`（86400s=1 天）作上限，与既有的
+    // `clamp_free_ttl`（30 天）同一风格——**远高于任何合理桥接超时**（默认 20s），
+    // 故对存量部署**行为零变化**。
     let socks_bridge = Arc::new(SocksBridge::new(
-        env_secs("SOCKS_BRIDGE_TIMEOUT_SECS", 20),
+        clamp_bridge_timeout(env_secs("SOCKS_BRIDGE_TIMEOUT_SECS", 20)),
         env_str("SOCKS_MAX_BODY_BYTES", "10485760")
             .parse::<u64>()
             .unwrap_or(10 * 1024 * 1024),
@@ -788,11 +1020,26 @@ async fn setup_gateway() -> Server {
     let opt = Opt::parse_args();
     let mut conf =
         pingora_core::server::configuration::ServerConf::new().expect("ServerConf defaults");
-    conf.grace_period_seconds = Some(
-        env_str("GATEWAY_GRACE_SECS", "300")
-            .parse::<u64>()
-            .unwrap_or(300),
-    );
+    // OPT-R14 B1/B2：平台感知默认值 + 不响响岔告警。
+    let grace_default = default_grace_secs(cfg!(windows));
+    let grace_secs: u64 = env_str("GATEWAY_GRACE_SECS", "")
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(grace_default);
+    conf.grace_period_seconds = Some(grace_secs);
+    if cfg!(windows) {
+        // 不响响 = 运维会当成随机崩溃（无 panic、无错误码，只有一句
+        // "All runtimes exited" 就消失）。不说清楚就永远很难定位。
+        log::warn!(
+            "[OPT-R14] Windows 上 Pingora 0.6 不等待信号：Server::run() 把 shutdown_type \
+             硬编码为 Graceful 并 sleep(grace_period) 后退出（pingora-core 0.6 \
+             src/server/mod.rs 的 #[cfg(windows)] 分支）。本机已实测退出存活 \
+             305~308s，与配置无关。本轮已把默认 grace 改为 {grace_secs}s \
+             以绕过该限制；长期正确修法是升级 Pingora。 \
+             需短命进程（如测试）可显式设 GATEWAY_GRACE_SECS=1 覆盖。"
+        );
+    }
     let mut server = Server::new_with_opt_and_conf(Some(opt), conf);
     server.bootstrap();
 
@@ -807,12 +1054,9 @@ async fn setup_gateway() -> Server {
             metrics: metrics.clone(),
             require_api_key,
             bridge: Some(socks_bridge.clone()),
+            tier_quota_window: std::sync::Mutex::new(std::collections::VecDeque::new()),
         },
     );
-    // R2-8：网关监听地址 env 化（D3 起默认 127.0.0.1:8916 回环收紧；
-    // 2026-09-24 由 8080 迁出，起因见 PORT-8916 计划；局域网/容器场景显式覆写
-    // GATEWAY_ADDR=0.0.0.0:8916，见 OPERATION D2 节）。
-    let gateway_addr = env_str("GATEWAY_ADDR", "127.0.0.1:8916");
     proxy_service.add_tcp(&gateway_addr);
 
     log::info!(
@@ -1106,5 +1350,43 @@ mod tests {
         let n = runs.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(runs.load(Ordering::Relaxed), n, "no respawn after stop");
+    }
+
+    // ---- OPT-R14 B3：平台感知 grace 默认值 ----
+
+    /// Unix 侧行为**零变化**：仍是 300s（真正的优雅停机等待窗口）。
+    #[test]
+    fn opt_r14_default_grace_unix_unchanged() {
+        assert_eq!(
+            crate::default_grace_secs(false),
+            300,
+            "Unix 默认必须保持 300（存量行为零变化）"
+        );
+    }
+
+    /// Windows 侧必须**远大于 300s**，否则框架会在 300s 后杀死进程。
+    #[test]
+    fn opt_r14_default_grace_windows_avoids_300s_self_kill() {
+        let g = crate::default_grace_secs(true);
+        assert!(g > 300, "Windows 默认 grace 必须 >300s，实测 {g}");
+        assert_ne!(g, 0, "绝不能为 0：会让 Windows 上立即退出，比现状更糟");
+        assert_eq!(g, 86_400, "实测值锁定为 1 天（避免静默改动意外不知情）");
+    }
+
+    /// 两平台必须**不同**：相同就白白定了平台感知的意义。
+    #[test]
+    fn opt_r14_default_grace_platforms_differ() {
+        assert_ne!(
+            crate::default_grace_secs(true),
+            crate::default_grace_secs(false),
+            "两平台默认值必须不同"
+        );
+    }
+
+    /// 当前构建平台上的实际默认值，与 `cfg!(windows)` 一致且**非零**。
+    #[test]
+    fn opt_r14_actual_platform_default_is_nonzero() {
+        let g = crate::default_grace_secs(cfg!(windows));
+        assert!(g > 0, "当前平台的实际默认不得为 0（否则立退）");
     }
 }
