@@ -1916,27 +1916,48 @@ mod tests {
 
     // ---- OPT-R11 A1：`prune_stale_arms` 第 4 处 P0 计数下溢 ----
 
-    /// **红测（确定性）**：证明旧写法 `before - arms.len()` 在「并发生长」下
-    /// 确实会 panic，从而说明饱和减**不是可有可无的宽容**。
+    /// **红测（确定性）**：证明旧写法 `before - after` 在「并发生长」下确实是
+    /// 缺陷，从而说明饱和减**不是可有可无的宽容**。
     ///
     /// 为何不用「真实并发」测试：要卡准 `len()` 与 `retain()` 之间的窗口需要
     /// 精确的线程同步点，既脆弱又可能长期测不到（窗口极窄）——那种测试在
     /// 没有命中时永远绿，等于没有门。此处直接对「下溢表达式本身」断言，
     /// 确定性、无时序依赖，且正是缺陷的最小充分复现。
+    ///
+    /// # OPT-R15 修正：断言必须与构建 profile 解耦
+    ///
+    /// 旧写法为 `assert!(catch_unwind(|| before - after).is_err())`，即断言
+    /// 「普通减法必 panic」。**该断言只在 `overflow-checks = on` 时成立**：
+    /// release（`cargo bench --workspace -- --test`、`cargo test --release`）
+    /// 默认关闭溢出检查，下溢改为回绕 ⇒ 不 panic ⇒ 测试红。实测本仓
+    /// `cargo bench -- --test` 稳定复现该失败。
+    ///
+    /// 现改为断言**两个 profile 都成立的语义**：`checked_sub` 下溢返 `None`
+    /// （这正是 debug 下普通减法 panic 的原因），且回绕值是天文数字（这正是
+    /// release 下的实际危害）。二者合起来完整刻画该缺陷，不再依赖 profile。
+    /// 修复后的饱和减行为由紧邻的绿测锁定。
+    ///
+    /// 注：`arms` 被数据面 `arm_for()`（冷路径 `arms.insert`）并发写；
+    /// 后台 sweep 采样 `before` 后若有插入，则 `after > before`。
     #[test]
-    fn opt_r11_a1_plain_subtraction_panics_under_concurrent_growth() {
-        // `arms` 被数据面 `arm_for()`（gateway.rs 冷路径 `arms.insert`）并发写。
-        // 后台 sweep 采样 `before` 后若有插入，则 `after > before`。
+    fn opt_r11_a1_plain_subtraction_is_unsound_in_every_profile() {
         let before: usize = 0;
         let after: usize = 3;
-        // 若此处不 panic，则「旧写法会崩」的前提不成立，本测试失去意义——
-        // 因此这里要求**必须** panic（仅 debug 构建；release 下回绕，见下一测试）。
-        let r = std::panic::catch_unwind(|| before - after);
+        // ① 语义一：下溢可被检测（debug 下普通减法 panic 的根因）。
+        //    该性质由 checked_sub 的定义保证，与 overflow-checks 无关。
         assert!(
-            r.is_err(),
-            "旧写法 `before - after` 在并发生长下必须 panic；若未 panic，\
-             说明本轮的缺陷判断前提不成立，红测失去意义"
+            before.checked_sub(after).is_none(),
+            "before=0 after=3 属下溢，checked_sub 必须返回 None"
         );
+        // ② 语义二：若不检测（release 关闭溢出检查），下溢回绕成天文数字，
+        //    使 arms 计数/日志永久失真——危害不比 panic 小，只是更隐蔽。
+        assert_eq!(
+            before.wrapping_sub(after),
+            usize::MAX - 2,
+            "release 下普通减法回绕成天文数字，日志/指标将永久失真"
+        );
+        // ③ 无论哪个 profile，饱和减都给出 sane 值（下界 0，绝不为天文数字）。
+        assert_eq!(crate::janitor::removed_count(before, after), 0);
     }
 
     /// release 构建下旧写法不 panic，但**回绕成天文数字**——同样必须修。
