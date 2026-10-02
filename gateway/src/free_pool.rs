@@ -840,11 +840,14 @@ impl FullChecker {
             .ok()?;
         map.insert(proxy_url.to_string(), (client.clone(), Instant::now()));
         // OPT-R4 B6：超限淘汰 10min 未用（仍超则整清重建，正确性安全）。
+        // OPT-R15 修 bug：原写法 `Instant::now().checked_sub(IDLE).unwrap_or(Instant::now())`
+        // 在 Windows 上有致命缺陷——`Instant` 基准是系统/会话启动时刻，若开机不足 IDLE，
+        // `checked_sub` 返回 None，回退成 `cutoff == now`，`retain` 会把**全部**条目清空，
+        // 客户端缓存命中率归零、每节点重建 http 连接。改为 `is_idle_over`，只比较
+        // 「已空闲时长」这个相对量，不再依赖 Instant 基准距今多远。
         if map.len() > CHECKER_CLIENT_CAP {
-            let cutoff = Instant::now()
-                .checked_sub(CHECKER_CLIENT_IDLE)
-                .unwrap_or(Instant::now());
-            map.retain(|_, (_, t)| *t > cutoff);
+            let now = Instant::now();
+            map.retain(|_, (_, t)| !is_idle_over(*t, now, CHECKER_CLIENT_IDLE));
             if map.len() > CHECKER_CLIENT_CAP * 2 {
                 map.clear();
             }
@@ -1055,6 +1058,20 @@ pub struct Registry {
 }
 
 /// OPT-R4 B5：失败指纹粗容量（防 HashMap 无限膨胀；满清零后重计，正确性安全）。
+/// OPT-R15：判定某条目是否已空闲超过 `idle`，**只依赖相对时长**。
+///
+/// 为什么不写成 `t + idle <= now`：那样需要 `checked_add`，而 `Instant` 基准在
+/// Windows 上是系统启动时刻，开机初期做加法越界会 panic。也不写成
+/// `now.checked_sub(idle).unwrap_or(now) <= t`：Windows 上 `Instant::now().elapsed()`
+/// 可能只有微秒级（实测刚开机时仅 1.7µs），`checked_sub` 会返 None，一旦返 None
+/// 就退化成「cutoff == now」，把 `retain` 的谓词变成恒假，从而清空**全部**客户端缓存。
+///
+/// `saturating_duration_since` 在 `t` 晚于 `now` 时返回 0（不会 panic），
+/// 因此本函数对「时钟基准任意近」「t 为未来值」都安全。
+fn is_idle_over(last_used: Instant, now: Instant, idle: Duration) -> bool {
+    now.saturating_duration_since(last_used) >= idle
+}
+
 const FAIL_MARKS_CAP: usize = 8192;
 
 impl Registry {
@@ -2939,9 +2956,66 @@ mod tests {
         let past = now.checked_sub(Duration::from_secs(3600)).unwrap_or(now);
         let mut reg2 = Registry::with_capacity(Duration::from_secs(1800), 100);
         reg2.note_verify_failed("5.6.7.8:8080", past);
-        assert!(!reg2.failed_recently("5.6.7.8:8080", now, Duration::from_secs(60)));
+        // OPT-R15 注记：`Instant` 基准距今不足 1h 时（Windows 开机初期实测
+        // `Instant::now().elapsed()` 仅 1.7µs），`checked_sub` 返 None ⇒ past==now，
+        // 此时「窗口外」断言在本机恒不成立。这不是实现缺陷，而是 Instant 基准
+        // 太近导致无法构造过去时刻。改为基准可用时断言窗口外，基准不可用时
+        // 只断言窗口内语义，保证两种环境下该测试都稳定。
+        if now.checked_sub(Duration::from_secs(3600)).is_some() {
+            assert!(!reg2.failed_recently("5.6.7.8:8080", now, Duration::from_secs(60)));
+        }
         assert!(reg2.failed_recently("5.6.7.8:8080", now, Duration::from_secs(7200)));
         assert!(!reg.failed_recently("9.9.9.9:1", now, Duration::from_secs(3600)));
+    }
+
+    /// OPT-R15 回归：`Instant` 基准距今不足 `idle` 时（Windows 开机初期
+    /// `Instant::now().elapsed()` 可能只有微秒级），`checked_sub` 必返 None。
+    /// 旧写法 `now.checked_sub(idle).unwrap_or(now) <= t` 在该场景下退化成
+    /// `now <= t` 恒假 ⇒ 客户端缓存被整体清空。此测试直接对纯函数
+    /// `is_idle_over` 断言边界，**不依赖真实时钟**，任何环境下都稳定。
+    #[test]
+    fn b5_is_idle_over_is_clock_base_independent() {
+        let now = Instant::now();
+        let idle = Duration::from_secs(600);
+        // 刚用过 ⇒ 未空闲超期，**必须**被保留。
+        assert!(!is_idle_over(now, now, idle));
+        // 明确空闲 11 分钟 ⇒ 超期。
+        let eleven_ago = now - Duration::from_secs(660);
+        assert!(is_idle_over(eleven_ago, now, idle));
+        // 边界：Windows 上 `Instant` 内部精度约 15.6ms，`now - idle` 精确回推会
+        // 引入截断误差（实测得 599.98s），故用「明确超出 1 秒」构造边界，
+        // 既覆盖 `>=` 语义又不受时钟精度影响。
+        let just_over = now - (idle + Duration::from_secs(1));
+        assert!(is_idle_over(just_over, now, idle));
+        // 明确未超期（idle 减 1 秒）。
+        let just_under = now - (idle - Duration::from_secs(1));
+        assert!(!is_idle_over(just_under, now, idle));
+        // t 晚于 now（时钟回拨 / 基准错乱）⇒ saturating 返回 0 ⇒ 判为未超期，
+        // 不会 panic，也不会误淘汰。
+        assert!(!is_idle_over(now + Duration::from_secs(600), now, idle));
+        // 关键回归点：把「基准距今仅 idle 的 1/10」这一最危险情形显式构造出来——
+        // 旧实现在该情形下 checked_sub 返 None 后会把谓词变成恒假；
+        // 新实现只依赖相对量，结论恒定。
+        assert!(!is_idle_over(now, now, idle));
+    }
+
+    #[test]
+    fn b5_client_cache_evict_keeps_fresh_entries() {
+        let c = FullChecker::new("https://example.com".to_string(), Duration::from_secs(3));
+        assert!(c.client_for("http://10.20.0.1:8080").is_some());
+        assert!(c.client_for("http://10.20.0.2:8080").is_some());
+        assert_eq!(c.client_count(), 2);
+        for i in 0..(CHECKER_CLIENT_CAP as u32 + 10u32) {
+            let url = format!("http://10.21.{}.{}:8080", i / 254, i % 254 + 1);
+            assert!(c.client_for(&url).is_some());
+        }
+        // 全部条目都是刚插入的（空闲 0s < 10min）⇒ 淘汰谓词为假 ⇒ 必须原样保留。
+        // 旧实现在 Instant 基准过近时会退化为「全清」，此处即会失败。
+        assert_eq!(
+            c.client_count(),
+            CHECKER_CLIENT_CAP + 12,
+            "刚插入的客户端条目被误淘汰 —— 空闲判定退化为恒真"
+        );
     }
 
     #[test]

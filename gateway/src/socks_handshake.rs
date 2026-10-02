@@ -214,12 +214,27 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// stub 模式：NoAuth 成功／要求账密／CONNECT 拒绝／坏版本。
+    const VER5: u8 = 0x05;
+    const VER4: u8 = 0x04;
+    const CMD_CONNECT: u8 = 0x01;
+    const RSV: u8 = 0x00;
+    const ATYP_DOMAIN: u8 = 0x03;
+    const REP_OK: u8 = 0x00;
+    const METHOD_USERPASS: u8 = 0x02;
+    const METHOD_NONE: u8 = 0x00;
+    const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+    const SOCKS4A_MARKER: [u8; 4] = [0, 0, 0, 1];
+    const SOCKS4_GRANTED: u8 = 0x5A;
+    const SOCKS4_REJECTED_CD: u8 = 0x5B;
+    const ATYP_ILLEGAL: u8 = 0x09;
+
+    /// stub 模式：NoAuth 成功／要求账密／CONNECT 拒绝／坏版本／坏 ATYP。
     enum StubMode {
         NoAuthOk,
         RequireAuth { user: String, pass: String },
         ConnectRefused,
         BadVersion,
+        BadAtyp,
     }
 
     /// 起本地 SOCKS5 stub，返回（端口，收到的原始字节记录）。
@@ -311,6 +326,10 @@ mod tests {
             }
             seen2.lock().extend_from_slice(&rest);
             // 4. 回复。
+            if matches!(mode, StubMode::BadAtyp) {
+                let _ = s.write_all(&[VER5, REP_OK, RSV, ATYP_ILLEGAL, 0, 0]).await;
+                return;
+            }
             if matches!(mode, StubMode::ConnectRefused) {
                 let _ = s
                     .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -320,6 +339,70 @@ mod tests {
             let _ = s
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 9, 9, 9, 0, 80])
                 .await;
+        });
+        (port, seen)
+    }
+
+    /// greet_only stub：吃掉 greeting 后回固定两字节（VER/METHOD）。
+    async fn spawn_greet_stub(reply: [u8; 2]) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut s, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut head = [0u8; 2];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; head[1] as usize];
+            if s.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            let _ = s.write_all(&reply).await;
+        });
+        port
+    }
+
+    /// SOCKS4 stub：读 8 字节头＋userid 零结尾；若 IP 位为 4a 标记再读域名零结尾；
+    /// 回 8 字节回包且第 2 字节置 `reply_cd`。
+    async fn spawn_socks4_stub(reply_cd: u8) -> (u16, std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut s, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut head = [0u8; 8];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            seen2.lock().extend_from_slice(&head);
+            let is_4a = head[4..8] == SOCKS4A_MARKER;
+            for _ in 0..2 {
+                loop {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    seen2.lock().push(b[0]);
+                    if b[0] == 0x00 {
+                        break;
+                    }
+                }
+                if !is_4a {
+                    break;
+                }
+            }
+            let _ = s.write_all(&[0x00, reply_cd, 0, 0, 0, 0, 0, 0]).await;
         });
         (port, seen)
     }
@@ -502,5 +585,180 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn greet_only_socks5_accepts_valid_and_rejects_ff_or_bad_version() {
+        assert!(greet_only(
+            "127.0.0.1",
+            spawn_greet_stub([VER5, METHOD_NONE]).await,
+            EgressProto::Socks5
+        )
+        .await
+        .is_ok());
+        assert!(greet_only(
+            "127.0.0.1",
+            spawn_greet_stub([VER5, METHOD_USERPASS]).await,
+            EgressProto::Socks5
+        )
+        .await
+        .is_ok());
+        assert!(greet_only(
+            "127.0.0.1",
+            spawn_greet_stub([VER5, METHOD_NONE_ACCEPTABLE]).await,
+            EgressProto::Socks5
+        )
+        .await
+        .is_err());
+        assert!(greet_only(
+            "127.0.0.1",
+            spawn_greet_stub([VER4, METHOD_NONE]).await,
+            EgressProto::Socks5
+        )
+        .await
+        .is_err());
+        assert!(greet_only("127.0.0.1", 1, EgressProto::Socks5)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn greet_only_socks4_needs_only_listen_and_http_is_err() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        assert!(greet_only("127.0.0.1", port, EgressProto::Socks4)
+            .await
+            .is_ok());
+        assert!(greet_only("127.0.0.1", port, EgressProto::Http)
+            .await
+            .is_err());
+        assert!(greet_only("127.0.0.1", 1, EgressProto::Socks4)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn socks5_domain_target_uses_atyp_03() {
+        let (port, seen) = spawn_socks5_stub(StubMode::NoAuthOk).await;
+        establish(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            EgressProto::Socks5,
+            "example.com",
+            443,
+        )
+        .await
+        .expect("establish");
+        let got = seen.lock().clone();
+        assert_eq!(&got[..3], &[VER5, 1, METHOD_NONE]);
+        assert_eq!(&got[3..7], &[VER5, CMD_CONNECT, RSV, ATYP_DOMAIN]);
+        assert_eq!(got[7], 11);
+        assert_eq!(&got[8..19], b"example.com");
+        assert_eq!(&got[19..21], &443u16.to_be_bytes());
+        assert_eq!(got.len(), 21);
+    }
+
+    #[tokio::test]
+    async fn socks5_rejects_illegal_atyp_in_reply() {
+        let (port, _) = spawn_socks5_stub(StubMode::BadAtyp).await;
+        let e = establish(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            EgressProto::Socks5,
+            "example.com",
+            80,
+        )
+        .await
+        .expect_err("illegal atyp must reject");
+        assert!(e.contains("bad atyp"), "unexpected: {e}");
+    }
+
+    #[tokio::test]
+    async fn socks5_rejects_oversized_credentials() {
+        let long = "x".repeat(256);
+        let (port, _) = spawn_socks5_stub(StubMode::RequireAuth {
+            user: "u".to_string(),
+            pass: "p".to_string(),
+        })
+        .await;
+        let e = establish(
+            "127.0.0.1",
+            port,
+            Some(&long),
+            Some("p"),
+            EgressProto::Socks5,
+            "example.com",
+            80,
+        )
+        .await
+        .expect_err("256-byte username must reject");
+        assert!(e.contains("credentials too long"), "unexpected: {e}");
+    }
+
+    #[tokio::test]
+    async fn ipv6_targets_are_rejected_before_connect_write() {
+        let v5_port = spawn_greet_stub([VER5, METHOD_NONE]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let v4_port = listener.local_addr().expect("addr").port();
+        for (proto, port) in [
+            (EgressProto::Socks5, v5_port),
+            (EgressProto::Socks4, v4_port),
+        ] {
+            let e = establish("127.0.0.1", port, None, None, proto, "::1", 80)
+                .await
+                .expect_err("ipv6 target must reject");
+            assert!(
+                e.contains("ipv6 target not supported"),
+                "{proto:?} unexpected: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn socks4_domain_target_uses_4a_form() {
+        let (port, seen) = spawn_socks4_stub(SOCKS4_GRANTED).await;
+        establish(
+            "127.0.0.1",
+            port,
+            Some("bob"),
+            None,
+            EgressProto::Socks4,
+            "example.com",
+            8080,
+        )
+        .await
+        .expect("establish");
+        let got = seen.lock().clone();
+        assert_eq!(&got[..2], &[VER4, CMD_CONNECT]);
+        assert_eq!(&got[2..4], &8080u16.to_be_bytes());
+        assert_eq!(&got[4..8], &SOCKS4A_MARKER);
+        assert_eq!(&got[8..12], b"bob\0");
+        assert_eq!(&got[12..24], b"example.com\0");
+        assert_eq!(got.len(), 24);
+    }
+
+    #[tokio::test]
+    async fn socks4_rejected_reply_is_err() {
+        let (port, _) = spawn_socks4_stub(SOCKS4_REJECTED_CD).await;
+        let e = establish(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            EgressProto::Socks4,
+            "93.184.216.34",
+            80,
+        )
+        .await
+        .expect_err("cd!=0x5A must reject");
+        assert!(e.contains("cd=0x5b"), "unexpected: {e}");
     }
 }

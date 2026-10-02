@@ -19,7 +19,7 @@
 
 | 指标 | 值 | 复现命令 |
 | ---- | -- | -------- |
-| 单元测试通过数 | **274** | `cd gateway && cargo test --locked --workspace` |
+| 单元测试通过数 | **284** | `cd gateway && cargo test --locked --workspace` |
 | 单元测试失败数 | **0** | 同上 |
 | 忽略测试数 | **7** | 同上 |
 | 其中：真 live 测试 | **4** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
