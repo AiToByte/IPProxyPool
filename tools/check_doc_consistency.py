@@ -51,6 +51,9 @@ ALLOWLIST = [
     "docs/USAGE.md",
     "docs/DATAFLOW.md",
     "docs/QUALITY_BASELINE.md",
+    # 能力复核报告：§6 规模指标表声明"以 QUALITY_BASELINE 为准"，
+    # 故必须被门禁守住，否则该表会静默漂移。
+    "docs/CAPABILITY-AUDIT.md",
 ]
 
 # 历史文件：记录的是**某轮收官时的真实状态**。
@@ -76,6 +79,11 @@ EXPECTED_KEYS = {
     "docs/USAGE.md": {"tests"},
     "docs/DATAFLOW.md": {"tests"},
     "docs/QUALITY_BASELINE.md": {"tests", "live"},
+    # 必须与 ALLOWLIST 同时登记：只加 ALLOWLIST 而不加本表，等于"被扫描但
+    # 不做任何断言"，会给出虚假的安全感（曾实测：把该文件改成 999 单测，
+    # 门禁仍 exit=0）。§5 取证纪律那节直接以「284 单测」作反面教材，
+    # 该数字若漂移，本文件自身就失去说服力。
+    "docs/CAPABILITY-AUDIT.md": {"tests"},
 }
 
 
@@ -104,6 +112,21 @@ def main() -> int:
     baseline = parse_baseline()
     failures: list[str] = []
     checked: list[str] = []
+
+    # 两表必须同步：ALLOWLIST 里登记了 EXPECTED_KEYS 没有的条目 ⇒ 该文件被
+    # 扫描却不做任何断言，等于虚假安全感（实测：把 CAPABILITY-AUDIT 的
+    # 「284 单测」改成 999，门禁仍 exit=0）。这是结构性坑，靠人记不住，
+    # 故在此硬断言。
+    unasserted = sorted(set(ALLOWLIST) - set(EXPECTED_KEYS))
+    if unasserted:
+        print(
+            "[check-doc-consistency] FAIL: ALLOWLIST 与 EXPECTED_KEYS 不同步。\n"
+            f"这些文件被扫描但不做任何数字断言：{unasserted}\n"
+            "修法：给它们补上 EXPECTED_KEYS 条目（哪怕只声明实际用到的口径），"
+            "或从 ALLOWLIST 移除。",
+            file=sys.stderr,
+        )
+        return 1
 
     for rel in ALLOWLIST:
         path = REPO / rel
