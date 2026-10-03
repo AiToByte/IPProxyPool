@@ -30,6 +30,17 @@ log/*.exe
 log/*.dll
 log/*.pdb
 
+# --- .NET SDK 编译壳的构建产物（OPT-R16 E3）---
+# tools/sdk-dotnet/ipp_sdk.csproj 只是 CI 的编译验证壳，本机跑
+# `dotnet build` 会产出 bin/ 与 obj/（含 dll/pdb/project.assets.json 等
+# 21 个文件）。这些是构建产物，**不入库**——否则每次本地跑一次该门
+# 就会污染工作树，且 obj/ 里的绝对路径缓存（*.FileListAbsolute.txt、
+# *.nuget.g.props）在别的机器上必然失效。
+# 与 log/*.exe 同理：只限定目录，不用全局规则（避免误伤将来可能要入库的
+# 合法 .NET 源码或工具产物）。
+tools/sdk-dotnet/bin/
+tools/sdk-dotnet/obj/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

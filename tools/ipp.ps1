@@ -70,7 +70,34 @@ function Show-Port($Url, $Name) {
 # 注意：形参禁叫 $Args（自动变量 $args 会遮蔽它，V1 实测 mock 因此裸跑交互式 Python 即退）。
 # 本函数故意无形参：调用点位置实参全进自动 $args，原样转给 launcher。
 function Start-Detached {
-    & $PY log/launch_detached.py @args
+    # OPT-R16 E3：原实现是纯 `@args` 转发（无 param 块），调用点只能靠位置
+    # 猜含义。现给出显式签名，要点：
+    #  1. Exe/OutFile/ErrFile 必填且具名——这三个是固定契约，具名可读且
+    #     防错位（原先传反了不会报错，只会写到错误的日志文件）。
+    #  2. 尾部改用**具名数组** `$Rest` 而非 `ValueFromRemainingArguments`。
+    #     这不是风格偏好，是被 PSSA 逼出来的：那条规则在**调用方**报错，
+    #     而「任意多个透传参数」用剩余参数只能按位置传，等于无解。改成显式
+    #     数组参数后，调用点写 `-Rest @(...)`，既过门又保住变长契约。
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Exe,
+        [Parameter(Mandatory = $true)]
+        [string]$OutFile,
+        [Parameter(Mandatory = $true)]
+        [string]$ErrFile,
+        [Parameter()]
+        # 允许空数组但**不能省略**：网关启动就是「无尾部」的调用。若标
+        # Mandatory=$true，PowerShell 会抛 EmptyArrayNotAllowed（该约束是
+        # 「必须传值」，空数组不算值）——本轮实测踩到，会让网关启动路径直接失败。
+        # 显式写 -Rest @() 则是合法的「传了空数组」，故不标 Mandatory，
+        # 但调用点仍显式传空数组以表明「尾部确实为空」而非「忘了传」。
+        [AllowEmptyCollection()]
+        [string[]]$Rest = @()
+    )
+    # 必须保持 `launch_detached.py` 的**变长** argv 契约：该脚本读
+    # `sys.argv[4:]` 并原样透传给子进程，故 `$Rest` 原样展开，
+    # 不补空串、不加壳（补空串会让 mock 上游收到多余空 argv 而错位）。
+    & $PY log/launch_detached.py $Exe $OutFile $ErrFile @Rest
 }
 
 if ($Action -eq "status") {
@@ -126,16 +153,20 @@ function Wait-Port($Url, $Name, $Tries = 12, $Keyed = $false) {
 if ((Test-GwPort "http://127.0.0.1:8916/") -eq "200") {
     Write-Output "gw already listening, skip launch"
 } else {
-    Start-Detached $GW "log/gw.out" "log/gw.err"
-    [void](Wait-Port "http://127.0.0.1:8916/" "gw" 12 $true)
+    # OPT-R16 E3：Start-Detached 已改为具名参数；此处无变长尾部。
+    Start-Detached -Exe $GW -OutFile "log/gw.out" -ErrFile "log/gw.err" -Rest @()
+    [void](Wait-Port -Url "http://127.0.0.1:8916/" -Name "gw" -Tries 12 -Keyed $true)
 }
 if ($Mocks) {
     foreach ($m in @(@(8888, "mock-a-us", "mockA"), @(8889, "mock-b-jp", "mockB"), @(8890, "mock-c-gb", "mockC"))) {
         if ((Test-Port "http://127.0.0.1:$($m[0])/") -eq "200") {
             Write-Output "$($m[2]) already listening, skip"
         } else {
-            Start-Detached $PY "log/$($m[2]).out" "log/$($m[2]).err" "log/mock_upstream.py" "$($m[0])" $m[1]
-            [void](Wait-Port "http://127.0.0.1:$($m[0])/" $m[2] 6)
+            # OPT-R16 E3：三个固定契约参数具名；变长尾部用 -Rest 数组显式传入。
+            # 上游 mock 的 argv 契约：<script> <port> <keyed>（见 log/mock_upstream.py）。
+            Start-Detached -Exe $PY -OutFile "log/$($m[2]).out" -ErrFile "log/$($m[2]).err" `
+                -Rest @("log/mock_upstream.py", "$($m[0])", "$($m[1])")
+            [void](Wait-Port -Url "http://127.0.0.1:$($m[0])/" -Name $m[2] -Tries 6)
         }
     }
 }

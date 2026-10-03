@@ -59,13 +59,23 @@ def check_dotnet() -> int:
         [dotnet, "build", str(DOTNET_PROJ), "--nologo", "-v", "quiet"],
         cwd=REPO,
         capture_output=True,
-        text=True,
+        # OPT-R16 E1：`dotnet build` 的输出含中文与本地代码页字符，
+        # `text=True` 会用 locale 默认编码解码；在中文 Windows 上是 GBK，
+        # 遇到 UTF-8 字节直接抛 UnicodeDecodeError。该异常发生在
+        # `_readerthread` 里，**吞掉了真实的编译错误**，随后 `proc.stdout`
+        # 变成 None，再触发 `TypeError: 'NoneType' object is not
+        # subscriptable` ——两层异常叠加，门禁报出的信息完全不可读。
+        # 显式指定 errors="replace" 让解码永不失败，保住真实报错。
+        encoding="utf-8",
+        errors="replace",
         timeout=600,
     )
     if proc.returncode != 0:
         print("[check-jvm-sdk] FAIL: dotnet build failed", file=sys.stderr)
-        print(proc.stdout[-4000:], file=sys.stderr)
-        print(proc.stderr[-4000:], file=sys.stderr)
+        # `proc.stdout` 理论上可为 None（异常路径），用 or "" 兜底，
+        # 避免门禁自身崩溃而掩盖真正的编译错误。
+        print((proc.stdout or "")[-4000:], file=sys.stderr)
+        print((proc.stderr or "")[-4000:], file=sys.stderr)
         return 1
     print("[check-jvm-sdk] dotnet build: OK")
     return 0
@@ -85,13 +95,17 @@ def check_java() -> int:
             [javac, "-d", tmp, str(JAVA_SRC)],
             cwd=REPO,
             capture_output=True,
-            text=True,
+            # OPT-R16 E1：同 check_dotnet 的理由——javac 在中文 Windows 上
+            # 也输出本地代码页字节，text=True 会按 GBK 解码而抛
+            # UnicodeDecodeError，进而让门禁报不出真正的编译错误。
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
         )
     if proc.returncode != 0:
         print("[check-jvm-sdk] FAIL: javac failed", file=sys.stderr)
-        print(proc.stdout[-4000:], file=sys.stderr)
-        print(proc.stderr[-4000:], file=sys.stderr)
+        print((proc.stdout or "")[-4000:], file=sys.stderr)
+        print((proc.stderr or "")[-4000:], file=sys.stderr)
         return 1
     print("[check-jvm-sdk] javac: OK")
     return 0

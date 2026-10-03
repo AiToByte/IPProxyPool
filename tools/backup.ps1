@@ -166,7 +166,10 @@ function Assert-TarHasEntries($TarPath, $MinEntries, $Label) {
     }
     Write-Output ($Label + " archive OK (" + $entries.Count + " entries, " + [math]::Round($size / 1KB, 1) + " KB)")
 }
-Assert-TarHasEntries (Join-Path $dst "clickhouse-data.tar") 3 "clickhouse"
-Assert-TarHasEntries (Join-Path $dst "grafana-data.tar") 1 "grafana"
+# OPT-R16 E3：改用具名参数。原为位置参数，被 PSSA 的
+# PSAvoidUsingPositionalParameters 命中（CI run 37112516372 失败点）。
+# 具名参数让调用点自解释，且未来在中间插入新参数不会静默错位。
+Assert-TarHasEntries -TarPath (Join-Path $dst "clickhouse-data.tar") -MinEntries 3 -Label "clickhouse"
+Assert-TarHasEntries -TarPath (Join-Path $dst "grafana-data.tar") -MinEntries 1 -Label "grafana"
 
 Write-Output "ALL BACKUP DONE (restore: see docs/OPERATION.md)"

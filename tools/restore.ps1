@@ -174,13 +174,14 @@ Write-Output "[3/5] replaying ClickHouse data volume ..."
 # tar 回放进卷（覆盖卷内容）。用 redis:7-alpine 做 tar 工具（镜像已在本机）。
 docker run --rm -v "${chVolume}:/dst" -v "${src}:/src:ro" redis:7-alpine `
     sh -c "tar -xf /src/clickhouse-data.tar -C /dst" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "clickhouse tar replay failed — stop and inspect volume " + $chVolume }
+# OPT-R16 E3：改用具名参数（PSAvoidUsingPositionalParameters）。
+if ($LASTEXITCODE -ne 0) { Fail -msg "clickhouse tar replay failed — stop and inspect volume " + $chVolume }
 Write-Output "      clickhouse volume replayed"
 
 Write-Output "[4/5] replaying Grafana data volume ..."
 docker run --rm -v "${gfVolume}:/dst" -v "${src}:/src:ro" redis:7-alpine `
     sh -c "tar -xf /src/grafana-data.tar -C /dst" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "grafana tar replay failed — stop and inspect volume " + $gfVolume }
+if ($LASTEXITCODE -ne 0) { Fail -msg "grafana tar replay failed — stop and inspect volume " + $gfVolume }
 Write-Output "      grafana volume replayed"
 
 Write-Output "[5/5] starting services and reconciling ..."
