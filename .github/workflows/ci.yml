@@ -353,8 +353,16 @@ jobs:
               $failed = $true
             }
             $errors = $null
+            # OPT-R16 E5：必须显式 `-Encoding UTF8`。原写法 `Get-Content -Raw`
+            # 不带编码，在 GitHub Windows runner 上按 **ANSI 代码页**（取决于
+            # runner 区域设置）读取带 BOM 的 UTF-8 文件，中文注释被解成乱码，
+            # 进而可能破坏字符串/引号配对 → PSParser 报出并不存在的语法错。
+            # 该步骤此前从未真正执行过（#3 PSScriptAnalyzer 一直先失败，
+            # 它被标 skipped），所以问题一直被掩盖到 OPT-R16 E3 修好 #3 之后。
+            # 本机（中文 Windows，ANSI=GBK）复现不出差异，故按「显式指定编码
+            # 消除环境依赖」的思路修，而不是猜测具体代码页。
             [System.Management.Automation.PSParser]::Tokenize(
-              (Get-Content -LiteralPath $f.FullName -Raw), [ref]$errors) | Out-Null
+              (Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8), [ref]$errors) | Out-Null
             if ($errors -and $errors.Count -gt 0) {
               foreach ($e in $errors) {
                 Write-Error "PARSE ERROR $($f.Name): line $($e.Token.StartLine) — $($e.Message)"
