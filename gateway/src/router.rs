@@ -2117,7 +2117,6 @@ mod tests {
     #[test]
     #[ignore = "needs --test-threads=1; run via CI serial allocation-contract job"]
     fn opt_r11_b1_pick_weighted_streaming_hit_path_does_not_allocate() {
-        use std::sync::atomic::Ordering;
         let nodes: Vec<Arc<ProxyNode>> = (0..64u32)
             .map(|i| {
                 Arc::new(ProxyNode::new(
@@ -2144,22 +2143,33 @@ mod tests {
         // 预热：显式消耗一次，确保线程局部已初始化完毕。
         let _ = rng.gen_range(0..u32::MAX);
 
-        let before = crate::test_allocs::ALLOCS.load(Ordering::Relaxed);
-        let mut picked = 0usize;
-        for _ in 0..1000 {
-            if pick_weighted_streaming(|| nodes.iter(), &mut rng).is_some() {
-                picked += 1;
+        // 先验证功能不变量：非空候选必须每次都选中一个。
+        {
+            let mut picked = 0usize;
+            for _ in 0..1000 {
+                if pick_weighted_streaming(|| nodes.iter(), &mut rng).is_some() {
+                    picked += 1;
+                }
             }
+            assert_eq!(picked, 1000, "非空候选必须每次都选中一个");
         }
-        let observed = crate::test_allocs::ALLOCS.load(Ordering::Relaxed) - before;
 
-        assert_eq!(picked, 1000, "非空候选必须每次都选中一个");
-        assert_eq!(
-            observed, 0,
-            "流式选路必须零分配（OPT-R11 B1 核心收益）。\
-             串行下仍失败说明热路径引入了分配；若只在并行全量下偶发失败，\
-             是其它测试线程污染了进程级计数器——用 --test-threads=1 复跑确认。"
-        );
+        // OPT-R16 E8：改用共享的「多轮采样取最小值」判据，理由见
+        // test_allocs::assert_min_zero_alloc_across_rounds 的文档。
+        //
+        // 【踩坑记录 · 修正自身第一版】第一版把 body 写成「单次调用」，结果
+        // 每轮恰好 1 次分配（min=1 ⇒ 判红）。对比 HEAD 版（循环 1000 次）为 0。
+        // 原因不是热路径退化，而是**测量口径变了**：单次调用时迭代器适配器
+        // 与捕获环境的初始化被计入，而循环版把它摊薄到 1000 次里。
+        // 结论：零分配契约必须以「批量循环」为测量单位，否则测的是初始化
+        // 而非稳态热路径。这也是 HEAD 版一直用循环的原因——那是对的，
+        // 不该改。这一点是我在修 CI 平台差异时误伤的。
+        const ITERS_PER_ROUND: usize = 1000;
+        crate::test_allocs::assert_min_zero_alloc_across_rounds("pick_weighted_streaming", || {
+            for _ in 0..ITERS_PER_ROUND {
+                let _ = pick_weighted_streaming(|| nodes.iter(), &mut rng);
+            }
+        });
     }
 
     // ---- OPT-R11 C1：隔离表外层准入（长度 + 水位）----

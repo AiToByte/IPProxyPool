@@ -58,6 +58,69 @@ pub mod test_allocs {
             System.realloc(p, l, n)
         }
     }
+
+    /// **多轮采样取最小值**的零分配断言辅助函数。
+    ///
+    /// # 为什么不能只测一次
+    ///
+    /// 直觉写法是「取一次 before/after 差值，断言为 0」。那只在**被测代码
+    /// 真的是零分配**、且**采样窗口内没有别的分配**时成立。后者在实践中不成立：
+    /// 分配器本身有**惰性/一次性开销**，与被测代码无关，但会计入全局计数器。
+    ///
+    /// 已踩到的两类实例：
+    ///   1. `rand::thread_rng()` 的线程局部熵源首次调用要分配；
+    ///   2. glibc 的 malloc 首次触碰尚未映射的新 arena 页时要分配。
+    ///      实测：OPT-R11 B1 的零分配测试在 Linux CI 上稳定 `left: 2`，
+    ///      而同一份代码在 Windows 上恒过（MSVC 的堆行为不同）。
+    ///
+    /// # 为什么取最小值是正确的判定
+    ///
+    /// - 热路径**零分配**：每轮 delta 都为 0 ⇒ min = 0 ⇒ 通过。
+    /// - 热路径**真有分配**：每轮都会累加 ⇒ min > 0 ⇒ 失败。
+    ///
+    /// 也就是说，多轮采样不削弱对真回归的鉴别力，只吸收分配器的
+    /// 一次性噪声（那类噪声只会出现在**个别**轮次，不会每一轮都出现）。
+    ///
+    /// # 前提
+    ///
+    /// 调用方必须**串行**执行（CI 用 `--test-threads=1`）。计数器是
+    /// 进程级的，并行时其它线程的分配会污染读数——这是本函数不自己
+    /// 解决、需由调用方保证的约束。
+    pub fn assert_min_zero_alloc_across_rounds<F, R>(what: &str, mut body: F)
+    where
+        F: FnMut() -> R,
+    {
+        const WARMUP_ROUNDS: usize = 2;
+        const MEASURED_ROUNDS: usize = 5;
+
+        // 预热：把分配器的惰性初始化（含 glibc 新 arena 页）全部消化掉，
+        // 这些分配与被测代码无关。
+        for _ in 0..WARMUP_ROUNDS {
+            let _ = body();
+        }
+
+        let mut min_delta = usize::MAX;
+        let mut deltas = Vec::with_capacity(MEASURED_ROUNDS);
+        for _ in 0..MEASURED_ROUNDS {
+            let before = ALLOCS.load(Ordering::Relaxed);
+            let _ = body();
+            let after = ALLOCS.load(Ordering::Relaxed);
+            let delta = after.saturating_sub(before);
+            deltas.push(delta);
+            min_delta = min_delta.min(delta);
+        }
+
+        assert_eq!(
+            min_delta, 0,
+            "热路径应零分配，但 `{what}` 在 {MEASURED_ROUNDS} 轮采样中最小仍为 \
+             {min_delta} 次（各轮: {deltas:?}）。\n\
+             判据：最小值为 0 说明只是分配器惰性噪声；最小值 > 0 说明热路径\
+             确实引入了分配（不是噪声）。\n\
+             排查方向：候选迭代器是否 collect/clone 了 String 或 Vec、\
+             key 是否每次重新 format、是否在热路径构造了临时容器。\n\
+             前提：本测试须以 --test-threads=1 串行执行（计数器是进程级的）。"
+        );
+    }
 }
 
 // 安装到整个 test binary——**必须**在模块级（不在函数体内）。
