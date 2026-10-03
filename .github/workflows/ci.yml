@@ -126,6 +126,13 @@ jobs:
         # 缺 BOM 时 Windows PowerShell 5.1 会按 GBK 代码页解析中文注释 →
         # 乱码乃至解析失败（事故背景见 docs/FREE_BASELINE.md）。
         run: python3 tools/check_ps1_bom.py
+      # OPT-R16 E6: static gate for shell: powershell steps (PS 5.1) whose
+      # run: body must stay pure ASCII. Added because run 37117250483 step #4
+      # failed with "Missing closing ')'" caused by an em dash inside the
+      # step's own script, which the runner truncated mid-string. The error
+      # pointed at the runner's temp .ps1, so it was not reproducible locally.
+      - name: CI shell compatibility (PS 5.1 run blocks stay ASCII)
+        run: python3 tools/check_ci_shell_compat.py
       - name: No plaintext credentials in process argv (OPT-R8 A5)
         # 凭据进 argv 会被同机任意用户读到（Get-CimInstance Win32_Process /
         # /proc/<pid>/cmdline）。正确做法是环境变量（REDISCLI_AUTH /
@@ -294,37 +301,45 @@ jobs:
       # 这正是本 job 的意义所在。
       - name: PSScriptAnalyzer (Windows PowerShell 5.1)
         shell: powershell
+        # OPT-R16 E6: keep the `run:` body pure ASCII.
+        # `shell: powershell` is Windows PowerShell 5.1, which receives this
+        # block as a generated .ps1 file encoded from the runner's code page.
+        # Any non-ASCII byte (CJK comments, em dash U+2014, etc.) can be
+        # truncated mid-string, which cascades into bogus parser errors such
+        # as "Missing closing ')'" / "string is missing the terminator".
+        # Evidence: run 37117250483 step #4 failed with exactly those errors
+        # while the script itself was valid. All rationale prose therefore
+        # lives HERE (YAML comments, never parsed by PowerShell), not inside
+        # the run block.
+        #
+        # Rationale for a version pin: PSGallery packages can be re-published
+        # by their authors, so a floating version makes the same source yield
+        # different verdicts over time. Pinned to an exact version.
+        #
+        # Rationale for a whitelist (-IncludeRule) rather than a blacklist
+        # (-ExcludeRule):
+        #   * The rule set stays FIXED and is immune to new rules appearing in
+        #     newer PSScriptAnalyzer releases. Under a blacklist, an upgrade
+        #     can turn existing code red for reasons unrelated to any real
+        #     defect being introduced.
+        #   * It cannot fail on first run merely because the count of
+        #     pre-existing warnings is unknown (we cannot install PSSA locally,
+        #     so we cannot enumerate them beforehand).
+        #   * Clearer semantics: we are only accountable for the rules we
+        #     explicitly opted into.
+        #
+        # Whitelist criterion: rules that can cause REAL failures (uninitialized
+        # variable, alias shadowing a built-in cmdlet, ambiguous positional
+        # parameters, hardcoded credentials) rather than style rules.
         run: |
-          # 版本锁定：PSGallery 上的包可被作者重发布，浮动版本会让同一份代码
-          # 在不同时间得到不同结论（CI 变成薛定谔的绿）。锁定到具体版本。
-          # 本机装不上（NuGet provider 缺失，PSGallery 供应链问题）⇒ 该检查
-          # **未在本地实证**，由 CI 首次运行确认；这是已知取舍，已登记。
           Install-Module PSScriptAnalyzer -RequiredVersion 1.21.0 `
             -Scope CurrentUser -Force -ErrorAction Stop
           Import-Module PSScriptAnalyzer -RequiredVersion 1.21.0
-          # OPT-R9 B2：从「只查 Error」改为「**只查白名单规则**」。
-          #
-          # 为何用白名单（-IncludeRule）而不是黑名单（-ExcludeRule）：
-          #   * 规则集**固定**，不受 PSScriptAnalyzer 新版本新增规则影响 ——
-          #     黑名单下，升级引入的新规则会让存量代码突然红，而「为什么红」
-          #     与「是不是真问题」没有必然关系；
-          #   * 不会因存量告警数量未知而使 CI 首次运行直接失败（本机无法安装
-          #     PSSA，**无法预先枚举存量告警**，这是选择白名单的直接原因）；
-          #   * 语义更清晰：只对我们**明确想要**的规则负责。
-          #
-          # 白名单规则的选择标准：**会造成真实故障**的那一类
-          # （未初始化变量、别名覆盖内置 cmdlet、命令参数歧义、硬编码凭据），
-          # 而非风格类（命名/大写/缩进）。
           $results = Invoke-ScriptAnalyzer -Path tools -Recurse -IncludeRule @(
-            # 引用了未初始化的变量 → 运行期取到 $null，行为不可预期
             'PSUseDeclaredVarsMoreThanAssignments',
-            # Write-Host / echo 的别名遮蔽内置 cmdlet
             'PSAvoidUsingCmdletAliases',
-            # 参数位置歧义（switch 传值）
             'PSAvoidUsingPositionalParameters',
-            # 明文口令（本仓 .env 开发缺省属设计内，但仍要求显式确认才放行）
             'PSAvoidUsingPlainTextForPassword',
-            # 缺少 [CmdletBinding()] 却用 $args 自动变量
             'PSReviewUnusedParameter'
           )
           if ($results) {
@@ -336,12 +351,32 @@ jobs:
           Write-Output "PSScriptAnalyzer (whitelisted rules): clean"
       - name: PowerShell 5.1 parse check (encoding + syntax)
         shell: powershell
+        # OPT-R16 E6: keep the `run:` body pure ASCII (same reason as the
+        # PSScriptAnalyzer step above).
+        #
+        # What this checks, per file under tools/:
+        #   1. Parse errors (unbalanced brackets/quotes/structure) via
+        #      PSParser::Tokenize.
+        #   2. Missing UTF-8 BOM. Windows PowerShell 5.1 reads a BOM-less
+        #      .ps1 as ANSI/code page, which garbles CJK comments and can
+        #      cause real parse failures. This repo has hit it before; see
+        #      docs/FREE_BASELINE.md.
+        # Parse only, never execute: no Docker, no gateway, no credentials.
+        # This is a purely static gate.
+        #
+        # Corrected diagnosis (OPT-R16 E6 supersedes E5):
+        # E5 blamed `Get-Content -Raw` for reading with the ANSI code page
+        # and added `-Encoding UTF8`. That was WRONG: the failure was not in
+        # the file being read, it was in THIS step's own generated .ps1.
+        # The runner emitted the run block as a .ps1 in PS 5.1; the em dash
+        # (U+2014) inside the Write-Error string below was truncated
+        # mid-string, so the string never closed and every following line got
+        # swallowed into it -- surfacing as "Missing closing ')'" and
+        # "The string is missing the terminator", all pointing at
+        # D:\a\_temp\<uuid>.ps1 rather than at any repo file.
+        # `-Encoding UTF8` is kept because it is correct and explicit, but
+        # the actual fix is ASCII-only run bodies.
         run: |
-          # 用**生产同款**的 5.1 解析器逐文件校验：
-          #   ① 解析错误（括号/引号/结构）——PSParser 的 Tokenize 会抛；
-          #   ② BOM 缺失（PS 5.1 按 ANSI 代码页读无 BOM 文件，中文注释会乱码
-          #      并可能引发解析故障——仓库已踩过，见 docs/FREE_BASELINE.md）。
-          # 只解析不执行：无需 Docker/网关/凭据，纯静态门。
           $failed = $false
           $files = Get-ChildItem -Path tools -Filter *.ps1 -Recurse
           foreach ($f in $files) {
@@ -349,23 +384,15 @@ jobs:
             $hasBom = ($bytes.Length -ge 3 -and
                        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
             if (-not $hasBom) {
-              Write-Error "MISSING UTF-8 BOM: $($f.Name)  (PS 5.1 parses BOM-less .ps1 as ANSI/GBK)"
+              Write-Error "MISSING UTF-8 BOM: $($f.Name) -- PS 5.1 reads BOM-less .ps1 as ANSI"
               $failed = $true
             }
             $errors = $null
-            # OPT-R16 E5：必须显式 `-Encoding UTF8`。原写法 `Get-Content -Raw`
-            # 不带编码，在 GitHub Windows runner 上按 **ANSI 代码页**（取决于
-            # runner 区域设置）读取带 BOM 的 UTF-8 文件，中文注释被解成乱码，
-            # 进而可能破坏字符串/引号配对 → PSParser 报出并不存在的语法错。
-            # 该步骤此前从未真正执行过（#3 PSScriptAnalyzer 一直先失败，
-            # 它被标 skipped），所以问题一直被掩盖到 OPT-R16 E3 修好 #3 之后。
-            # 本机（中文 Windows，ANSI=GBK）复现不出差异，故按「显式指定编码
-            # 消除环境依赖」的思路修，而不是猜测具体代码页。
             [System.Management.Automation.PSParser]::Tokenize(
               (Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8), [ref]$errors) | Out-Null
             if ($errors -and $errors.Count -gt 0) {
               foreach ($e in $errors) {
-                Write-Error "PARSE ERROR $($f.Name): line $($e.Token.StartLine) — $($e.Message)"
+                Write-Error "PARSE ERROR $($f.Name): line $($e.Token.StartLine) -- $($e.Message)"
               }
               $failed = $true
             }
