@@ -73,3 +73,12 @@ data/
 
 # --- 备份输出（tools/backup.ps1 默认写 backup/<stamp>/，大体积不进仓） ---
 /backup/
+
+# --- 端到端压测工具（OPT-R16 B）---
+# tools/bench/ 只入库源码（main.go + go.mod），以下均为构建/运行产物：
+#   bench_server.exe  go build 产出（~9MB，每次编译都会变）
+#   *.err / *.txt     上游与网关的 stderr 重定向、pid 记录
+# 与 log/ 同理：只限定目录，不用全局规则。
+tools/bench/*.exe
+tools/bench/*.err
+tools/bench/*.txt
