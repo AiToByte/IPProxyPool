@@ -85,6 +85,61 @@ def _kill_all():
 atexit.register(_kill_all)
 
 
+def clean_env(extra: dict | None = None) -> dict:
+    """给子进程用的环境：显式剥离代理变量。
+
+    # 为什么（OPT-R16 B 排查结论）
+    Go 的 http.Client 在自建 Transport 时默认直连（Proxy=nil），不读环境——
+    所以本轮的反常曲线**不是**代理造成的（已证伪）。但压测数据若经过用户的
+    前置代理（如 Clash），测出的就是代理的产能而非被测组件，**必须**在源头
+    掐掉这种可能，而不是靠"当前 shell 恰好没设"这种运气。
+    urllib 则相反：默认读环境代理，故 urllib 探针必须显式 ProxyHandler({})。
+    """
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+              "ALL_PROXY", "all_proxy"):
+        env.pop(k, None)
+    # 127.0.0.1/localhost 永不走代理（双保险：客户端已直连，这里防其它工具）。
+    cur = env.get("NO_PROXY", env.get("no_proxy", ""))
+    need = {"localhost", "127.0.0.1"}
+    have = {x.strip() for x in cur.split(",") if x.strip()}
+    env["NO_PROXY"] = ",".join(sorted(have | need))
+    env.pop("no_proxy", None)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def ports_in_use(ports: list[int]) -> list[tuple[int, int]]:
+    """返回 [(port, pid)]：这些端口已被占用。压测前必须全空。"""
+    import socket as _socket
+    busy = []
+    for p in ports:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            busy.append((p, _port_pid(p)))
+        finally:
+            s.close()
+    return busy
+
+
+def _port_pid(port: int) -> int:
+    try:
+        import subprocess as _sp
+        out = _sp.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=15).stdout
+        for line in out.splitlines():
+            if f"127.0.0.1:{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                return int(parts[-1])
+    except Exception:
+        pass
+    return -1
+
+
 def log(msg=""):
     print(msg, flush=True)
 
@@ -118,11 +173,14 @@ def start_upstreams() -> int:
         _started.append(subprocess.Popen(
             [BENCH_EXE, "serve", "-addr", f"127.0.0.1:{port}"],
             stdout=subprocess.DEVNULL, stderr=errf,
+            env=clean_env(),
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP))
     time.sleep(1.5)
     for i in range(N_UP):
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{UP_BASE+i}/", timeout=4) as r:
+            # urllib 默认读环境代理，必须显式绕过（见 clean_env 文档）。
+            nop = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with nop.open(f"http://127.0.0.1:{UP_BASE+i}/", timeout=4) as r:
                 r.read()
                 ok += 1
         except Exception:
@@ -138,8 +196,7 @@ def start_gateway() -> bool:
     nodes = ",".join(
         f"127.0.0.1:{UP_BASE+i}:residential:{UP_COUNTRY}:bench-up:{100}"
         for i in range(N_UP))
-    env = dict(os.environ)
-    env.update({
+    env = clean_env({
         "TEST_POOL_NODES": nodes,
         "GATEWAY_ADDR": f"127.0.0.1:{GW_PORT}",
         "METRICS_ADDR": f"127.0.0.1:{METRICS_PORT}",
@@ -148,6 +205,16 @@ def start_gateway() -> bool:
         "FREE_ENABLED": "0",
         "GATEWAY_GRACE_SECS": "86400",
     })
+    # 上一次的网关日志先归档，避免"失败现场被下一次运行覆盖"——
+    # 本轮排查时就因为 gw.err 被覆写，丢掉了关键 runs 的拒因日志。
+    try:
+        if os.path.isfile(GW_LOG):
+            prev = GW_LOG + ".prev"
+            if os.path.isfile(prev):
+                os.remove(prev)
+            os.rename(GW_LOG, prev)
+    except Exception:
+        pass
     errf = open(GW_LOG, "wb")
     _started.append(subprocess.Popen(
         [GW_EXE], env=env, stdout=subprocess.DEVNULL, stderr=errf,
@@ -161,25 +228,82 @@ def start_gateway() -> bool:
 
 def gw_alive() -> bool:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{METRICS_PORT}/metrics", timeout=2) as r:
+        nop = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with nop.open(f"http://127.0.0.1:{METRICS_PORT}/metrics", timeout=2) as r:
             r.read()
             return True
     except Exception:
         return False
 
 
-def run_client(port, conc, n, country=None, label=""):
+def run_client(target_port, host_port, conc, n, country=None, label="",
+               api_key="bench-key"):
+    """跑一次压测客户端。target_port 决定连谁，host_port 决定 Host 头。
+
+    # 血的教训（OPT-R16 B）
+    第一版把 `-target` 硬编码成网关端口，导致"地板测量"实际走的也是网关，
+    测出的 floor=0 毫无意义，还误导了后续判断。此后 target 必须显式传入：
+      - 地板：target=上游端口（直连，不经过网关）
+      - 端到端：target=网关端口（经网关转发）
+    """
     args = [BENCH_EXE, "client",
-            "-target", f"http://127.0.0.1:{GW_PORT}/",
-            "-host-header", f"127.0.0.1:{port}",
+            "-target", f"http://127.0.0.1:{target_port}/",
+            "-host-header", f"127.0.0.1:{host_port}",
             "-c", str(conc), "-n", str(n),
-            "-mode", "host", "-api-key", "bench-key",
+            "-mode", "host",
             "-label", label or f"conc={conc}"]
+    if api_key:
+        args += ["-api-key", api_key]
     if country:
         args += ["-country", country]
+    env = clean_env()
     r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=1800)
+                       errors="replace", timeout=1800, env=env)
     return parse(r.stdout or "")
+
+
+def wait_ready(timeout_s=90) -> bool:
+    """就绪门：/metrics 可达 ≠ 可服务。
+
+    # 为什么需要
+    start_gateway 只等 /metrics 可达就返回，但网关的 8916 监听、候选池连接、
+    Prober 首轮验证都可能还没完成。若阶梯立即开跑，前几档测的是"启动中"
+    而非"稳态"，数据不可用。本轮就出现过"低并发全失败、高并发恢复"的
+    反常曲线，事后无法区分是启动窗口还是真问题——因为没有就绪证据。
+
+    # 做法
+    用与正式压测完全相同的路径（Go 客户端 → 网关 → 上游）打小批量，
+    连续 3 次全成功才放行；超时则打印网关日志尾部并失败。
+    """
+    log("  --- readiness: same path as the bench, small batches ---")
+    deadline = time.time() + timeout_s
+    streak = 0
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        d = run_client(GW_PORT, UP_BASE, 2, 10,
+                       country=UP_COUNTRY, label=f"ready#{attempt}")
+        ok, tot = d.get("ok", 0), d.get("ok", 0) + d.get("err", 0)
+        status = d.get("status", {})
+        if tot == 10 and ok == 10:
+            streak += 1
+            log(f"    attempt {attempt}: 10/10 ok (streak {streak}/3)")
+            if streak >= 3:
+                log("    READY")
+                return True
+        else:
+            log(f"    attempt {attempt}: {ok}/{tot} ok  status={status}  "
+                f"errors={d.get('errors', [])[:1]}")
+            streak = 0
+        time.sleep(2.0)
+    log(f"  [FAIL] gateway not ready within {timeout_s}s; tail of {GW_LOG}:")
+    try:
+        with open(GW_LOG, "r", encoding="utf-8", errors="replace") as f:
+            for line in f.readlines()[-12:]:
+                log(f"    {line.rstrip()}")
+    except Exception:
+        pass
+    return False
 
 
 def parse(out: str) -> dict:
@@ -196,6 +320,11 @@ def parse(out: str) -> dict:
     m = re.search(r"p99\s+([0-9.]+)(ms|µs|s|ns)", out)
     if m:
         d["p99"] = f"{m.group(1)}{m.group(2)}"
+    # 状态码分布与错误采样：失败诊断的第一手证据（见 main.go 注释）。
+    m = re.search(r"status\s*=\s*map\[([^\]]*)\]", out)
+    d["status"] = m.group(1).strip() if m else ""
+    errs = re.findall(r"err\[\d+\]\s*=\s*(.+)", out)
+    d["errors"] = [e.strip()[:160] for e in errs[:3]]
     return d
 
 
@@ -216,6 +345,19 @@ def main() -> int:
         log(f"  [FAIL] {BENCH_EXE} missing and --skip-build given")
         return 1
 
+    # 启动前断言端口全空：残留的上游/网关会让新实例绑端口失败（或 urllib
+    # 自检连到旧实例），而失败是静默的——随后所有数据都不可信。
+    # 本轮排查时就遇到过"自检连到残留进程"的情形。
+    need = [GW_PORT, METRICS_PORT] + [UP_BASE + i for i in range(N_UP)]
+    busy = ports_in_use(need)
+    if busy:
+        log("  [FAIL] ports already in use; stop the stale processes first:")
+        for port, pid in busy:
+            log(f"    127.0.0.1:{port}  pid={pid}")
+        return 1
+    log(f"  ports {GW_PORT},{METRICS_PORT},{UP_BASE}..{UP_BASE+N_UP-1} all free")
+    log()
+
     n = start_upstreams()
     log(f"  upstream: {n}/{N_UP} ready on {UP_BASE}..{UP_BASE+N_UP-1}")
     if n == 0:
@@ -224,17 +366,27 @@ def main() -> int:
     log()
 
     if not args.skip_floor:
-        log("  --- floor: client -> upstream directly (no gateway) ---")
+        log("  --- floor: client -> upstream DIRECTLY (no gateway) ---")
+        log("  （注意：第一版这里误把 target 写成网关端口，导致 floor 实际")
+        log("   走的也是网关，floor=0 毫无意义。现已修正为直连上游。）")
         floors = []
         for conc in (64, 256):
-            d = run_client(UP_BASE, conc, conc * 200, country=None,
+            d = run_client(UP_BASE, UP_BASE, conc, conc * 200,
+                           country=None, api_key="",
                            label=f"floor conc={conc}")
             if "qps" in d and d["qps"] > 0:
                 floors.append(d["qps"])
                 log(f"    conc={conc:4d}  QPS={d['qps']:10.1f}  "
                     f"ok={d.get('ok', 0)}  p99={d.get('p99', '-')}")
+            else:
+                log(f"    conc={conc:4d}  FAILED  status={d.get('status','')}  "
+                    f"errors={d.get('errors', [])[:1]}")
         floor = max(floors) if floors else 0.0
         log(f"    floor = {floor:,.0f} QPS")
+        if floor <= 0:
+            log("  [FAIL] floor is zero: the client/upstream path itself is "
+                "broken; e2e numbers would be meaningless. fix that first.")
+            return 1
         log()
 
     if not start_gateway():
@@ -246,7 +398,10 @@ def main() -> int:
         except Exception:
             pass
         return 1
-    log(f"  gateway up on 127.0.0.1:{GW_PORT}")
+    log(f"  gateway up on 127.0.0.1:{GW_PORT} (/metrics reachable)")
+    log()
+    if not wait_ready():
+        return 1
     log()
 
     log("  --- end-to-end: client -> gateway -> upstream ---")
@@ -256,17 +411,21 @@ def main() -> int:
     log()
     rows = []
     for conc in [int(x) for x in args.ladder.split(",")]:
-        d = run_client(UP_BASE, conc, conc * args.per_conc,
+        d = run_client(GW_PORT, UP_BASE, conc, conc * args.per_conc,
                        country=UP_COUNTRY, label=f"e2e conc={conc}")
         if "qps" not in d:
-            log(f"  conc={conc:4d}  (no parsable output; gateway down?)")
+            log(f"  conc={conc:4d}  (no parsable output; gateway down?)  "
+                f"status={d.get('status','')}  errors={d.get('errors', [])[:1]}")
             continue
         rows.append((conc, d))
         tot = d.get("ok", 0) + d.get("err", 0)
         rate = 100.0 * d["ok"] / tot if tot else 0.0
+        extra = ""
+        if rate < 100.0:
+            extra = f"  status={d.get('status','')}  errors={d.get('errors', [])[:1]}"
         log(f"  conc={conc:4d}  QPS={d['qps']:9.1f}  success={rate:6.2f}%  "
             f"({d.get('ok',0)}/{tot})  p50={d.get('p50','-'):>9}  "
-            f"p99={d.get('p99','-'):>9}")
+            f"p99={d.get('p99','-'):>9}{extra}")
 
     if rows:
         peak = max(rows, key=lambda r: r[1]["qps"])

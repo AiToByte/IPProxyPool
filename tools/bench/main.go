@@ -116,6 +116,13 @@ func cmdClient(args []string) int {
 
 	newTransport := func() *http.Transport {
 		return &http.Transport{
+			// 显式直连：Transport.Proxy 的零值本就是 nil（直连），但这里必须
+			// 写出来——否则后人会怀疑"是不是走了系统代理"（Go 的 DefaultTransport
+			// 才读环境变量，自建 Transport 默认直连）。压测数据若经过用户
+			// 的前置代理（如 Clash），测出的就是代理的产能而非被测组件。
+			// 血的教训：本轮曾长时间怀疑代理干扰，却因客户端不报状态码而
+			// 无法证实也无法证伪，只能靠排除法。
+			Proxy:               nil,
 			MaxIdleConns:        4096,
 			MaxIdleConnsPerHost: 4096,
 			MaxConnsPerHost:     0,
@@ -150,19 +157,34 @@ func cmdClient(args []string) int {
 
 	var wg sync.WaitGroup
 	start := time.Now()
+	// 状态码分布 + 错误采样：没有这两样，失败时就是黑盒。
+	// 血的教训：本轮曾出现"0% 成功、p50=0s"的反常曲线，因为只有 ok/err
+	// 两个数字，无法区分 403（鉴权）/ 503（无候选）/ 连接被拒（没监听）/
+	// 客户端构造错误，只能靠猜。此后任何失败必须能一眼定位到哪一类。
+	statusHist := map[int]int64{}
+	var errSamples []string
+	var newReqErrs int64
 	for w := 0; w < *conc; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			cl := &http.Client{Transport: newTransport(), Timeout: *timeout}
 			local := make([]time.Duration, 0, per)
-			lok, lerr := int64(0), int64(0)
+			lok, lerr, lnewreq := int64(0), int64(0), int64(0)
+			lstatus := map[int]int64{}
+			var lerrs []string
 			for i := 0; i < per; i++ {
 				// 始终用完整 URL 构造请求（否则 http.NewRequest 拒绝裸 path），
 				// 再用 URL.Opaque 强制请求行只发 path 部分。
 				r, err := http.NewRequest(http.MethodGet, connectURL, nil)
 				if err != nil {
+					// 构造失败不计入延迟样本（它没走网络），单独计数，
+					// 否则会污染 p50（0 时长样本把中位数拉到 0）。
+					lnewreq++
 					lerr++
+					if len(lerrs) < 3 {
+						lerrs = append(lerrs, "newrequest: "+err.Error())
+					}
 					continue
 				}
 				if *mode == "host" {
@@ -185,11 +207,15 @@ func cmdClient(args []string) int {
 				if err != nil {
 					lerr++
 					local = append(local, d)
+					if len(lerrs) < 3 {
+						lerrs = append(lerrs, "do: "+err.Error())
+					}
 					continue
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
 				local = append(local, d)
+				lstatus[resp.StatusCode]++
 				if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 					lok++
 				} else {
@@ -200,6 +226,17 @@ func cmdClient(args []string) int {
 			all = append(all, local...)
 			okCount += lok
 			errCount += lerr
+			newReqErrs += lnewreq
+			for k, v := range lstatus {
+				statusHist[k] += v
+			}
+			if len(errSamples) < 5 {
+				need := 5 - len(errSamples)
+				if len(lerrs) > need {
+					lerrs = lerrs[:need]
+				}
+				errSamples = append(errSamples, lerrs...)
+			}
 			latMu.Unlock()
 		}()
 	}
@@ -215,6 +252,14 @@ func cmdClient(args []string) int {
 	fmt.Printf("  success    = %d   failure = %d\n", okCount, errCount)
 	fmt.Printf("  wall       = %.2fs\n", wall.Seconds())
 	fmt.Printf("  QPS        = %.1f\n", qps)
+	// 状态码分布与错误采样：失败诊断的第一手证据。
+	// status 为空 + failure 全是连接错误 = 对端没监听；
+	// 403 集中 = 鉴权头不对；503 集中 = 候选池为空；newrequest>0 = 客户端 bug。
+	fmt.Printf("  status     = %v\n", statusHist)
+	fmt.Printf("  newrequest_errors = %d\n", newReqErrs)
+	for i, s := range errSamples {
+		fmt.Printf("  err[%d]     = %s\n", i, s)
+	}
 	fmt.Printf("  latency    = p50 %v | p90 %v | p99 %v | p999 %v | max %v\n",
 		pct(all, .50), pct(all, .90), pct(all, .99), pct(all, .999),
 		func() time.Duration {

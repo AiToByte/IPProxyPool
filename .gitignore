@@ -82,3 +82,4 @@ data/
 tools/bench/*.exe
 tools/bench/*.err
 tools/bench/*.txt
+tools/bench/*.prev
