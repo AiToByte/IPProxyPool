@@ -1,0 +1,40 @@
+# CODEOWNERS（OPT-R16 D：治理基建）
+
+# 规则：GitHub 在 PR 时按这些路径自动请求对应 reviewer。
+# 当前是单维护者仓库，故全部指向 @AiToByte；分段写是为了将来加人时
+# 只需改对应行，而不是重写整个文件。
+#
+# 注意：CODEOWNERS 只在有 reviewer 可指派时生效。单人仓库里它的价值是
+# "文档化归属"而非"强制 review"（自己合自己的 PR 时 GitHub 不拦）。
+# 真正的合入质量门是 CI（见 .github/workflows/ci.yml），不是这个文件。
+# 不要误以为有了 CODEOWNERS 就等于有了 review 流程。
+
+# --- 网关核心（Rust）：改动必须过全部门禁 ---
+/gateway/ @AiToByte
+
+# --- 供应链策略：deny.toml / Cargo.lock / 供应链脚本 ---
+# 这三处决定"什么依赖可以进仓库"，改动需额外谨慎：
+# deny.toml 改 allow/ignore 等于改安全策略，Cargo.lock 改动必须能说清
+# 是哪个包为什么升级（见 docs/SUPPLY_CHAIN.md 的 triage 纪律）。
+/gateway/deny.toml @AiToByte
+/gateway/Cargo.lock @AiToByte
+/tools/check_supply_chain.py @AiToByte
+
+# --- 压测基线：数字变更必须附带复现命令 ---
+# PERF_BASELINE.md 的数字是实测值，改数字必须能复现
+# （`python tools/bench_gateway.py`），不能凭感觉改。
+/docs/PERF_BASELINE.md @AiToByte
+/tools/bench/ @AiToByte
+/tools/bench_gateway.py @AiToByte
+
+# --- 安全政策 ---
+/SECURITY.md @AiToByte
+
+# --- CI 与门禁脚本：改动 CI 即改"什么算绿" ---
+.github/ @AiToByte
+/tools/check_*.py @AiToByte
+
+# --- 文档与其它 ---
+/docs/ @AiToByte
+*.md @AiToByte
+* @AiToByte

@@ -160,6 +160,11 @@ jobs:
       # 状态（OPT-R4 收官确为 201），改了就等于伪造执行记录。
       - name: Doc quality numbers match canonical baseline
         run: python3 tools/check_doc_consistency.py
+      # OPT-R16 D：Cargo.toml 的 version 必须在 CHANGELOG.md 里有对应小节。
+      # 版本号 bump 而不同步 changelog，几个月后没人知道新版本里装了什么。
+      # 只判"有没有小节"，不判内容详实程度（那是 review 的事）。
+      - name: Changelog matches Cargo.toml version
+        run: python3 tools/check_changelog.py
       # OPT-R12 A2：鉴权配置文档必须说清 `REQUIRE_API_KEY=0` / `API_KEY` 的真实语义。
       #
       # 实测确认的失实：此前只写「`REQUIRE_API_KEY=0` 显式关闭鉴权门」，而
