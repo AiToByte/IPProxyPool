@@ -54,6 +54,7 @@ ALLOWLIST = [
     # 能力复核报告：§6 规模指标表声明"以 QUALITY_BASELINE 为准"，
     # 故必须被门禁守住，否则该表会静默漂移。
     "docs/CAPABILITY-AUDIT.md",
+    "docs/SUPPLY_CHAIN.md",
 ]
 
 # 历史文件：记录的是**某轮收官时的真实状态**。
@@ -84,6 +85,7 @@ EXPECTED_KEYS = {
     # 门禁仍 exit=0）。§5 取证纪律那节直接以「284 单测」作反面教材，
     # 该数字若漂移，本文件自身就失去说服力。
     "docs/CAPABILITY-AUDIT.md": {"tests"},
+    "docs/SUPPLY_CHAIN.md": {"tests"},
 }
 
 

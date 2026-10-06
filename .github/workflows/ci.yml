@@ -399,3 +399,29 @@ jobs:
           }
           if ($failed) { exit 1 }
           Write-Output "PowerShell 5.1 parse + BOM: clean ($($files.Count) file(s))"
+
+  # OPT-R16 C: supply-chain gates (vulnerabilities + bans + licenses + sources).
+  #
+  # Runs cargo-deny (advisories/bans/licenses/sources per gateway/deny.toml)
+  # and cargo-audit (independent vuln scan) via tools/check_supply_chain.py.
+  # Follows the repo convention: CI installs the toolchain, the Python gate
+  # shells out to it, missing toolchain = skip locally / hard fail here.
+  #
+  # Cost note: first run compiles both tools from source (~10 min) and fetches
+  # the RustSec DB (~1 min); rust-cache makes subsequent runs fast (lockfile
+  # hash key). This job runs in parallel with gates/static-checks, so it does
+  # not lengthen the critical path after warmup.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+      - name: Install cargo-deny + cargo-audit
+        run: cargo install --locked cargo-deny cargo-audit
+      - name: Supply-chain gates
+        run: python3 tools/check_supply_chain.py

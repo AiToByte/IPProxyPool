@@ -1,0 +1,90 @@
+# cargo-deny 配置（OPT-R16 C：供应链治理）
+#
+# 用途：漏洞（RustSec）+ 重复版本/通配符（bans）+ 许可证（licenses）+
+#       依赖来源（sources）四类门禁，一次 `cargo deny check` 全跑。
+#
+# 本地用法：
+#   cargo install --locked cargo-deny cargo-audit   # 一次性安装
+#   cargo deny check                                  # 全量检查
+#   cargo deny check advisories                       # 只查漏洞
+# CI 用法：见 tools/check_supply_chain.py（仓库门禁统一走 Python 脚本）。
+#
+# 版本注意（cargo-deny 0.20，实测确认，勿凭旧文档写）：
+#   - [advisories] 已没有 vulnerability/yanked/unmaintained/unsound 这些
+#     lint 级别键（写了就报 unexpected-value / deprecated，直接拒绝运行）。
+#     0.20 的模型更简单也更严：命中 RustSec DB 的 advisory，只要不在
+#     `ignore` 里就失败。所以"先 warn"的策略在此版本下不存在——看到就修，
+#     修不了的才进 ignore 并写理由。
+#   - [licenses] 也没有 unlicensed/deny/copyleft 键，纯 allowlist 模型：
+#     不在 `allow` 里的许可证即失败。copyleft 系天然不在 allow 里，
+#     无需单独列 deny。
+#   - 配错不会静默：cargo-deny 会直接拒绝运行并指出行号（本轮已踩两次，
+#     见下文记录）。这比"配错但绿"要好得多。
+#
+# 策略说明（每个选项都有理由，不接受"默认即可"）：
+#   - bans.multiple-versions = warn：当前 lock 有 20 个包存在多版本
+#     （syn 3 个、hashbrown 4 个等，均为传递依赖 pin 住不同 major）。
+#     一步收紧到 deny 需要大面积 skip 清单或升级依赖，风险收益比不划算；
+#     先 warn 可见，收敛到可处理时再收紧。warn 不阻断 CI，但会在日志留痕。
+#   - licenses.allow：2026-10 实测 364 个 crate 全为宽松许可证
+#     （MIT/Apache/BSD/ISC/Zlib/Unlicense 等），无 GPL 系。
+#     allowlist 保证"新增未知许可证即红"，而不是"只拦已知坏的"。
+#   - sources：只允许 crates.io。当前 lock 全部来自单一源，无 git/path 依赖。
+
+[graph]
+# 默认包含 dev 依赖。本仓 dev 依赖只有 tokio（已是主依赖），无额外攻击面，
+# 故不需 exclude-dev。
+
+[advisories]
+db-path = "~/.cargo/advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+ignore = []
+# NOTE: ignore 只能加"已确认不可达"的 advisory，每条必须写理由，例如：
+# { id = "RUSTSEC-20XX-XXXX", reason = "仅影响 wasm32 目标，本仓只构建 x86_64-windows/linux" }
+# 0.20 下 ignore 是唯一的降级手段（没有 warn 级别），故每条 ignore 都是一次
+# 显式风险接受，review 时重点看这里。
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# workspace-dependencies 不用：本仓是单包 crate，无 workspace 继承。
+allow = []
+deny = []
+skip = []
+skip-tree = []
+# NOTE: skip/skip-tree 只能加"传递依赖 pin 住不同 major 且无法升级"的包，
+# 每条必须写理由。当前 20 个多版本包全部走 warn，不设 skip。
+
+[licenses]
+# allowlist（2026-10 实测生成，覆盖 lock 中全部 crate）：
+# 全部为 OSI/FSF 认可的宽松许可证。新增任何不在此列的许可证即红，
+# 倒逼每次引入新许可证时做一次显式评审。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "MIT-0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+]
+# 置信度阈值 0.8：license 文件文本匹配低于此值会告警，
+# 避免"声明是 MIT 实则是改写版"的文本漂移。
+confidence-threshold = 0.8
+# workspace 自身（MIT）不参与检查，避免自检噪声。
+private = { ignore = true }
+exceptions = []
+# NOTE: exceptions 只能加"主许可证合规但有个别文件例外"的包，每条写理由。
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
