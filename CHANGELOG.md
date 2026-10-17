@@ -21,8 +21,16 @@
 
 ## [Unreleased]
 
+（暂无）
+
+---
+
+## [0.2.0] - 2026-10-17
+
 ### Added
 
+- Admin Web UI（`web/admin` SPA，对齐 `docs/ADMIN_UI.md`）：登录 + 仪表盘/节点池/
+  租户与计费/免费池/断路器/设置 六页（admin 契约同批收口，见 [0.1.0] Fixed）。
 - 供应链治理门禁：`gateway/deny.toml`（advisories/bans/licenses/sources）、
   `tools/check_supply_chain.py`（cargo-deny + cargo audit 双跑）、
   CI `supply-chain` job、`docs/SUPPLY_CHAIN.md`（首次评估与 triage）。
@@ -44,18 +52,32 @@
   `checked_sub` 返 None 导致全清（改用相对时长判据）。
 - OPT-R11 A1 红测的 profile 依赖（release 下稳定失败，改 profile 无关断言）。
 
+### Changed
+
+- 依赖升级：pingora 0.6 → 0.9.0（umbrella/core/proxy/load-balancing 四 crate
+  同步，src 零代码改动）+ rustls 0.23.45 → 0.23.46（patch）。升级决策台账见
+  `docs/SUPPLY_CHAIN.md` §9；端到端压测复跑 3 轮 PEAK
+  12,739 / 19,819 / 19,786 QPS（conc=4，100%），与首测锚点
+  17,215 QPS（`docs/PERF_BASELINE.md`）同量级，无吞吐回退；持续负载被
+  默认租户 10,000 QPS 配额门整形为 ~10k（429，预期门控行为）。
+
 ### Security
 
-- **已知未修复**（门禁按设计报红，变绿唯一正道是升级，见
-  `docs/SUPPLY_CHAIN.md` §3）：
-  - RUSTSEC-2026-0033 / 0034（pingora-core 请求走私，代理热路径可达）
-  - RUSTSEC-2026-0035（pingora-cache 缓存投毒，代码零引用）
-  - RUSTSEC-2024-0437（protobuf 递归崩溃，经 prometheus 间接引入）
+- RustSec 漏洞公告 8 → **0**（deny advisories ok + audit exit 0 交叉验证）：
+  RUSTSEC-2026-0033/0034（pingora-core HTTP 请求走私，critical）、
+  RUSTSEC-2026-0035（pingora-cache 缓存投毒，high）、
+  RUSTSEC-2026-0346~0349（rustls TLS 秘密暴露/降级/资源放大，medium/low）、
+  RUSTSEC-2024-0437（protobuf 递归崩溃，经 prometheus 0.13 传递链）。
+  处置为**升级而非 ignore**（pingora 0.6 → 0.9.0 + rustls 0.23.46，
+  见 Changed；台账与验收见 `docs/SUPPLY_CHAIN.md` §9）。
+- 残余 4 个传递依赖 unmaintained（No safe upgrade is available）：以
+  `deny.toml unmaintained = "workspace"` 挡直依（直依 unmaintained 一律
+  error、升级即红，传递仅 warn 可见）；不逐条 ignore，`ignore` 保持空。
 - 已修：yoke-derive 0.8.3 → 0.8.4（去掉 yanked 版本）。
 
 ---
 
-## [0.1.0] - 2026-09-19 ~ 2026-10-06
+## [0.1.0] - 2026-09-19 ~ 2026-10-17
 
 > 本节汇总仓库创建以来的全部工作（此前无 release、无 tag、无 changelog，
 > 故按提交历史如实归纳，不拆分虚构的中间版本）。
@@ -79,6 +101,13 @@
 - 免费档零信任（`tier=free` + 凭据头 → 403）。
 - 隔离三层（内存 → Redis SETEX → PubSub 扇出）。
 - MaxMind 署名合规、文档漂移门、API Key 卫生。
+- Admin API 契约收口（GW-5，对齐 docs/ADMIN_API.md §4）：`/nodes`、`/tenants`
+  回归文档承诺的**裸数组**；PATCH balance 真实落库（原为只改本地副本的假实现），
+  DELETE quarantine 真实解除（原为空操作）；全部非 2xx 响应统一为 `{error, code}`
+  JSON（401/404/400，含未知路径 fallback）；非有限余额（NaN/±Inf）拒绝为 400。
 
+> 本窗口（2026-10-17）内新增的 pingora 0.6 → 0.9.0 升级、RustSec 漏洞
+> 8 → 0 清零与压测复跑记录，按本文件"Unreleased 节记录已合并未发布内容"
+> 的政策放在 [Unreleased]（下次 bump 0.2.0 时并入版本节）。
 
 <!-- 版本链接注记：本仓尚无 tag、无 GitHub Release（实测 git tag 为空），故不写 compare 链接，写了就是死链。第一次切 release（v0.2.0，随 pingora 升级）时再补上。 -->

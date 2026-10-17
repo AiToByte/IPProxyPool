@@ -1367,3 +1367,67 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   ② 端口 443 TLS 转发（步骤 45+47，**端到端 50/50 通过**）。
 - **唯一长期遗留**：升 Pingora（可消除 `allow(dead_code)` 与若干 API 反复，
   属收益/风险比低的后台项）；GitHub Actions 仍未实跑；JDK/.NET 仍缺。
+
+### [2026-10-17] 步骤 48 完成：Admin API 文档契约对齐收口 + 供应链门 8 漏洞清零（pingora 0.6→0.9.0 升级 && live E2E 全证据链）
+
+- **目标**：完成优化计划（docs/ADMIN_API.md + docs/ADMIN_UI.md）收尾——后端对齐文档契约（裸数组/错误体/假实装/400 语义）、live 验证全链证据；supply-chain 门因 RustSec DB 刷新转红（8 漏洞）→ 按 docs/SUPPLY_CHAIN.md §3 判定走升级路线（非 ignore）并复绿。
+- **Admin 契约实装**：
+  - /nodes、/tenants 回归**裸数组** Vec<NodeView>/Vec<TenantSummary>（文档与前端三页面均按数组消费；删 NodeListResponse/TenantListResponse 包装）。
+  - 实装两处丢真实现：TenantManager::set_balance（PATCH balance 真落库，非有限值 NaN/±Inf 400、有限负数允许=扣减/罚金语义）；RouterEngine::remove_quarantine（DELETE 真解除，与 set 同 normalize 口径、空内层回收外层 domain、显式 drop(inner) 防 DashMap 同分片死锁）。
+  - 统一错误体 {error, code}（文档 §4 承诺）：401（中间件，文案不区分 key 未配置/不对，fail-closed 不给探测者信号）、404（节点/租户/未知 fallback）、400（JSON parse 与 deserialize 分型文案、非有限余额）。
+  - node_view() 助手消除 6 处重复构造；OpenAPI components 补 VerifyStat/ProtoStat/AnonymityStat/SuspendedStat 等；web/admin nodes 页加「解除隔离」按钮（tsc+vite 通过）。
+- **新增测试（点名）**：admin.rs 8 个（openapi_doc_builds、auth_middleware_rejects_missing_key、missing_admin_key_returns_json_401、nodes_list_is_bare_array、tenants_list_is_bare_array_and_balance_persists、quarantine_set_then_delete_really_removes、node_weight_patch_applies_and_detail_route_works、error_response 错误体契约）；router.rs 3 个（admin_remove_quarantine_*：解除目标 ip 且回收空外层/同 domain 其他 ip 保留/幂等归一化）；tenant.rs 2 个（admin_set_balance_persists_and_gate_follows、admin_set_balance_unknown_key_returns_false）。mod tests 补 #[cfg(test)] 门。
+- **供应链门修复**（台账 docs/SUPPLY_CHAIN.md §9）：
+  - 发现：audit DB 刷新（1334 advisories）后漏洞 4→8（新增 RUSTSEC-2026-0346~0349 rustls ×4（2026-10-14 发布）+ RUSTSEC-2026-0033/0034（pingora-core HTTP 走私 9.3 critical）+ 0035（pingora-cache 缓存投毒 8.4）+ RUSTSEC-2024-0437（protobuf 递归崩溃，经 prometheus 0.13 链））。
+  - 处置：升级不加 ignore（§3 判定：走私漏洞 100% 可达，任何 ignore 都是不诚实的）。pingora 四 crate 0.6→0.9.0 + cargo update -p rustls → 0.23.46。选 0.9 非仅 0.8 的决定性理由：0.8.1 仍依赖 prometheus ^0.13（protobuf 留树不解）；0.9.0 起 Prometheus 拆独立可选 crate、protobuf 退树；顺带 daemonize→daemonix。
+  - src 零改动：我方 API 面 7 导入点，header 写全走显式 API（insert_header/remove_header），不触 0.9 移除的 DerefMut；prometheus/curve/async_write_vec 未用。cargo check 一次过。
+  - deny.toml：unmaintained = workspace（残余 4 个 unmaintained 全传递依赖且 No safe upgrade is available：derivative←pingora-core、paste←simba←nalgebra、rustls-pemfile←pingora-rustls、unsafe-libyaml←serde_yaml←pingora-core，cargo tree -i 实证；**直依 unmaintained 一律 error 不降级**，符合『传递依赖不逐个 ignore』纪律）；ignore 保持空 + unused-ignored-advisory = deny 健忘防护；修正 0.20 键位注记（官方文档核实：移除的是 vulnerability/unsound/notice/severity-threshold，yanked/unmaintained 仍在且取值为域）。
+- **Live E2E**（admin :9092、ADMIN_API_KEY=ops-secret-key、debug build detached 双流日志 log/dev_server.*）：
+  - 无 key /health → 401 JSON {error:'missing or invalid admin key',code:401}；带 key → 200 {status:ok}。
+  - /nodes、/tenants 裸数组实证（[{'addr':...}]/[{'tenant_id':...}]）。
+  - PATCH weight 42 → 200 往返 + 详情路由（含 ':' 路径段 %3A）。
+  - quarantine：POST ttl_secs=3600 → 200，一轮 sweep tick 后 /circuit quarantine_nodes:1/quarantine_domains:1；DELETE → 下一拍归零闭环（gauge 由 60s sweep ticker 同步——main.rs:1060 读 len 设 gauge；单测锁内存 quarantine_len、live 锁 gauge，两口径都闭环）。
+  - balance：PATCH 3.5 → 200 往返（GET 亦 3.5）→ ghost key 404 {'error':'tenant not found','code':404} → 坏 JSON 400 parse 文案 → restore 100.0。
+  - autotune：POST {enabled:true,boost_percent:150} → 200/GET 往返 → 恢复 {false,100}；freepool/summary、freepool/sources、/openapi.json 200 实体齐备。
+  - 场上小坑：首轮 curl 用错 body 字段名（编了 balance/reason，实为 balance_usd/ttl_secs）→ 400 deserialize 正是错误体契约的正确表现；按 DTO 修正后全绿——反向验证了 400 语义在位。
+- **升级验收（SUPPLY_CHAIN §3.3 全四项当场执行）**：① 302 单测/clippy/fmt 绿；② Windows 存活实测：dev 实例全程 397 秒（11:25:28Z→11:32:05Z taskkill，期间 admin 批次正常）——P0 全量杀进程演练未重跑（沿用既有结论）；③ tools/bench_gateway.py --skip-build 复跑 3 轮均 exit 0：PEAK **12,739 / 19,819 / 19,786 QPS**（conc=4，100% 成功，p99 实测第 1/3 轮 1.5ms/1.0ms，第 2 轮未存档），与验收锚点 docs/PERF_BASELINE.md 首测 **17,215 QPS @ conc=4** 同量级、无回退（burst 峰值单轮方差 ±30% 量级，第 1 轮偏低属小样本 burst 方差；持续负载整形 ~10k，高并发 429 = 默认租户 1 万 QPS 配额门限流，预期门控行为；地板 156,287/163,727/166,373 QPS 远高于 e2e，链路非瓶颈）（勘误 2026-10-17：本句原对照「~3,700 QPS 的 3.4 倍」误用 bench 脚本 docstring 旧首测记录当锚点，验收锚点应为 docs/PERF_BASELINE.md，已原地更正）；④ deny + audit 全绿含 unmaintained 重 triage。
+- **门禁**：cargo fmt --check ✅；clippy -D warnings ✅；test --locked --workspace = **302 passed / 0 failed / 7 ignored** ✅；cargo bench --workspace --no-run ✅；cargo deny check 四段全 ok ✅；cargo audit exit 0 ✅（warnings 10→4，非阻断 unmaintained）；tools/check_supply_chain.py 全绿 ✅。
+- **文档**：docs/SUPPLY_CHAIN.md（§1 结论表刷新、§5 重复版本 20→17 明细、§6 许可证 364→373、§7-1 键位更正、§9 升级台账）；gateway/deny.toml（advisories 策略与版本注记、bans/licenses 数字）；tools/check_supply_chain.py（docstring 20→17）；docs/ADMIN_API.md 与 ADMIN_UI.md（本轮规格文档，步骤 47 前完成）；QUALITY_BASELINE/README/FEATURES/CAPABILITY-AUDIT 的 284→302 已先行完成。测试数权威源仍为 docs/QUALITY_BASELINE.md（302/7/4）。
+- **问题与解决**：① 本机 RUSTUP_HOME 指向 D:\DevSoft\rustup（无 toolchain）→ 每次命令前 $env:RUSTUP_HOME='C:\Users\xiaoj\.rustup'；② audit DB 拉取网络失败 → $env:HTTP_PROXY/$env:HTTPS_PROXY=127.0.0.1:7890（git 全局代理同端口在线）；③ PowerShell 原生命令调用对参数重排不经意转义（body 传参）→ 改用手写字段名核对 DTO 后用单引号原文传递。
+- **未 commit**。
+- **遗留**：① 4 个传递依赖 unmaintained（上游债：pingora/nalgebra/rustls 生态，策略 workspace 挡直依，台账 §4/§9 在案）；② P0 全量杀进程演练未重跑（本步 397s 存活 + 历史 P0 结论并存）；③ web/admin freepool/circuit 新页面 tsc/vite 构建绿，浏览器级人工走查未做。
+- **P0 kill 演练复跑（C1 口径，2026-10-17 本地 20:34:37~20:42:40，遗留②就此消除）**：冷启动 self-heal + 两次强杀均重拉回 200 + 全量收摊端口零残留。
+  - 冷启动：看护启动（20:34:37 `watchdog started`）→ 网关缺席 `gateway unhealthy` → `relaunch enter/exit`（20:34:45）→ 新网关双探针 200（`:8916` 带默认 Key `/`、`:9091` `/metrics`）+ mock 包体。
+  - kill#1：`taskkill /F` 9644 → `gateway unhealthy`（20:39:37）→ `relaunch enter/exit`（20:39:42）→ 新 PID **7352** 回 200+mock（连续两拍 `identity ok (egress fingerprint: mock)`）。
+  - kill#2：`taskkill /F` 7352 → `gateway unhealthy`（20:41:55）→ `relaunch enter/exit`（20:42:00）→ 新 PID **32016** 回 200+mock（连续两拍 identity ok）。两次恢复采样 gwprocs==1 ⇒ 3-strike 启动窗零重复（无双拉争抢 :8916）。
+  - 全量收摊：杀看护（9120）/网关（32016）/mocks×3（8888/8889/8890）→ `zero listeners on 8916/9091/8888-8890`，编排脚本 exit 0。全部证据行落 `log/ipp-watchdog.out`（09-25 历史段落原样保留在案）。
+  - 环境事项（如实登记，非仓库缺陷）：本轮首轮按头注释形态 `launch_detached.py powershell.exe` detached 拉看护 → 进程静默死亡、日志零新增（有/无 `-NoProfile` 双失败；同 launcher 拉网关 exe/ mocks 均正常，故定位为 **本机 detachment×PowerShell 5.1 环境回归**，需注意 09-24/25 历史同形态曾可用）。演练改用 `Start-Process -WindowStyle Hidden -NoProfile` 形态起看护（同代码路径），watchdog→launch_detached→gateway.exe 重拉链全程正常。`tools/ipp_watchdog.ps1` 头注释与 `install_watchdog.ps1` 文档形态**未改**；后续观察口：若其他机器/开机sch任务同形复现，再议文档加 `-NoProfile` 与替代启动形态（属运维环境注记，非代码改动）。
+- **未 commit。**
+- **web/admin 浏览器级冒烟（最佳可达层，2026-10-17 晚；遗留③降级为「登录后交互人工走查缺」）**：
+  - 构建复跑：`npm run build`（tsc && vite build）2.5s 绿；产物按页分包
+    (dashboard/nodes/tenants/freepool/circuit/settings 各 chunk)。
+  - 产物断言 5/5 True：nodes chunk 含「解除隔离」（本轮新按钮落地产物）、
+    freepool 含「免费池」、circuit 含「熔断」、tenants DTO 含 `balance_usd`、
+    index 含 `/api/v1`。
+  - 同源契约 HTTP 往返（vite dev 代理 → 网关 :9092 实链，浏览器同路径）：
+    带 Key `/api/v1/health` → 200 `{"status":"ok","service":"ipproxy-pool-admin"}`；
+    无 Key → 401 `{"error":"missing or invalid admin key","code":401}`；
+    网关直连 :9092 同口径 200/401 双向对照。
+  - 真实 Chromium（Edge 无头）渲染实证：`--dump-dom` 26,119B 且含
+    「IPProxyPool」「Admin API Key」；截图 `log/admin_ui_login_edge_headless.png`
+    （人工复核：登录卡完整渲染、Tailwind 样式在位）。
+  - 诚实边界：登录后（localStorage 持 key → 六页面数据流）无法用无头单次
+    调用驱动点击 ⇒ 登录后交互与 freepool/circuit 页面数据流可视化走查仍未做
+    （遗留③残余=人工项）；引入 Playwright 类工具属后续选项（会加 devDependency，
+    未擅动 package.json）。
+  - 收摊：dev server + 网关全杀，5173/9092/8916/9091 零监听，exit 0。
+- **未 commit。**
+- **web/admin 登录后六页自动化浏览走查（2026-10-17 晚；遗留③以自动化+截图闭环，人工抽查转可选）**：走查捕获 **1 个阻断级 bug** 并修复后全绿。
+  - **工具形态**：playwright-core 于 Temp 目录安装（**repo 零依赖改动**）+ 系统 Edge 无头（`channel:'msedge'`，零浏览器下载）；vite dev（`--host 127.0.0.1 --port 5173 --strictPort`，代理 → :9092）+ debug 网关（`ADMIN_API_KEY=ops-secret-key`）活链。
+  - **走查捕获的阻断 bug（修复）**：App.tsx 六个懒加载 `setView(m.Dashboard)` 直传组件函数 ⇒ React 把函数参数当 setState updater 调用 `Dashboard(prevState=null)` ⇒ `{ client }` 解构 null 崩溃、整树卸载（**tsc/vite 全测不出，登录后每页必白屏**）。修复 = `setView(() => m.X)` ×6。属真实用户首次登录即 100% 命中的缺陷，此前只有登录层渲染证据、懒加载路径从未被运行期触发。
+  - **顶栏标题修复**：layout.tsx 顶栏标题查侧边栏 NAV_ITEMS（仅 4 项）⇒ 免费池/断路器两页顶栏回落显示「管理后台」（截图实证）；新增 `PAGE_TITLES` 六项映射修复。
+  - **修复后走查 25/25 PASS（exit 0）**：wrong-key 401 错误契约文案 → 真实 key 登录 → 六页真实点击，逐页顶栏标题断言（仪表盘/节点池/租户与计费/免费池/断路器/设置）+ 内容断言（nodes 行 `127.0.0.1:8888`/`mock-a`/`解除隔离`、tenants `default_key`/`余额`/`10000`、freepool 干旱横幅、circuit 隔离卡、settings 退出登录），页内 fetch `/api/v1/health` 200，非预期 console error=0（唯一 error=故意 wrong-key 的 401 资源日志）。
+  - **按钮交互闭环**：真实点击节点行「隔离」按钮（prompt TTL=600 自动接受）→ `POST /api/v1/nodes/127.0.0.1%3A8888/quarantine` 200 → 自动重载；「解除隔离」→ `DELETE` 200 → 重载。核实设计语义：list DTO 无隔离状态字段 ⇒ 双按钮恒可用（解除隔离幂等，nodes.tsx 注释写明），与 ADMIN_API.md 契约一致、非缺陷。
+  - **截图档案**：`log/admin_ui_walkthrough/`（00~12 PNG：每页渲染、隔离前后/复原、交互日志；数据齐真：仪表盘 3 节点/1 租户/付费占比 100.0%，权重框 100/80/60，干旱红色横幅，隔离卡全 0）。
+  - **收摊**：dev + 网关全杀，5173/9092/8916/9091 零监听；`npm run build` 复跑绿。门禁终扫 15/15 ✅（本轮改动=web/JSX 修复+docs 追加，Rust 四门前轮绿）。
+- **未 commit。**

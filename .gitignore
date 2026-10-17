@@ -68,6 +68,16 @@ Desktop.ini
 *.swp
 *~
 
+# --- Admin Web UI 构建产物（0.2.0 起 web/admin 入库）---
+# node_modules / dist 不入库；package-lock.json 入库保证可复现（与 Cargo.lock 同理）。
+web/admin/node_modules/
+web/admin/dist/
+
+# --- log/ 证据截图（冒烟/走查产物，与 log/*.out 同理不入库）---
+# 只限定 log/：将来若需入库的界面设计稿等放别的目录。
+log/*.png
+log/**/*.png
+
 # --- Docker 本地数据目录（防未来误加；当前均为具名卷，无宿主挂载） ---
 data/
 
