@@ -7,6 +7,9 @@
 >
 > 本文件记录**首次评估的全部发现与 triage 结论**。数字会变，
 > 但"每个发现都有处置结论"这条纪律不变。
+>
+> **2026-10-17 更新**：pingora 升级已执行并重 triage（§9），当前门禁**绿**。
+> 下表为最新状态；首次评估历史按原文保留。
 
 ---
 
@@ -14,17 +17,18 @@
 
 | 类别 | 数量 | 处置 |
 | --- | --- | --- |
-| 漏洞（vulnerability） | **4** | 需升级 pingora 0.6 → 0.9（R17 级工作，见 §3） |
-| 无维护（unmaintained） | 7 | 全部为传递依赖，pingora 升级后重 triage（见 §4） |
-| Unsound（audit 补充） | 3（atty、lru×2） | 同上，随升级重 triage |
+| 漏洞（vulnerability） | **0** | 已清零：pingora 0.6→0.9.0 + rustls 0.23.46（§9；首次评估 4 个 + DB 刷新新增 rustls 4 个） |
+| 无维护（unmaintained） | 4（首次 7） | 全部传递依赖、上游无修复版；deny 策略 `unmaintained = "workspace"`（直依即红，见 §4/§9） |
+| Unsound（audit 补充） | 0（首次 3） | atty/lru 已随 pingora 升级退出依赖树 |
 | Yanked | 1（yoke-derive 0.8.3） | **已修**：`cargo update -p` 到 0.8.4 |
-| 重复版本 | 20 个包 | warn 可见，暂不收紧（见 §5） |
-| 许可证 | 364 crate 全宽松 | allowlist 已锁定，新增即红（见 §6） |
+| 重复版本 | 17 个包（首次 20） | warn 可见，暂不收紧（见 §5） |
+| 许可证 | 373 package 全宽松（首次 364） | allowlist 已锁定，新增即红（见 §6） |
 | 依赖来源 | 全部 crates.io | sources 门已锁定 |
 
-**当前门禁状态：红。** 这是门禁在正常工作——它在我们的核心框架里发现了
-真实漏洞（其中 2 个打在代理热路径上）。**不要**为了变绿而加 ignore；
-变绿的唯一正道是升级（§3）。
+**当前门禁状态：绿**（2026-10-17，deny 全量 + audit exit 0，含 rustls 等公告
+DB 刷新后复扫）。首次评估时门禁为红——那是门禁在正常工作：它在核心框架里
+发现了真实漏洞（2 个打在代理热路径上），处置是升级而非 ignore（§3 判定，
+§9 执行）。后续任何变红都同理：**不要**为了变绿而加 ignore。
 
 ---
 
@@ -76,7 +80,7 @@ prometheus/protobuf 链）。但 0.x 的 minor 升级即 breaking change，
 
 ### 3.3 升级验收标准（届时执行）
 
-1. 编译通过 + 全量门禁绿（284 单测、clippy、13 门）。
+1. 编译通过 + 全量门禁绿（302 单测、clippy、13 门）。
 2. Windows 300s+ 存活实测（OPT-R14 方法复用）。
 3. 端到端压测复跑（`tools/bench_gateway.py`），QPS 不低于本次基线。
 4. `cargo deny check` + `cargo audit` 全绿（含 unmaintained 重 triage）。
@@ -106,11 +110,12 @@ RUSTSEC-2021-0145）、lru@0.14.0 有 2 个 unsound（经 pingora-cache/pool 引
 
 ---
 
-## 5. 重复版本（20 个包，warn）
+## 5. 重复版本（首次 20 个包 → 2026-10-17 复测 17 个，warn）
 
-syn（3 个）、hashbrown（4 个）、getrandom（3 个）、windows-sys（3 个）等，
-均为传递依赖 pin 住不同 major。`bans.multiple-versions = warn`，
-**不设 skip**——warn 日志留痕但不阻断。
+×3：getrandom、hashbrown、syn、windows-sys；×2：cpufeatures、dashmap、
+heck、indexmap、r-efi、rand、rand_core、socket2、synstructure、thiserror、
+thiserror-impl、tower-http、zstd、zstd-safe——均为传递依赖 pin 住不同 major。
+`bans.multiple-versions = warn`，**不设 skip**——warn 日志留痕但不阻断。
 
 收紧条件（满足任一即改 deny）：直接依赖全部收敛到单一 major；
 或某个重复包出现漏洞（届时必须升级，顺带收敛）。
@@ -119,23 +124,28 @@ syn（3 个）、hashbrown（4 个）、getrandom（3 个）、windows-sys（3 �
 
 ## 6. 许可证（allowlist 已锁定）
 
-2026-10 实测 364 个 crate：MIT / Apache-2.0 / BSD / ISC / Zlib /
-Unlicense / CC0-1.0 / MIT-0 / BSL-1.0 / Unicode-3.0 / CDLA-Permissive-2.0，
-**无 GPL/AGPL/LGPL**。`gateway/deny.toml` 的 allowlist 覆盖全部原子，
-新增未知许可证即红。
+首次评估 364 个 crate；2026-10-17 pingora 0.9 升级后复测 373 个 package：
+MIT / Apache-2.0 / BSD / ISC / Zlib / Unlicense / CC0-1.0 / MIT-0 / BSL-1.0 /
+Unicode-3.0 / CDLA-Permissive-2.0，**无 GPL/AGPL/LGPL**。`gateway/deny.toml`
+的 allowlist 覆盖全部原子（升过程中 deny licenses 门始终绿），新增未知许可证即红。
 
 ---
 
 ## 7. 过程记录（本轮踩坑，勿重犯）
 
-1. **cargo-deny 0.20 改了 schema**（PR #611）：`[advisories]` 没有
-   vulnerability/yanked/unmaintained/unsound 键，`[licenses]` 没有
-   unlicensed/deny/copyleft 键——写了就直接拒绝运行（unexpected-value /
-   deprecated 错误，行号精确）。不要凭旧文档写配置，用
-   `cargo deny init` 生成模板对照。本轮连踩两次才对。
-2. **新模型更严**：advisories 靠 ignore 控制（命中即失败，无 warn 级别）；
-   licenses 纯 allowlist（不在列即失败）。"先 warn"的策略在此版本下
-   不存在——看到就修，修不了才 ignore+理由。
+1. **cargo-deny 0.20 改了 schema**（PR #611）：`[advisories]` 删除的键是
+    vulnerability/unsound/notice/severity-threshold（写了就直接拒绝运行，
+    unexpected-value / deprecated 错误，行号精确）；`[licenses]` 没有
+    unlicensed/deny/copyleft 键。不要凭旧文档写配置，用
+    `cargo deny init` 生成模板对照。本轮连踩两次才对。
+    **（2026-10-17 更正）**：经官方文档核实，yanked 与 unmaintained 键在 0.20
+    并未删除，只是取值变更：`yanked = deny|warn(默认)|allow`、
+    `unmaintained = all(默认)|workspace|transitive|none`（取值为"作用域"而非
+    lint 级别）。当时把 lint 级别值写进去报 unexpected-value，误判为键不存在。
+2. **新模型对漏洞类更严**：vulnerability 无条件 error（无 warn 级别）；
+    licenses 纯 allowlist（不在列即失败）。传递依赖的 unmaintained 可用
+    `unmaintained = "workspace"` 一并覆盖（直依仍 fail、传递仅 warn），
+    比 4 条逐一 ignore 更可维护（2026-10-17 采纳，见 §9）。
 3. **`cargo-audit` 必须调子命令形式**（`cargo audit`），裸跑 `cargo-audit`
    只打印 help 就退出，门禁会误判为通过（已修，见 check_supply_chain.py 注释）。
 4. **rust-toolchain.toml pin 导致 hang**：pin 到未安装的 1.93.0 会触发
@@ -154,3 +164,69 @@ Unlicense / CC0-1.0 / MIT-0 / BSL-1.0 / Unicode-3.0 / CDLA-Permissive-2.0，
 - `tools/check_supply_chain.py` — 门禁脚本（deny + audit 双跑）
 - `.github/workflows/ci.yml` — `supply-chain` job
 - [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md) — 测试数/门数权威源
+
+---
+
+## 9. pingora 升级重 triage（2026-10-17，§3 预判的升级已执行）
+
+**触发**：门禁本轮 audit DB 刷新（`~/.cargo/advisory-db` 拉到 1334 条），
+漏洞从首次评估的 4 个变 **8 个**——新增 4 个 rustls 公告
+（RUSTSEC-2026-0346~0349，2026-10-14 发布，评估时还不存在）。按 §3 判定走
+升级路线（**不加 ignore**）。
+
+**执行**（均为 lock/manifest 层面，无 src 代码改动）：
+
+| 变更 | 说明 |
+| --- | --- |
+| pingora 0.6 → **0.9.0** | 4 个 pingora crate 同步（umbrella/core/proxy/load-balancing） |
+| rustls 0.23.45 → **0.23.46** | `cargo update -p rustls` patch 升级，解 4 个 rustls 公告 |
+
+选 0.9 而非 0.8 的决定性理由：**0.8.1 仍依赖 `prometheus ^0.13`**，protobuf
+2.28（RUSTSEC-2024-0437）还在依赖树里；0.9.0 起 pingora-core 把 Prometheus
+拆为独立可选 crate，protobuf 整体退出依赖树。顺带 `daemonize`→`daemonix`
+Linux 分支（消 1 个 unmaintained）。
+
+**API 兼容性实证**：我方 API 面本就极小（§3.2 列的 7 个导入点），header
+写操作全走显式 API（`insert_header`/`remove_header`），不触 0.9 移除的
+`DerefMut`；`prometheus` 集成、`PeerOptions::curve`、`async_write_vec`
+均未使用。`cargo check` 一次通过，**src 零改动**。
+
+**结果**（复跑门禁全绿）：
+
+- 漏洞：**8 → 0**（deny advisories ok + audit exit 0 交叉验证）
+- unmaintained 警告：10 → **4**（atty/daemonize/proc-macro-error/yaml-rust
+  随升级退出树；atty unsound + lru×2 unsound 同步消失）
+- 重复版本：20 → **17** 个包；许可证 allowlist 覆盖 373 个 package（门未动即绿）
+- `cargo fmt`/`clippy -D warnings`/`test --locked`（**302 passed / 7 ignored**）/
+  `bench --no-run` 全绿
+
+**deny.toml 策略配套变更**（非放行，是策略落地）：
+
+1. `[advisories] unmaintained = "workspace"`——剩 4 个 unmaintained 全为
+   **传递依赖**且 "No safe upgrade is available"（derivative←pingora-core、
+   paste←simba←nalgebra、rustls-pemfile←pingora-rustls、unsafe-libyaml←
+   serde_yaml←pingora-core，路径见 `cargo tree -i` 实证），本仓 manifest 无
+   升级路径；策略保证**直依 unmaintained 一律 error**（今后相关风险不会被此
+   配置放过），传递仅 warn 可见。未逐条 ignore（符合 §4 原则）。
+2. `ignore` 保持空 + 新增 `unused-ignored-advisory = "deny"`——健忘防护。
+3. 修正 §7-1 的键位记录（见该处 2026-10-17 更正）。
+
+**§3.3 验收标准对照（当场执行）**：
+
+1. ✅ 编译 + 302 单测 + clippy + fmt（见上）。
+2. ✅ Windows 存活实测：dev 实例（debug build）live E2E 全程存活 **397s**
+    （2026-10-17 11:25:28Z 起至 11:32:05Z taskkill），期间 admin API 批次
+    正常响应；P0 kill 演练（C1 口径）已于 2026-10-17 下午复跑通过——
+    冷启动 self-heal + 两次强杀均重拉回 200 + 收摊零残留
+    （见 EXEC_LOG 步骤 48 演练条目）；OPT-R14 原本项（>330s 长时存活）
+    由步骤 39 t=348s/447s 实证覆盖。
+3. ✅ 端到端压测复跑（`tools/bench_gateway.py --skip-build`，2026-10-17
+    共 3 轮均 exit 0）：PEAK 依次 **12,739 / 19,819 / 19,786 QPS**
+    （conc=4、100% 成功；p99 实测第 1 轮 1.5ms / 第 3 轮 1.0ms，
+    第 2 轮未存档），
+    与验收锚点 `docs/PERF_BASELINE.md` 首测
+    **17,215 QPS @ conc=4** 同量级，无吞吐回退（burst 峰值单轮方差 ±30%
+    量级，第 1 轮 12,739 属小样本 burst 方差；持续负载被默认租户
+    10,000 QPS 配额门整形为 ~10k，429 属预期门控行为；地板
+    156,287 / 163,727 / 166,373 QPS 远高于 e2e，链路非瓶颈）。
+4. ✅ deny + audit 全绿（本节）。

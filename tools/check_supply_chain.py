@@ -8,7 +8,7 @@ OPT-R16 C：供应链治理门禁（漏洞 + 重复版本/通配符 + 许可证 
 # 查什么（四类，见 gateway/deny.toml 的逐项 rationale）
 
 1. advisories（cargo-deny + cargo-audit 双跑）：RustSec 已知漏洞即红线。
-2. bans：通配符版本 deny；重复版本 warn（当前 20 个包多版本，全为传递
+2. bans：通配符版本 deny；重复版本 warn（当前 17 个包多版本，全为传递
    依赖 pin 住不同 major，一步收紧需要大面积 skip 清单，先 warn 可见）。
 3. licenses：显式 allowlist + copyleft deny。新增未知许可证即红。
 4. sources：只允许 crates.io。

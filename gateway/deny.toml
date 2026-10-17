@@ -9,12 +9,14 @@
 #   cargo deny check advisories                       # 只查漏洞
 # CI 用法：见 tools/check_supply_chain.py（仓库门禁统一走 Python 脚本）。
 #
-# 版本注意（cargo-deny 0.20，实测确认，勿凭旧文档写）：
-#   - [advisories] 已没有 vulnerability/yanked/unmaintained/unsound 这些
-#     lint 级别键（写了就报 unexpected-value / deprecated，直接拒绝运行）。
-#     0.20 的模型更简单也更严：命中 RustSec DB 的 advisory，只要不在
-#     `ignore` 里就失败。所以"先 warn"的策略在此版本下不存在——看到就修，
-#     修不了的才进 ignore 并写理由。
+# 版本注意（cargo-deny 0.20.2；2026-10 对照官方文档
+#   embarkstudios.github.io/cargo-deny → checks/advisories 核实，修正旧注记）：
+#   - [advisories] 移除的键是 vulnerability / unsound / notice /
+#     severity-threshold（写了就报错，漏洞类无条件 error——这部分与旧注记一致）。
+#   - 但 yanked 与 unmaintained 并未移除，只是取值变了：
+#     yanked = deny | warn（默认） | allow；
+#     unmaintained = all（默认：任何 crate 命中即失败） | workspace（仅直依失败，
+#     传递仅 warn） | transitive（仅传递失败） | none（完全不查）。
 #   - [licenses] 也没有 unlicensed/deny/copyleft 键，纯 allowlist 模型：
 #     不在 `allow` 里的许可证即失败。copyleft 系天然不在 allow 里，
 #     无需单独列 deny。
@@ -22,11 +24,11 @@
 #     见下文记录）。这比"配错但绿"要好得多。
 #
 # 策略说明（每个选项都有理由，不接受"默认即可"）：
-#   - bans.multiple-versions = warn：当前 lock 有 20 个包存在多版本
-#     （syn 3 个、hashbrown 4 个等，均为传递依赖 pin 住不同 major）。
+#   - bans.multiple-versions = warn：当前 lock 有 17 个包存在多版本
+#     （pingora 0.9 升级后实测，syn/hashbrown 等均为传递依赖 pin 住不同 major）。
 #     一步收紧到 deny 需要大面积 skip 清单或升级依赖，风险收益比不划算；
 #     先 warn 可见，收敛到可处理时再收紧。warn 不阻断 CI，但会在日志留痕。
-#   - licenses.allow：2026-10 实测 364 个 crate 全为宽松许可证
+#   - licenses.allow：2026-10 实测 373 个 package 全为宽松许可证
 #     （MIT/Apache/BSD/ISC/Zlib/Unlicense 等），无 GPL 系。
 #     allowlist 保证"新增未知许可证即红"，而不是"只拦已知坏的"。
 #   - sources：只允许 crates.io。当前 lock 全部来自单一源，无 git/path 依赖。
@@ -38,11 +40,23 @@
 [advisories]
 db-path = "~/.cargo/advisory-dbs"
 db-urls = ["https://github.com/RustSec/advisory-db"]
-ignore = []
-# NOTE: ignore 只能加"已确认不可达"的 advisory，每条必须写理由，例如：
+# unmaintained = workspace（0.20 取值为域，见上方版本注记）：
+#   直依 unmaintained 一律 error——绝不降级；传递依赖上的 unmaintained 记 warn 可见
+#   但不阻断。理由：当前 4 个传入 unmaintained 全为传递依赖（2026-10 triage，路径与
+#   处置见 docs/SUPPLY_CHAIN.md §4）：
+#     derivative  ← pingora-core 0.9（上游仍在用，无替代版本）
+#     paste       ← simba ← nalgebra 0.33（本仓直依 nalgebra 的宏链）
+#     rustls-pemfile ← pingora-rustls（证书加载，上游未迁移 pki-types）
+#     unsafe-libyaml ← serde_yaml 0.9 ← pingora-core（server conf YAML 解析）
+#   四者均 "No safe upgrade is available"，本仓 Cargo.toml 无升级路径；pingora 升级
+#   已清掉 atty/daemonize/proc-macro-error/yaml-rust 等 6 个，剩余属上游债。
+unmaintained = "workspace"
+# NOTE: ignore 只能加"已确认不可达/已确认不可修"的 advisory，每条必须写理由，例如：
 # { id = "RUSTSEC-20XX-XXXX", reason = "仅影响 wasm32 目标，本仓只构建 x86_64-windows/linux" }
-# 0.20 下 ignore 是唯一的降级手段（没有 warn 级别），故每条 ignore 都是一次
-# 显式风险接受，review 时重点看这里。
+# 每条 ignore 都是一次显式风险接受，review 时重点看这里。
+ignore = []
+# 门禁健忘防护：ignore 一旦失效（上游修复/依赖消失）立即报错，防止默默积累僵尸豁免。
+unused-ignored-advisory = "deny"
 
 [bans]
 multiple-versions = "warn"
@@ -54,7 +68,7 @@ deny = []
 skip = []
 skip-tree = []
 # NOTE: skip/skip-tree 只能加"传递依赖 pin 住不同 major 且无法升级"的包，
-# 每条必须写理由。当前 20 个多版本包全部走 warn，不设 skip。
+# 每条必须写理由。当前 17 个多版本包（pingora 0.9 后实测）全部走 warn，不设 skip。
 
 [licenses]
 # allowlist（2026-10 实测生成，覆盖 lock 中全部 crate）：
