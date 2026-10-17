@@ -232,7 +232,7 @@ impl RouterEngine {
             .filter(|n| n.weight > 0)
             .map(Arc::clone)
             .collect();
-        live.sort_by(|a, b| b.weight.cmp(&a.weight));
+        live.sort_by_key(|a| std::cmp::Reverse(a.weight));
         live.truncate(HOT_NODES_K);
         live
     }
