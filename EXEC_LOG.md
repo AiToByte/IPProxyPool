@@ -1443,3 +1443,12 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
 - **未 commit。**
 - **v0.2.0 发版后自查修正（同晚，a51036f 推送后数分钟）**：发现 a51036f 的 .gitignore 只改了注释、`log/**/*.txt` 规则本体漏写——status 仍见 `?? log/admin_ui_walkthrough/`（6 个 txt 裸露），立即补规则落位；本条即诚实留痕，单一小提交修正、不改已推送历史（不做 force push / rebase）。
 - **未 commit。**
+- **0.2.0 切版后 GitHub Actions 主管道观测与收敛（2026-10-17 晚；本仓 CI 史上首次 master 全绿）**：
+  - **首轮观测**：发版三提交 push 触发三笔 run（46179e22 / a51036f5 / 0d58e563）。46179e22 run（39037791775）四 job 中三绿（static-checks / windows-powershell / supply-chain）+ **gates 红，FAIL step = clippy**；a51036f5 / 0d58e563 同因同红。重要正交事实：**supply-chain 自中国 10-06 上线以来此轮首次转绿**——其在 10-06 两轮红的根因是旧 lockfile 里 8 条 RustSec 公告被如实拦截（CI 先于本地发现，属门禁正确行为），本日随 pingora 0.9 lockfile 升级自动清零。
+  - **gates/clippy 根因（gh CLI 登录态拉 `--log-failed` 实证，非猜测）**：toolchain 版本偏差——本地 stable 1.93.0、runner stable **1.99.0**（失败日志的 lint 索引 URL 自证）；1.99 的 `clippy::unnecessary_sort_by` 已能识别 `sort_by(|a, b| b.x.cmp(&a.x))` 单键降序惯用改写 → `gateway/src/router.rs:235` `build_hot_nodes` 命中。本地 1.93 clippy（含 `--all-targets` 复跑）测不出——CI 比本地严半代，这正是远端门禁的价值。
+  - **修法遵循「不 ignore、按 lint 改对」**：`live.sort_by_key(|a| std::cmp::Reverse(a.weight));`（语义不变：weight 降序、稳定排序、只影响截断前序）；同时 `rustup update stable` → 本地 **1.99.1** 与 runner 对齐，并以 CI 同款命令（`--locked --workspace --all-targets -D warnings`）全库复扫无新命中；test --locked **302 passed / 0 failed / 7 ignored**。过程教训如实记录：rustup update 与 cargo 在同一 default toolchain 上并行会撕裂组件（`cargo-fmt.exe` not applicable / 0xC0000135），改串行即好。
+  - **收敛实证**：修复提交 `3332b69` push → run **39039094305** 四 job 全绿：gates 5m31s（fmt / clippy / unit tests / allocation-contract / release bandit / bench compile / Cargo.lock unchanged 全过）、static-checks 5m46s（27 步含 Gateway Docker image build + compose 双 profile）、supply-chain 24s、windows-powershell 2m2s；run conclusion=`success`（`gh run watch --exit-status` 退出码 0）。master CI 史上首次全绿。
+  - **诚实边界（tag 对齐问题）**：tag `v0.2.0` 指向 46179e22（其 CI 缺这 1 行修复）；46179e22→3332b69 差异 = 一行排序等价改写，其余发布内容零变化。tag 不可变性优先（不 retag、不 force push）；master 头部 3332b69 = 修正后的全绿版本。若需「tag 与全绿 CI 对齐」的 retag，属用户决策项。
+  - **CI 侧仅有注记（非失败，留观）**：runner Node 20→24 强迁提示；`ubuntu-latest` 将自 2026-10-19 起迁 Ubuntu 26（actions/runner-images#14748）。
+  - **本机 sweep 勘误**：17:48 终扫一度 14/15：漏设 `RUSTUP_HOME` 致 supply-chain 门假红（rustup 报 no default）；按惯例补带后 15/15 复绿——环境惯例（每次先 `$env:RUSTUP_HOME`）重申为本机铁律。
+- **未 commit。**

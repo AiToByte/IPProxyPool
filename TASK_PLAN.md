@@ -1,7 +1,7 @@
 # 任务总体执行规划: GW-R1 企业级IP代理池网关落地
 
 > 创建/更新时间: 2026-09-19 12:00
-> 当前状态：步骤 1~48 已完成，**四项全部闭环**。② 端口 443 TLS 转发已**端到端完整通过**（步骤 47）：`SSL_CERT_FILE` 指向自建 CA 时 **50/50 次 200 且响应体均为真实公网出口 IP**；不设则 503 + `TLSHandshakeFailure`（反向对照，证明成功来自正确的 CA 信任而非关闭校验）。P0 Windows 300s 自杀（步骤 39）、① 分档最小探索配额（步骤 44）、③ 遥测落地端健康告警（步骤 43）亦已活流量实证。P0 kill 演练（C1 口径）+ web/admin 六页自动化浏览走查（真实点击+截图+按钮交互闭环，`log/admin_ui_walkthrough/`）已补跑通过（2026-10-17）。**长期遗留**：4 个传递依赖 unmaintained（上游生态债，deny 策略挡直依）、GitHub Actions 未实跑、JDK/.NET 仍缺。
+> 当前状态：步骤 1~48 已完成，**四项全部闭环**。② 端口 443 TLS 转发已**端到端完整通过**（步骤 47）：`SSL_CERT_FILE` 指向自建 CA 时 **50/50 次 200 且响应体均为真实公网出口 IP**；不设则 503 + `TLSHandshakeFailure`（反向对照，证明成功来自正确的 CA 信任而非关闭校验）。P0 Windows 300s 自杀（步骤 39）、① 分档最小探索配额（步骤 44）、③ 遥测落地端健康告警（步骤 43）亦已活流量实证。P0 kill 演练（C1 口径）+ web/admin 六页自动化浏览走查（真实点击+截图+按钮交互闭环，`log/admin_ui_walkthrough/`）已补跑通过（2026-10-17）。**长期遗留**：4 个传递依赖 unmaintained（上游生态债，deny 策略挡直依）、JDK/.NET 仍缺。**2026-10-17 收口**：v0.2.0 切版（CHANGELOG `[0.2.0]` 小节 + annotated tag + push）；GitHub Actions master CI 史上首次全绿（run 39039094305：gates/static-checks/supply-chain/windows-powershell 四 job 全过，supply-chain 自 10-06 上线以来首绿、依赖债清零）。修正后 master 头部 `3332b69`；tag `v0.2.0` 指向 46179e22（与其相差一行排序等价修复），retag 属用户决策。
 > 跟踪表: `plan/2026年9月19日-GW-R1实施计划.md`（动态更新，状态以该文件为准）+ `plan/2026年9月21日-FreePool实施计划-v2.md`（FreePool 第二线，supersede v1）
 > 优化表: `plan/2026年9月19日-OPT-R1优化方案.md`（已收官） + `plan/2026年9月21日-OPT-R2优化方案.md`（本轮）
 
