@@ -1431,3 +1431,13 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **截图档案**：`log/admin_ui_walkthrough/`（00~12 PNG：每页渲染、隔离前后/复原、交互日志；数据齐真：仪表盘 3 节点/1 租户/付费占比 100.0%，权重框 100/80/60，干旱红色横幅，隔离卡全 0）。
   - **收摊**：dev + 网关全杀，5173/9092/8916/9091 零监听；`npm run build` 复跑绿。门禁终扫 15/15 ✅（本轮改动=web/JSX 修复+docs 追加，Rust 四门前轮绿）。
 - **未 commit。**
+- **v0.2.0 发版切版与 push（2026-10-17 晚；用户指令「切0.2.0发版」，首次切 release + 首个 tag）**：
+  - **版本号四处 bump**：`gateway/Cargo.toml` version 0.1.0→0.2.0；Cargo.lock 同步（cargo check exit 0，lock 行 name="pingora-proxy-gateway" / version="0.2.0"）；`web/admin/package.json` 0.1.0→0.2.0；layout.tsx 顶栏徽标 v0.1.0 · Phase 1→v0.2.0 · Phase 1。
+  - **CHANGELOG 切版**：`[Unreleased]` 改名 `## [0.2.0] - 2026-10-17`（Added/Fixed/Changed/Security 四节齐）+ 新空 Unreleased（「暂无」）；check_changelog 门（Cargo.toml 版本须有对应小节）匹配 ✓。
+  - **.gitignore 扩充**：`web/admin/node_modules/`、`web/admin/dist/`不入库（package-lock.json 入库保证可复现，与 Cargo.lock 同理）；`log/*.png` + `log/**/*.png`（走查截图证据属进程产物）；`log/**/*.txt`（嵌套文本产物——首版只加 png 规则，walkthrough 子目录 6 个 .txt 仍裸露，发版收尾补齐）。
+  - **四门复跑全绿（发版前终验）**：cargo fmt --check exit 0；clippy --workspace -D warnings exit 0；test --locked --workspace **302 passed / 0 failed / 7 ignored**（与 QUALITY_BASELINE 一致）；bench --locked --no-run 3m32s（bench profile 编译目标 pingora_proxy_gateway-*.exe，实证 v0.2.0）。
+  - **15 门 Python 复扫 PASS=15 / FAIL=0**（supply-chain 门走 7890 代理；check_changelog 按新版本号判定）。
+  - **三提交分组 + tag**：`5b799f1` security(deps)（Cargo.toml/lock + deny.toml + check_supply_chain.py + SUPPLY_CHAIN.md）；`66295b6` feat(admin)（gateway/src ×16 + web/admin ×43 含 package-lock.json + ADMIN_API/ADMIN_UI 两契约 + deploy/README/FEATURES/QUALITY_BASELINE/CAPABILITY-AUDIT + bench_gateway.py；staged 断言 node_modules/dist/*.png 零渗漏）；`46179e2` chore(release)（CHANGELOG + EXEC_LOG + TASK_PLAN + .gitignore）。annotated tag `v0.2.0` 打在 46179e2。
+  - **push 实证（代理 7890；版本政策「bump 提交后打 tag 并推送」首次执行）**：前置分叉检查 0 behind / 3 ahead（可快进）；匿名 `git ls-remote origin HEAD` ✓（HEAD=8991dd2，网络通）；`git push origin master` → `8991dd2..46179e2 master -> master` exit 0；`git push origin v0.2.0` → `* [new tag] v0.2.0 -> v0.2.0` exit 0。凭据走 credential.helper=manager 静默通过。
+  - **发版后遗留转痕**：GitHub Actions 首跑（含 supply-chain job）由本次 push 触发，本机未核运行状态（「未实跑」遗留转为远端可观测项）。
+- **未 commit。**

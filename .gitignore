@@ -73,7 +73,10 @@ Desktop.ini
 web/admin/node_modules/
 web/admin/dist/
 
-# --- log/ 证据截图（冒烟/走查产物，与 log/*.out 同理不入库）---
+# --- log/ 证据截图与文本（冒烟/走查产物，与 log/*.out 同理不入库）---
+# `log/*.png` 等单星规则只匹配 log/ 直下；走查类证据在子目录（如
+# log/admin_ui_walkthrough/01_dashboard.png），补 `log/**/*.png` 嵌套规则。
+# `log/*.txt` 同理只覆盖直下，`log/**/*.txt` 收编子目录文本产物。
 # 只限定 log/：将来若需入库的界面设计稿等放别的目录。
 log/*.png
 log/**/*.png
