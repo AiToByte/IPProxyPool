@@ -9,6 +9,7 @@
 //! Deviation from manual-A2 (verified against redis 0.26.1 source): stream
 //! field values match on `Value::BulkString`, not `Value::Data`.
 
+use crate::metrics::MetricsRegistry;
 use crate::router::RouterEngine;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::collections::HashMap;
@@ -149,6 +150,9 @@ pub struct PassiveCircuitBreaker {
     consumer_group: String,
     consumer_name: String,
     router: Arc<RouterEngine>,
+    /// GW-6 熔断触发计数（per status：429/403/502/504），供 `/api/v1/circuit` 与
+    /// Prometheus `breaker_trigger_total{status}` 观测。
+    metrics: Arc<MetricsRegistry>,
     remote_stats: Arc<RemoteSyncStats>,
 }
 
@@ -159,6 +163,7 @@ impl PassiveCircuitBreaker {
         consumer_group: String,
         consumer_name: String,
         router: Arc<RouterEngine>,
+        metrics: Arc<MetricsRegistry>,
     ) -> Self {
         Self {
             redis_conn,
@@ -166,6 +171,7 @@ impl PassiveCircuitBreaker {
             consumer_group,
             consumer_name,
             router,
+            metrics,
             remote_stats: Arc::new(RemoteSyncStats::default()),
         }
     }
@@ -233,6 +239,8 @@ impl PassiveCircuitBreaker {
                 );
                 return;
             }
+            // GW-6：记录熔断触发计数（per status，供 `/api/v1/circuit` 与 Prometheus 观测）。
+            self.metrics.note_breaker_trigger(status);
             self.apply_quarantine(&domain, &event.out_ip, ttl).await;
         }
     }
@@ -487,6 +495,7 @@ mod tests {
             "circuit_breaker_group".to_string(),
             "itest".to_string(),
             router.clone(),
+            Arc::new(MetricsRegistry::new()),
         );
         cb.apply_quarantine(domain, out_ip, 5).await;
         // 1. Memory isolation: target domain blocked, others routable.

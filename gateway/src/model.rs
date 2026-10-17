@@ -37,7 +37,7 @@ pub struct ProxyNode {
 ///
 /// - `Http`：经典 HTTP 正向代理（存量全部节点＋免费 http/https 映射到此）；
 /// - `Socks5`/`Socks4`：经网关内翻译桥出站；默认选路永不命中（见 `RouterEngine::matches` 隔离）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum EgressProto {
     Http,
     Socks5,
@@ -147,6 +147,15 @@ pub struct ProxyContext {
     /// `logging` 复用同一向量做 reward 更新：省一次 `extract_context`
     ///（含时钟 syscall），且选学一致；粘滞路径为 None（logging 回落现算）。
     pub bandit_context: Option<VectorD>,
+    /// GW-6 选路完成（建链就绪）时刻，由 `upstream_peer` 记录；`logging` 用于
+    /// 计算 connect 阶段耗时。重试时被新选路覆盖，反映本次节点的连接耗时。
+    pub peer_connected_at: Option<Instant>,
+    /// GW-6 首字节到达时刻，由 `response_body_filter` 首次调用记录；`logging`
+    /// 用于计算 ttfb 阶段耗时。`fail_to_connect` 重置为 None，便于重试后重新计算。
+    pub first_byte_at: Option<Instant>,
+    /// GW-6 请求链路追踪 ID（`request_filter` 生成，下游带 `X-Trace-Id` 则沿用，
+    /// 否则本地生成 `{ms}-{pid}-{seq}`，贯穿五阶段并落入遥测）。
+    pub trace_id: String,
 }
 
 impl Default for ProxyContext {
@@ -163,6 +172,9 @@ impl Default for ProxyContext {
             transferred_bytes: 0,
             failed_addrs: Vec::new(),
             bandit_context: None,
+            peer_connected_at: None,
+            first_byte_at: None,
+            trace_id: String::new(),
         }
     }
 }

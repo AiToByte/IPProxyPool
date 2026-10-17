@@ -65,7 +65,13 @@ pub struct MetricsRegistry {
     bridge_errors: AtomicU64,
     /// NEXT-A4：内存隔离表水位（sweep 滴答同步 `quarantine_map.len()`）。
     quarantine_nodes: AtomicU64,
+    /// 按 provider 统计 403 响应数（per-provider 封禁比，与 `req_by_provider` 正交）。
     forbidden_by_provider: DashMap<String, AtomicU64>,
+    /// 按 (status_class, provider) 统计请求数，用于 per-provider 成功率/403 比例查询。
+    /// status_class ∈ {2xx, 4xx, 5xx, other}，provider 缺失时为 "none"。
+    /// 与现有 `forbidden_by_provider`（仅 403）正交，两者不冲突。
+    /// provider 基数有限（付费商 + free），不触发标签基数爆炸。
+    req_by_provider: DashMap<(String, String), AtomicU64>,
     bytes_total: AtomicU64,
     duration_buckets: Vec<AtomicU64>,
     duration_count: AtomicU64,
@@ -137,6 +143,23 @@ pub struct MetricsRegistry {
     /// OPT-R5 E5：按出口分组计数（`free_pool_exit_total{exit_ip}` 渲染；
     /// 轮转语义不在此处存“上次 exit”状态，由 PromQL `changes()` 看，见 render 注释）。
     free_exit_total: DashMap<String, AtomicU64>,
+    /// GW-6 五阶段耗时直方图写侧（stage ∈ connect/ttfb/transfer；ms；单原子写＋render 前缀累加，
+    /// 与主 histogram 同模式；tls 握手暂并入 connect，Pingora 不单独暴露）。
+    stage_connect_buckets: Vec<AtomicU64>,
+    stage_ttfb_buckets: Vec<AtomicU64>,
+    stage_transfer_buckets: Vec<AtomicU64>,
+    stage_connect_count: AtomicU64,
+    stage_connect_sum_ms: AtomicU64,
+    stage_ttfb_count: AtomicU64,
+    stage_ttfb_sum_ms: AtomicU64,
+    stage_transfer_count: AtomicU64,
+    stage_transfer_sum_ms: AtomicU64,
+    // GW-6：熔断触发计数，per status（429/403/502/504）。
+    breaker_trigger: DashMap<String, AtomicU64>,
+    // GW-6：LinUCB 分档强制探索总次数。
+    bandit_exploration: AtomicU64,
+    // GW-6：隔离域数（外层 domain 数，由 sweep 同步）。
+    quarantine_domains: AtomicU64,
 }
 
 /// OPT-R4 A4：u64 饱和累加（CAS 循环；长稳运行 sum 不回绕，Prometheus sum 曲线不倒退）。
@@ -149,6 +172,96 @@ fn saturating_add(target: &AtomicU64, delta: u64) {
             Err(actual) => cur = actual,
         }
     }
+}
+
+/// GW-6：免费池供给快照（Admin API `/api/v1/freepool/*` 用）。
+/// 所有字段均从已有计数器只读聚合，不新增指标字段；前端按
+/// `pass/(pass+tcp_fail+full_fail+geo_fail)` 计算整体验证成功率，
+/// 按 `nodes_total==0` 判定当前干旱，按 `elite/yield` 看各源出货质量。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct FreePoolSnapshot {
+    /// 当前合并进池的免费节点总数（gauge；0 即干旱）。
+    pub nodes_total: u64,
+    /// 当前是否干旱（nodes_total==0 的即时镜像）。
+    pub dry: bool,
+    /// 全局质检结果汇总。
+    pub verify: Vec<VerifyStat>,
+    /// 按出站协议分布，proto∈http/socks5/socks4。
+    pub by_proto: Vec<ProtoStat>,
+    /// 各源产出与抓取明细。
+    pub sources: Vec<FreePoolSourceStat>,
+    /// 匿名度分级，level∈elite/anonymous/transparent/unknown。
+    pub anonymity: Vec<AnonymityStat>,
+    /// 源站熔断状态。
+    pub suspended: Vec<SuspendedStat>,
+    /// 进检截断丢弃累计。
+    pub intake_capped: u64,
+    /// 基线不可达降级轮次。
+    pub baseline_fail: u64,
+    /// 容量淘汰累计。
+    pub evicted: u64,
+}
+
+/// 单源免费池产出与抓取明细（verify 结果按 result 全局汇总，不按源拆分）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct FreePoolSourceStat {
+    pub source: String,
+    /// 抓取产出节点数。
+    pub yield_total: u64,
+    /// Elite 节点数（`elite/yield` 可近似该源出货质量）。
+    pub elite_total: u64,
+    /// 来源抓取耗时和（ms，用于前端算均值）。
+    pub fetch_ms_sum: u64,
+    /// 来源抓取次数。
+    pub fetch_count: u64,
+}
+
+/// GW-6 断路器快照（Admin API `/api/v1/circuit` 用）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct BreakerSnapshot {
+    /// 熔断触发计数，per status（429/403/502/504）。
+    pub breaker_trigger: Vec<BreakerTriggerStat>,
+    /// LinUCB 分档强制探索总次数（tier_quota 强制选路）。
+    pub bandit_exploration: u64,
+    /// 隔离域数（外层 domain 数，区别于 quarantine_nodes 的内层 ip 数）。
+    pub quarantine_domains: u64,
+    /// 隔离条目总数（内层 ip 数）。
+    pub quarantine_nodes: u64,
+}
+
+/// 单状态熔断触发计数：(status, count)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct BreakerTriggerStat {
+    pub status: String,
+    pub count: u64,
+}
+
+/// 质检结果单项：(result, count)，result∈pass/tcp_fail/full_fail/geo_fail。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VerifyStat {
+    pub result: String,
+    pub count: u64,
+}
+
+/// 按协议的节点水位：(proto, count)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ProtoStat {
+    pub proto: String,
+    pub count: u64,
+}
+
+/// 匿名度单项：(level, count)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AnonymityStat {
+    pub level: String,
+    pub count: u64,
+}
+
+/// 源站熔断单项：(source, 0/1)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SuspendedStat {
+    pub source: String,
+    pub suspended: u64,
 }
 
 impl MetricsRegistry {
@@ -173,6 +286,7 @@ impl MetricsRegistry {
             bridge_errors: AtomicU64::new(0),
             quarantine_nodes: AtomicU64::new(0),
             forbidden_by_provider: DashMap::new(),
+            req_by_provider: DashMap::new(),
             bytes_total: AtomicU64::new(0),
             duration_buckets: (0..DURATION_BUCKETS_MS.len())
                 .map(|_| AtomicU64::new(0))
@@ -207,6 +321,24 @@ impl MetricsRegistry {
             free_fwd_count: AtomicU64::new(0),
             free_fwd_sum_ms: AtomicU64::new(0),
             free_exit_total: DashMap::new(),
+            stage_connect_buckets: (0..DURATION_BUCKETS_MS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stage_ttfb_buckets: (0..DURATION_BUCKETS_MS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stage_transfer_buckets: (0..DURATION_BUCKETS_MS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stage_connect_count: AtomicU64::new(0),
+            stage_connect_sum_ms: AtomicU64::new(0),
+            stage_ttfb_count: AtomicU64::new(0),
+            stage_ttfb_sum_ms: AtomicU64::new(0),
+            stage_transfer_count: AtomicU64::new(0),
+            stage_transfer_sum_ms: AtomicU64::new(0),
+            breaker_trigger: DashMap::new(),
+            bandit_exploration: AtomicU64::new(0),
+            quarantine_domains: AtomicU64::new(0),
         }
     }
 
@@ -252,6 +384,151 @@ impl MetricsRegistry {
     /// 免费池在池节点数（FreePool worker 每次合并后设置，只写不参与 observe）。
     pub fn set_free_pool_nodes(&self, n: u64) {
         self.free_pool_nodes.store(n, Ordering::Relaxed);
+    }
+
+    /// GW-6：免费池供给快照（Admin API `/api/v1/freepool/*` 用，只读）。
+    pub fn free_pool_snapshot(&self) -> FreePoolSnapshot {
+        // 各 source 名称并集（来自 yield/elite/fetch/suspended 的 key）。
+        let mut sources: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for e in self.free_source_yield.iter() {
+            sources.insert(e.key().clone());
+        }
+        for e in self.free_source_elite.iter() {
+            sources.insert(e.key().clone());
+        }
+        for e in self.free_fetch_ms_sum.iter() {
+            sources.insert(e.key().clone());
+        }
+        for e in self.free_fetch_count.iter() {
+            sources.insert(e.key().clone());
+        }
+        for e in self.free_suspended.iter() {
+            sources.insert(e.key().clone());
+        }
+
+        let get_yield = |s: &str| {
+            self.free_source_yield
+                .get(s)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+        let get_elite = |s: &str| {
+            self.free_source_elite
+                .get(s)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+        let get_fetch_sum = |s: &str| {
+            self.free_fetch_ms_sum
+                .get(s)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+        let get_fetch_cnt = |s: &str| {
+            self.free_fetch_count
+                .get(s)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+
+        let sources: Vec<FreePoolSourceStat> = sources
+            .into_iter()
+            .map(|source| FreePoolSourceStat {
+                source: source.clone(),
+                yield_total: get_yield(&source),
+                elite_total: get_elite(&source),
+                fetch_ms_sum: get_fetch_sum(&source),
+                fetch_count: get_fetch_cnt(&source),
+            })
+            .collect();
+
+        let verify: Vec<VerifyStat> = self
+            .free_verify
+            .iter()
+            .map(|e| VerifyStat {
+                result: e.key().clone(),
+                count: e.value().load(Ordering::Relaxed),
+            })
+            .collect();
+        let by_proto: Vec<ProtoStat> = self
+            .free_nodes_by_proto
+            .iter()
+            .map(|e| ProtoStat {
+                proto: e.key().clone(),
+                count: e.value().load(Ordering::Relaxed),
+            })
+            .collect();
+        let anonymity: Vec<AnonymityStat> = self
+            .free_anonymity
+            .iter()
+            .map(|e| AnonymityStat {
+                level: e.key().clone(),
+                count: e.value().load(Ordering::Relaxed),
+            })
+            .collect();
+        let suspended: Vec<SuspendedStat> = self
+            .free_suspended
+            .iter()
+            .map(|e| SuspendedStat {
+                source: e.key().clone(),
+                suspended: e.value().load(Ordering::Relaxed),
+            })
+            .collect();
+
+        FreePoolSnapshot {
+            nodes_total: self.free_pool_nodes.load(Ordering::Relaxed),
+            dry: self.free_pool_nodes.load(Ordering::Relaxed) == 0,
+            verify,
+            by_proto,
+            sources,
+            anonymity,
+            suspended,
+            intake_capped: self.free_intake_capped.load(Ordering::Relaxed),
+            baseline_fail: self.free_baseline_fail.load(Ordering::Relaxed),
+            evicted: self.free_evicted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// GW-6：记录一次熔断触发（仅 429/403/502/504，由 circuit_breaker 调用）。
+    pub fn note_breaker_trigger(&self, status: u16) {
+        match status {
+            429 | 403 | 502 | 504 => {
+                self.breaker_trigger
+                    .entry(status.to_string())
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// GW-6：记录一次 LinUCB 分档强制探索（tier_quota 强制选路）。
+    #[allow(dead_code)]
+    pub fn note_bandit_exploration(&self) {
+        self.bandit_exploration.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// GW-6：设置隔离域数（外层 domain 数，由 sweep 同步）。
+    pub fn set_quarantine_domains(&self, n: u64) {
+        self.quarantine_domains.store(n, Ordering::Relaxed);
+    }
+
+    /// GW-6：断路器快照（Admin API `/api/v1/circuit` 用，只读）。
+    pub fn breaker_snapshot(&self) -> BreakerSnapshot {
+        let breaker_trigger: Vec<BreakerTriggerStat> = self
+            .breaker_trigger
+            .iter()
+            .map(|e| BreakerTriggerStat {
+                status: e.key().clone(),
+                count: e.value().load(Ordering::Relaxed),
+            })
+            .collect();
+        BreakerSnapshot {
+            breaker_trigger,
+            bandit_exploration: self.bandit_exploration.load(Ordering::Relaxed),
+            quarantine_domains: self.quarantine_domains.load(Ordering::Relaxed),
+            quarantine_nodes: self.quarantine_nodes.load(Ordering::Relaxed),
+        }
     }
 
     /// OPT-R15：标记某落地端一次**成功**写入（`up=1` 并刷新 `last_ok`）。
@@ -474,6 +751,12 @@ impl MetricsRegistry {
     }
 
     pub fn observe(&self, status: u16, provider: Option<&str>, bytes: u64, duration: Duration) {
+        let status_class = match status {
+            200..=299 => "2xx",
+            400..=499 => "4xx",
+            500..=599 => "5xx",
+            _ => "other",
+        };
         match status {
             200..=299 => self.req_2xx.fetch_add(1, Ordering::Relaxed),
             // NEXT-A4：402/429 独立计数（仍进 4xx 总盘，不破坏存量口径）。
@@ -489,6 +772,12 @@ impl MetricsRegistry {
             500..=599 => self.req_5xx.fetch_add(1, Ordering::Relaxed),
             _ => self.req_other.fetch_add(1, Ordering::Relaxed),
         };
+        // 按 (status_class, provider) 计数，provider 缺失时用 "none"，供 per-provider 查询。
+        let provider_label = provider.unwrap_or("none").to_string();
+        self.req_by_provider
+            .entry((status_class.to_string(), provider_label))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
         if status == 403 {
             if let Some(p) = provider {
                 self.forbidden_by_provider
@@ -508,6 +797,35 @@ impl MetricsRegistry {
         }
         self.duration_count.fetch_add(1, Ordering::Relaxed);
         saturating_add(&self.duration_sum_ms, ms);
+    }
+
+    /// GW-6：记录某阶段耗时（ms，截断 60s），进入对应 histogram 桶。
+    /// stage ∈ connect/ttfb/transfer；未知阶段静默忽略，不污染指标。
+    pub fn observe_stage(&self, stage: &str, ms: u64) {
+        let ms = ms.min(60_000);
+        let (buckets, count, sum) = match stage {
+            "connect" => (
+                &self.stage_connect_buckets,
+                &self.stage_connect_count,
+                &self.stage_connect_sum_ms,
+            ),
+            "ttfb" => (
+                &self.stage_ttfb_buckets,
+                &self.stage_ttfb_count,
+                &self.stage_ttfb_sum_ms,
+            ),
+            "transfer" => (
+                &self.stage_transfer_buckets,
+                &self.stage_transfer_count,
+                &self.stage_transfer_sum_ms,
+            ),
+            _ => return,
+        };
+        if let Some(i) = DURATION_BUCKETS_MS.iter().position(|bound| ms <= *bound) {
+            buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+        count.fetch_add(1, Ordering::Relaxed);
+        saturating_add(sum, ms);
     }
 
     /// Render Prometheus text exposition (cumulative buckets).
@@ -531,6 +849,25 @@ impl MetricsRegistry {
             "proxy_requests_total{{status=\"other\"}} {}\n",
             self.req_other.load(Ordering::Relaxed)
         ));
+        // 按 (status_class, provider) 输出 per-provider 请求计数，供
+        // `sum by (provider)(rate(proxy_requests_total{status="2xx"}[5m]))` 等查询。
+        // provider 基数有限（付费商 + free），不触发标签基数爆炸。
+        let mut reqs: Vec<((String, String), u64)> = self
+            .req_by_provider
+            .iter()
+            .map(|e| {
+                (
+                    (e.key().0.clone(), e.key().1.clone()),
+                    e.value().load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        reqs.sort();
+        for ((status_class, provider), n) in reqs {
+            out.push_str(&format!(
+                "proxy_requests_total{{status=\"{status_class}\", provider=\"{provider}\"}} {n}\n"
+            ));
+        }
         out.push_str("# HELP proxy_requests_forbidden_total 403 responses by provider.\n");
         out.push_str("# TYPE proxy_requests_forbidden_total counter\n");
         let mut providers: Vec<(String, u64)> = self
@@ -595,6 +932,77 @@ impl MetricsRegistry {
         out.push_str(&format!(
             "gateway_processing_duration_ms_sum {}\n",
             self.duration_sum_ms.load(Ordering::Relaxed)
+        ));
+        // GW-6：五阶段耗时直方图（stage 标签区分 connect/ttfb/transfer；
+        // tls 握手暂并入 connect，Pingora 不单独暴露，后续可细化）。
+        for (stage, buckets, count, sum) in [
+            (
+                "connect",
+                &self.stage_connect_buckets,
+                &self.stage_connect_count,
+                &self.stage_connect_sum_ms,
+            ),
+            (
+                "ttfb",
+                &self.stage_ttfb_buckets,
+                &self.stage_ttfb_count,
+                &self.stage_ttfb_sum_ms,
+            ),
+            (
+                "transfer",
+                &self.stage_transfer_buckets,
+                &self.stage_transfer_count,
+                &self.stage_transfer_sum_ms,
+            ),
+        ] {
+            out.push_str(
+                "# HELP proxy_stage_duration_ms Per-stage gateway overhead histogram (ms).\n",
+            );
+            out.push_str("# TYPE proxy_stage_duration_ms histogram\n");
+            let mut cumulative = 0u64;
+            for (i, bound) in DURATION_BUCKETS_MS.iter().enumerate() {
+                cumulative += buckets[i].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "proxy_stage_duration_ms_bucket{{stage=\"{stage}\",le=\"{bound}\"}} {cumulative}\n"
+                ));
+            }
+            let n = count.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "proxy_stage_duration_ms_bucket{{stage=\"{stage}\",le=\"+Inf\"}} {n}\n"
+            ));
+            out.push_str(&format!(
+                "proxy_stage_duration_ms_count{{stage=\"{stage}\"}} {n}\n"
+            ));
+            out.push_str(&format!(
+                "proxy_stage_duration_ms_sum{{stage=\"{stage}\"}} {}\n",
+                sum.load(Ordering::Relaxed)
+            ));
+        }
+        // GW-6：断路器触发计数（per status：429/403/502/504）。
+        out.push_str("# HELP breaker_trigger_total Circuit breaker trigger count by status.\n");
+        out.push_str("# TYPE breaker_trigger_total counter\n");
+        let mut triggers: Vec<(String, u64)> = self
+            .breaker_trigger
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        triggers.sort();
+        for (s, n) in triggers {
+            out.push_str(&format!("breaker_trigger_total{{status=\"{s}\"}} {n}\n"));
+        }
+        // GW-6：LinUCB 分档强制探索总次数。
+        out.push_str("# HELP bandit_exploration_total LinUCB forced tier exploration count.\n");
+        out.push_str("# TYPE bandit_exploration_total counter\n");
+        out.push_str(&format!(
+            "bandit_exploration_total {}\n",
+            self.bandit_exploration.load(Ordering::Relaxed)
+        ));
+        // GW-6：隔离域数（外层 domain 数，区别于 quarantine_nodes 的内层 ip 数）。
+        out.push_str("# HELP quarantine_domains_total Quarantined domain count (outer level).\n");
+        out.push_str("# TYPE quarantine_domains_total gauge\n");
+        out.push_str(&format!(
+            "quarantine_domains_total {}\n",
+            self.quarantine_domains.load(Ordering::Relaxed)
         ));
         // OPT-4：落库重试一次仍失败的丢弃事件总数（常驻 0 行，便于 PromQL 告警）。
         out.push_str("# HELP telemetry_dropped_total Telemetry events dropped after one retry.\n");
@@ -1063,11 +1471,12 @@ mod tests {
         assert!(text.contains("proxy_requests_total{status=\"2xx\"} 1"));
         assert!(text.contains("proxy_requests_total{status=\"4xx\"} 1"));
         assert!(text.contains("proxy_requests_total{status=\"5xx\"} 1"));
+        // Phase 1：per-provider 计数，所有状态均携带 provider 标签。
+        assert!(text.contains("proxy_requests_total{status=\"2xx\", provider=\"mock-a\"} 1"));
+        assert!(text.contains("proxy_requests_total{status=\"4xx\", provider=\"mock-a\"} 1"));
+        assert!(text.contains("proxy_requests_total{status=\"5xx\", provider=\"mock-b\"} 1"));
+        // 403 专属计数保持不变。
         assert!(text.contains("proxy_requests_forbidden_total{provider=\"mock-a\"} 1"));
-        assert!(
-            !text.contains("provider=\"mock-b\""),
-            "only 403s counted per provider"
-        );
         assert!(text.contains("gateway_transferred_bytes_total 150"));
         // Cumulative buckets: 3ms lands in le>=5; 30ms in le>=50; 1200ms in le>=2500.
         assert!(text.contains("gateway_processing_duration_ms_bucket{le=\"1\"} 0"));

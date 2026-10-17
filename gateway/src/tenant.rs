@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,6 +37,8 @@ pub struct TenantAccount {
     /// Control-plane key id (map key); kept for billing joins (GW-R2).
     #[allow(dead_code)]
     pub api_key: String,
+    /// 注册时的 QPS 配额，供 Admin API 租户详情展示（governor 内部不直接暴露 qps）。
+    pub qps: u32,
     pub is_active: AtomicBool,
     pub limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
     pub in_flight: AtomicUsize,
@@ -199,13 +202,38 @@ pub fn is_loopback_listen(listen: &str) -> bool {
     }
 }
 
+/// Admin API 租户列表条目（只读，不暴露 governor 内部限流器状态）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TenantSummary {
+    pub tenant_id: String,
+    pub api_key: String,
+    pub is_active: bool,
+    pub qps: u32,
+    pub max_concurrency: usize,
+    pub in_flight: usize,
+    pub total_bytes: u64,
+    pub balance_usd: f64,
+}
+
+/// Admin API 租户详情（与 TenantSummary 同形态，保留扩展字段的位置，便于未来追加）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TenantDetail {
+    pub tenant_id: String,
+    pub api_key: String,
+    pub is_active: bool,
+    pub qps: u32,
+    pub max_concurrency: usize,
+    pub in_flight: usize,
+    pub total_bytes: u64,
+    pub balance_usd: f64,
+}
+
 impl TenantManager {
     pub fn new() -> Self {
         Self {
             tenants: DashMap::new(),
         }
     }
-
     /// R2-3 默认 burst：`qps/10`（至少 1）。突发容忍与限流强度解耦，
     /// 老调用按此换算后行为不变（`qps=1 → burst=1`，存量单测语义冻结）。
     pub fn default_burst_for_qps(qps: u32) -> u32 {
@@ -225,6 +253,7 @@ impl TenantManager {
         let account = Arc::new(TenantAccount {
             tenant_id: tenant_id.to_string(),
             api_key: api_key.to_string(),
+            qps,
             is_active: AtomicBool::new(true),
             limiter: RateLimiter::direct(quota),
             in_flight: AtomicUsize::new(0),
@@ -236,8 +265,7 @@ impl TenantManager {
     }
 
     /// Deactivate without dropping live references (billing holds `Arc`s).
-    /// Control-plane op (covered by unit tests; live use lands in GW-R2).
-    #[allow(dead_code)]
+    /// Control-plane op；Admin API `PATCH /tenants/{api_key}/active` 实时调用。
     pub fn set_active(&self, api_key: &str, active: bool) -> bool {
         match self.tenants.get(api_key) {
             Some(entry) => {
@@ -246,6 +274,64 @@ impl TenantManager {
             }
             None => false,
         }
+    }
+
+    /// Admin API：修改租户余额（USD），写入即生效（`AtomicF64` 共享有状态账户，
+    /// 存量持有 `Arc` 的账务引用下一帧读取即见新值）。返回是否存在该租户。
+    ///
+    /// # 非有限值由调用方拒绝（Admin handler 的 400）
+    ///
+    /// `NaN` 会绕过欠费门（`NaN <= 0.0` 为 false ⇒ 永不拒付），且 `fetch_sub`
+    /// 之后余额永久 isNaN——所以 `PATCH balance` 在 handler 侧必须校验
+    /// `is_finite()`，本方法不做二次裁决（单一职责：校验在 API 边界做一次）。
+    pub fn set_balance(&self, api_key: &str, balance_usd: f64) -> bool {
+        match self.tenants.get(api_key) {
+            Some(entry) => {
+                entry
+                    .value()
+                    .balance_usd
+                    .store(balance_usd, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Admin API：列出所有租户的摘要信息（只读，按注册顺序返回 DashMap 快照）。
+    pub fn list_tenants(&self) -> Vec<TenantSummary> {
+        self.tenants
+            .iter()
+            .map(|entry| {
+                let acc = entry.value();
+                TenantSummary {
+                    tenant_id: acc.tenant_id.clone(),
+                    api_key: acc.api_key.clone(),
+                    is_active: acc.is_active.load(Ordering::Relaxed),
+                    qps: acc.qps,
+                    max_concurrency: acc.max_concurrency,
+                    in_flight: acc.in_flight.load(Ordering::Relaxed),
+                    total_bytes: acc.total_bytes.load(Ordering::Relaxed),
+                    balance_usd: acc.balance_usd.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// Admin API：按 API Key 查询单个租户详情；不存在时返回 None。
+    pub fn tenant_detail(&self, api_key: &str) -> Option<TenantDetail> {
+        self.tenants.get(api_key).map(|entry| {
+            let acc = entry.value();
+            TenantDetail {
+                tenant_id: acc.tenant_id.clone(),
+                api_key: acc.api_key.clone(),
+                is_active: acc.is_active.load(Ordering::Relaxed),
+                qps: acc.qps,
+                max_concurrency: acc.max_concurrency,
+                in_flight: acc.in_flight.load(Ordering::Relaxed),
+                total_bytes: acc.total_bytes.load(Ordering::Relaxed),
+                balance_usd: acc.balance_usd.load(Ordering::Relaxed),
+            }
+        })
     }
 
     /// Auth + balance + QPS + concurrency gate. On success the caller owns one
@@ -479,6 +565,41 @@ mod tests {
         assert_eq!(err, "Insufficient balance");
         // 拒绝路径不取槽。
         assert_eq!(a.in_flight.load(Ordering::Relaxed), before);
+    }
+
+    // ---- Admin API：set_balance（PATCH /tenants/{api_key}/balance 实装）----
+
+    /// `set_balance` 写入即生效：detail 立即反映新值；**欠费门即刻跟上**
+    ///（置 0 ⇒ 下次鉴权 `Insufficient balance` 且不占槽；恢复余额后可通行）。
+    /// 这是 PATCH balance 从「改本地副本的假实现」到「实装」的核心验收。
+    #[test]
+    fn admin_set_balance_persists_and_gate_follows() {
+        let m = manager_with("k9", 10_000, 100);
+        assert!(m.set_balance("k9", 3.5));
+        let d = m.tenant_detail("k9").expect("detail");
+        assert!((d.balance_usd - 3.5).abs() < 1e-9, "detail 必须读到新余额");
+
+        // 置 0 ⇒ 欠费门拦截（不占槽；拒绝发生在 QPS/并发之前）。
+        assert!(m.set_balance("k9", 0.0));
+        let err = m.authenticate_and_throttle("k9").unwrap_err();
+        assert_eq!(err, "Insufficient balance");
+
+        // 恢复余额 ⇒ 可正常取槽；用完照常释放计量。
+        assert!(m.set_balance("k9", 1.0));
+        let acc = m.authenticate_and_throttle("k9").expect("balance restored");
+        m.release_and_meter(&acc, 0, "datacenter");
+    }
+
+    /// 幂等/容错面：未知 key 返回 false（与 `set_active` 同风格），
+    /// 不触碰任何既有租户。
+    #[test]
+    fn admin_set_balance_unknown_key_returns_false() {
+        let m = manager_with("k10", 10_000, 100);
+        assert!(!m.set_balance("ghost", 1.0));
+        assert!(
+            (m.tenant_detail("k10").expect("existing").balance_usd - 100.0).abs() < 1e-9,
+            "未知 key 的调用不得影响既有租户余额"
+        );
     }
 
     // ---- OPT-R12：鉴权密钥卫生 ----

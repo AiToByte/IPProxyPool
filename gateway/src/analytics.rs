@@ -111,7 +111,21 @@ pub struct AnalyticsEngine {
 }
 
 impl AnalyticsEngine {
+    /// 默认批次构造器（5000 行 / 1s，与 OPT-R5 口径一致）。
+    /// 保留供向后兼容；线上 main 已改用 `new_with_batch`（按 `CH_BATCH_SIZE` env）。
+    #[allow(dead_code)]
     pub fn new(ch_url: &str, user: &str, password: &str, database: &str) -> Self {
+        Self::new_with_batch(ch_url, user, password, database, ANALYTICS_BATCH_SIZE)
+    }
+
+    /// 批次可配构造器（供 main.rs 按 `CH_BATCH_SIZE` env 装配；下限 1）。
+    pub fn new_with_batch(
+        ch_url: &str,
+        user: &str,
+        password: &str,
+        database: &str,
+        batch_size: usize,
+    ) -> Self {
         let ch_client = Client::default()
             .with_url(ch_url)
             .with_user(user)
@@ -120,7 +134,7 @@ impl AnalyticsEngine {
             .with_compression(Compression::Lz4);
         Self {
             ch_client,
-            batch_size: ANALYTICS_BATCH_SIZE,
+            batch_size: batch_size.max(1),
             flush_interval: ANALYTICS_FLUSH_INTERVAL,
         }
     }
@@ -230,6 +244,7 @@ mod tests {
     fn row_from_event_maps_all_fields() {
         let e = crate::telemetry::TelemetryEvent {
             event_id: "evt-1".to_string(),
+            trace_id: String::new(),
             client_ip: "c".to_string(),
             target_domain: "d.example".to_string(),
             out_ip: "o".to_string(),

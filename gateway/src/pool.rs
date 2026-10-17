@@ -9,6 +9,7 @@
 //! is ever held across an `.await` (frozen repo rule).
 
 use crate::model::{EgressProto, RoutingSpec};
+use crate::net_connector::{TcpConnector, TokioTcpConnector};
 use crate::router::RouterEngine;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,8 @@ pub struct ConnectionPrewarmer {
     interval: Duration,
     /// R2-7 建链并发上限（信号量；默认 100，百节点池单轮齐探不 FD burst）。
     semaphore: Arc<Semaphore>,
+    /// GW-6 传输层连接器（默认 tokio，Linux 下预留 io_uring 接入点）。
+    connector: Arc<dyn TcpConnector + Send + Sync>,
 }
 
 /// R2-7 默认建链并发上限（与百节点池同量级；单轮齐探至多 100 并发建链）。
@@ -66,7 +69,17 @@ impl ConnectionPrewarmer {
             router,
             interval: PREWARM_INTERVAL,
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            connector: Arc::new(TokioTcpConnector {
+                timeout: PREWARM_TCP_TIMEOUT,
+            }),
         }
+    }
+
+    /// 注入自定义连接器（单测/Linux io_uring 接入用；线上走默认 tokio）。
+    #[allow(dead_code)]
+    pub fn with_connector(mut self, connector: Arc<dyn TcpConnector + Send + Sync>) -> Self {
+        self.connector = connector;
+        self
     }
 
     /// 注入滴答间隔的 builder（R2-8 env 覆盖用；默认 30s）。
@@ -104,6 +117,7 @@ impl ConnectionPrewarmer {
             for node in chunk {
                 let node = node.clone();
                 let sem = self.semaphore.clone();
+                let connector = self.connector.clone();
                 handles.push(tokio::spawn(async move {
                     // 许可在建链期间持有：并发建链数恒 ≤ 上限（FD 有界）。
                     // 拿不到许可（信号量关闭，理论不可达）按失败计，不 panic。
@@ -112,12 +126,13 @@ impl ConnectionPrewarmer {
                         Err(_) => return false,
                     };
                     match node.proto {
-                        EgressProto::Http => tokio::time::timeout(
-                            PREWARM_TCP_TIMEOUT,
-                            tokio::net::TcpStream::connect(node.addr.clone()),
-                        )
-                        .await
-                        .is_ok_and(|r| r.is_ok()),
+                        EgressProto::Http => {
+                            // GW-6：通过 TcpConnector 建链（默认 tokio，Linux 下预留 io_uring）。
+                            let addr = node.addr.clone();
+                            tokio::time::timeout(PREWARM_TCP_TIMEOUT, connector.connect(&addr))
+                                .await
+                                .is_ok_and(|r| r.is_ok())
+                        }
                         EgressProto::Socks5 | EgressProto::Socks4 => tokio::time::timeout(
                             PREWARM_TCP_TIMEOUT,
                             crate::socks_handshake::greet_only(&node.ip, node.port, node.proto),

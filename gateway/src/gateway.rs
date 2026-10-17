@@ -23,8 +23,9 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, Result};
 use pingora_proxy::{ProxyHttp, Session};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// OPT-R15：分档最小探索配额窗口大小。
 ///
@@ -68,6 +69,20 @@ pub struct SmartProxyGateway {
 ///   以便错误归因（坏 Key vs 缺 Key）保持可区分。
 pub fn should_reject_missing_api_key(require_api_key: bool, has_api_key_header: bool) -> bool {
     require_api_key && !has_api_key_header
+}
+
+/// GW-6：请求链路追踪 ID 发号器（`{unix_ms}-{pid}-{seq}`，本进程唯一）。
+/// 下游带 `X-Trace-Id` 则沿用，否则本地生成，贯穿五阶段并落入遥测。
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_trace_id() -> String {
+    let n = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        TelemetryEvent::now_unix_ms(),
+        std::process::id(),
+        n
+    )
 }
 
 /// 为门省省 API Key（OPT-R12 A3：单一真源）。
@@ -336,6 +351,12 @@ fn build_http_peer(node: &ProxyNode, target_host: &str) -> Result<Box<HttpPeer>>
     peer.options.connection_timeout = Some(Duration::from_millis(1500));
     peer.options.read_timeout = Some(Duration::from_millis(5000));
     peer.options.write_timeout = Some(Duration::from_millis(3000));
+    // GW-6：启用 idle_timeout（60s 空闲保留），使网关→上游代理节点的 TCP/TLS 连接
+    // 可跨请求复用。TLS 会话票据（session ticket）随连接复用自动获得，避免
+    // 对同一上游节点的重复 TLS 握手（显著降低 P99 延迟与 CPU 开销）。
+    // 与 `fingerprint::FingerprintHardener::apply_chrome_profile` 正交：后者只改
+    // 客户端 TLS 指纹头，不影响连接层复用。
+    peer.options.idle_timeout = Some(Duration::from_secs(60));
     FingerprintHardener::apply_chrome_profile(&mut peer);
     Ok(Box::new(peer))
 }
@@ -826,6 +847,18 @@ impl ProxyHttp for SmartProxyGateway {
         // R2-2 会话租户隔离：`{tenant}:{session}`，跨租户同名会话不串绑定。
         apply_tenant_namespace(&mut ctx.routing_spec, ctx.tenant_id.as_deref());
 
+        // GW-6：链路追踪 ID（下游带 `X-Trace-Id` 则沿用，否则本地生成，
+        // 贯穿五阶段并落入遥测）。
+        let trace_id = session
+            .req_header()
+            .headers
+            .get("X-Trace-Id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(next_trace_id);
+        ctx.trace_id = trace_id;
+
         // D1：free 匿名出口拒收下游凭据头（403，不占租户配额；网关自己的
         // X-API-Key 不在此列，见 free_tier_with_credentials 注释）。
         // OPT-R6 S1：探测口径抽到 `has_authorization`/`has_cookie` 自由函数，
@@ -886,6 +919,9 @@ impl ProxyHttp for SmartProxyGateway {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("default.target")
             .to_string();
+        // GW-6：选路完成（建链就绪时刻），logging 用于计算 connect 阶段耗时；
+        // 重试时被新选路覆盖，反映本次节点的连接耗时。
+        ctx.peer_connected_at = Some(Instant::now());
         // OPT-R6 S1（P0 安全）：**按实际选中节点**的档位兜底校验下游凭据头。
         // 旧护栏只看请求声明的 `X-Proxy-Tier`，而无 tier 声明的请求按权重选路
         // 时本就可能命中免费节点 → 带 `Authorization`/`Cookie` 的请求可经匿名
@@ -957,6 +993,8 @@ impl ProxyHttp for SmartProxyGateway {
     ) -> Box<Error> {
         // OPT-3：失败 attempt 的字节作废，新 attempt 从零累计（只计最后一次）。
         reset_retry_accounting(ctx);
+        // GW-6：重试前重置首字节时刻，下一轮重新计算 ttfb。
+        ctx.first_byte_at = None;
         // R2-2：记下失败节点，重试选路时排除（只换节点，不换重试次数语义）。
         record_failed_addr(ctx);
         if ctx.retry_count < ctx.max_retries {
@@ -983,6 +1021,10 @@ impl ProxyHttp for SmartProxyGateway {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        // GW-6：首次收到 body chunk 时记录首字节时刻，logging 用于计算 ttfb。
+        if ctx.first_byte_at.is_none() && body.is_some() {
+            ctx.first_byte_at = Some(Instant::now());
+        }
         if let Some(ref chunk) = body {
             ctx.transferred_bytes += chunk.len() as u64;
         }
@@ -991,6 +1033,30 @@ impl ProxyHttp for SmartProxyGateway {
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         let duration = ctx.start_time.elapsed();
+        // GW-6：五阶段耗时（近似：connect＝选路到 peer_connected_at，ttfb＝首字节到达，
+        // transfer＝剩余耗时；tls 握手并入 connect）。
+        let now_ms = duration.as_millis() as u64;
+        let connect_ms = ctx
+            .peer_connected_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+            .min(now_ms);
+        let ttfb_offset_ms = ctx
+            .first_byte_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(now_ms);
+        let ttfb_ms = ctx
+            .peer_connected_at
+            .and_then(|pc| {
+                ctx.first_byte_at
+                    .map(|fb| fb.duration_since(pc).as_millis() as u64)
+            })
+            .unwrap_or(0)
+            .min(now_ms);
+        let transfer_ms = now_ms.saturating_sub(ttfb_offset_ms);
+        self.metrics.observe_stage("connect", connect_ms);
+        self.metrics.observe_stage("ttfb", ttfb_ms);
+        self.metrics.observe_stage("transfer", transfer_ms);
         let status = session
             .response_written()
             .map(|r| r.status.as_u16())
@@ -1036,6 +1102,8 @@ impl ProxyHttp for SmartProxyGateway {
             publisher.emit(TelemetryEvent {
                 // R2-4：id 留空由 emit 配号（`{ms}-{pid}-{seq}`，XADD 幂等）。
                 event_id: String::new(),
+                // GW-6：链路追踪 ID，贯穿五阶段，便于 ClickHouse 钻取单请求全链路。
+                trace_id: ctx.trace_id.clone(),
                 client_ip: ctx.client_ip.clone(),
                 target_domain: ctx.routing_spec.target_domain.clone(),
                 out_ip: node_ip.to_string(),

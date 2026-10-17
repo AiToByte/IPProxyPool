@@ -5,12 +5,13 @@
 //! `snapshot_all` 导出全量快照（供网关臂表修剪用），三者皆为长稳运行防内存泄漏之用。
 
 use crate::janitor;
-use crate::model::{ProxyNode, RoutingSpec};
+use crate::model::{EgressProto, ProxyNode, RoutingSpec};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 #[cfg(test)]
 use rand::seq::SliceRandom;
 use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,20 @@ pub fn normalize_domain(raw: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// GW-6 Top-K 热节点数量（按 weight 降序截断，供分桶未命中时的快速兜底）。
+/// 64 个节点足以覆盖高流量热点，内存占用 negligible；每次池替换时重排。
+pub(crate) const HOT_NODES_K: usize = 64;
+
+/// GW-6 选路分桶键（tier + country + proto）。
+/// 用于 O(1) 哈希命中候选桶，替代全量池 O(N) 扫描，显著降低数据面延迟。
+/// `proto` 存 `Some`（Http/Socks5/Socks4），分桶与 `matches` 的 proto 隔离语义对齐。
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct BucketKey {
+    pub tier: String,
+    pub country: String,
+    pub proto: Option<EgressProto>,
+}
+
 pub struct RouterEngine {
     /// R2-6：池内节点以 `Arc` 持有。读路径只做 `Arc` 克隆（一次原子 +1，
     /// 不碰 `ip/country/tier/provider` 四个 `String`）；控制面整体替换仍无锁。
@@ -126,6 +141,17 @@ pub struct RouterEngine {
     /// NEXT-B6：免费套利因子表（(provider, country小写)→factor；`merge_once` 应用，
     /// 审计 scale 不再被下轮合并覆盖；缺省 1.0；键空间随池多样性有界）。
     free_scale: DashMap<(String, String), f64>,
+    /// GW-6：按 (tier, country, proto) 分桶的只读索引。
+    /// 写路径（reload/replace/adjust）原子重建，读路径 O(1) 哈希命中候选桶，
+    /// 避免 O(N) 全量池扫描，显著降低数据面选路延迟（免费池缺省 2000 节点时
+    /// 每请求从 ~2000 次归一/匹配降至同桶十几次）。
+    buckets: ArcSwap<HashMap<BucketKey, Vec<Arc<ProxyNode>>>>,
+    /// GW-6：Top-K 热节点（按 weight 降序截断 HOT_NODES_K），供分桶未命中时的
+    /// 快速兜底。每次池替换时重排，无访问计数器开销，实现简单且可预测。
+    hot_nodes: ArcSwap<Vec<Arc<ProxyNode>>>,
+    /// GW-6 自动调权：付费节点基准权重（addr → boost 前的原始权重），供
+    /// 免费池干旱时上调付费权重、恢复后还原。仅记录非 free provider 节点。
+    paid_base_weight: DashMap<String, u32>,
 }
 
 /// NEXT-B6：因子表键（provider 精确＋country 小写；与匹配侧 `eq_ignore_ascii_case` 同语义）。
@@ -150,14 +176,65 @@ fn session_sticky_allowed(
     true
 }
 
+// =====================================================================
+// GW-5 Admin REST API 只读查询访问器（Phase 1：节点/租户管理后台数据源）。
+// NodeFilter 定义在模块级，供 `list_nodes` 与 `admin.rs` 引用。
+// =====================================================================
+
+/// Admin API 节点列表过滤条件。全部字段可选，未设置则不过滤。
+/// 需 `Deserialize` 以供 axum `Query` extractor 从 URL 查询字符串反序列化。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NodeFilter {
+    pub tier: Option<String>,
+    pub country: Option<String>,
+    pub proto: Option<String>,
+}
+
 impl RouterEngine {
     pub fn new(initial_nodes: Vec<ProxyNode>) -> Self {
+        let pools_vec: Vec<Arc<ProxyNode>> = initial_nodes.into_iter().map(Arc::new).collect();
+        let buckets = Self::build_buckets(&pools_vec);
+        let hot_nodes = Self::build_hot_nodes(&pools_vec);
         Self {
-            pools: ArcSwap::from_pointee(initial_nodes.into_iter().map(Arc::new).collect()),
+            pools: ArcSwap::from_pointee(pools_vec),
             session_store: DashMap::new(),
             quarantine_map: DashMap::new(),
             free_scale: DashMap::new(),
+            buckets: ArcSwap::from_pointee(buckets),
+            hot_nodes: ArcSwap::from_pointee(hot_nodes),
+            paid_base_weight: DashMap::new(),
         }
+    }
+
+    /// GW-6：从池快照构建分桶索引（weight==0 节点不入桶，选路阶段已过滤）。
+    /// 桶内按 `Arc` 持有（引用计数 +1，不克隆节点 String），与 `pools` 复用同一批节点句柄。
+    fn build_buckets(pools: &[Arc<ProxyNode>]) -> HashMap<BucketKey, Vec<Arc<ProxyNode>>> {
+        let mut map: HashMap<BucketKey, Vec<Arc<ProxyNode>>> = HashMap::new();
+        for n in pools {
+            if n.weight == 0 {
+                continue;
+            }
+            let key = BucketKey {
+                tier: n.tier.clone(),
+                country: n.country.clone(),
+                proto: Some(n.proto),
+            };
+            map.entry(key).or_default().push(Arc::clone(n));
+        }
+        map
+    }
+
+    /// GW-6：从池快照构建 Top-K 热节点（weight 降序，截断 HOT_NODES_K）。
+    /// 无访问计数器开销，每次池替换时重排，行为可预测。
+    fn build_hot_nodes(pools: &[Arc<ProxyNode>]) -> Vec<Arc<ProxyNode>> {
+        let mut live: Vec<Arc<ProxyNode>> = pools
+            .iter()
+            .filter(|n| n.weight > 0)
+            .map(Arc::clone)
+            .collect();
+        live.sort_by(|a, b| b.weight.cmp(&a.weight));
+        live.truncate(HOT_NODES_K);
+        live
     }
 
     /// NEXT-B6：查询免费套利因子（merge 应用；缺省 1.0 即无缩放）。
@@ -222,12 +299,44 @@ impl RouterEngine {
             .insert(ip.to_string(), expiry);
     }
 
+    /// Admin API：移除一条隔离条目（`set_quarantine` 的对称解除操作）。
+    ///
+    /// - domain 与写入侧共用同一 `normalize_domain` 归一口径：调用方传什么
+    ///   原始形式（大小写/带端口）结果一致，`A.COM:443` 与 `a.com` 落同一条目；
+    /// - 返回**是否真的删掉了条目**（未隔离过 / 已过期被 sweep 清掉 ⇒ false，
+    ///   幂等：重复解除无害）；
+    /// - 删除后内层为空则回收外层 domain（与 `sweep_expired_at` 的空内层回收
+    ///   同语义：外层 key 空间客户端可控，留着就是纯内存泄漏，新 version 接入
+    ///   Admin DELETE 后不再依赖 sweep 兜底这一条）；
+    /// - 空 domain（归一化后）直接 false，不触碰外层表。
+    pub fn remove_quarantine(&self, domain: &str, ip: &str) -> bool {
+        let domain = normalize_domain(domain);
+        if domain.is_empty() {
+            return false;
+        }
+        let removed = self
+            .quarantine_map
+            .get(&domain)
+            .map(|inner| inner.remove(ip).is_some())
+            .unwrap_or(false);
+        if removed {
+            // 空内层回收。⚠️ 外层 `Ref` 守卫持分片读锁，必须先释放再取外层写锁
+            //（`DashMap::remove` 与 `get` 同分片会死锁）——`drop(inner)` 显式断点，
+            // 与 `sweep_expired_at` 的「先判后删两趟」同一纪律。
+            if let Some(inner) = self.quarantine_map.get(&domain) {
+                if inner.is_empty() {
+                    drop(inner);
+                    self.quarantine_map.remove(&domain);
+                }
+            }
+        }
+        removed
+    }
+
     /// 隔离表外层条目数（`QUARANTINE_MAX_DOMAINS` 水位的可观测口径）。
     ///
     /// 与 `quarantine_len`（内层 ip 条目总数，供 metrics gauge 用）刻意区分：
-    /// 水位卡的是**外层**，所以需要一个能看见外层的计数。生产侧目前只用于
-    /// 指标/排障需求未接入，故先仅供测试与按需调用。
-    #[cfg(test)]
+    /// 水位卡的是**外层**，所以需要一个能看见外层的计数。
     pub fn quarantine_domains(&self) -> usize {
         self.quarantine_map.len()
     }
@@ -514,28 +623,32 @@ impl RouterEngine {
         }
 
         // 2. Filter snapshot（spec 已在入口归一，直接用）。
+        // GW-6 分桶快路径：当 spec 完全指定 tier+country+proto 时，O(1) 哈希命中
+        // 对应桶，避免 O(N) 全量池扫描；否则回退原有全量扫描（语义完全一致，
+        // 粘滞会话/quarantine/excluded 复核与原实现逐字同构）。
         let guard = self.pools.load();
-        // 3. Weighted random pick。
-        //
-        // OPT-R11 B1：原为「先把全部候选物化成 `Vec<Arc<ProxyNode>>`，再调
-        // `pick_weighted` 取一个」——物化的唯一用途就是喂给只需要一个元素的
-        // 函数。`FREE_MAX_NODES=2000` 缺省时每请求约 16KB 分配 + 2000 次原子
-        // 引用计数递增 + 约 11 次 realloc。改走流式两趟（`total`/`count` 一趟、
-        // 定位一趟），**分配量 O(N) → 0**。
-        //
-        // 过滤条件与顺序逐字沿用旧实现（`excluded` 先判、`matches` 后判），
-        // 故候选集合与遍历顺序不变 ⇒ 与 `pick_weighted` 逐值等价
-        // （差分测试见 `opt_r11_b1_pick_weighted_streaming_matches_reference`）。
-        let mut rng = rand::thread_rng();
-        let selected = pick_weighted_streaming(
-            || {
-                guard
-                    .iter()
-                    .filter(|n| !excluded.iter().any(|e| e == &n.addr))
-                    .filter(|n| self.matches(n, &spec, now))
-            },
-            &mut rng,
-        );
+        let selected = if let (Some(tier), Some(country), Some(proto)) =
+            (spec.tier.as_deref(), spec.country.as_deref(), spec.proto)
+        {
+            let key = BucketKey {
+                tier: tier.to_string(),
+                country: country.to_string(),
+                proto: Some(proto),
+            };
+            self.select_from_bucket(&key, excluded, &spec, now, &mut rand::thread_rng())
+        } else {
+            // 3. Weighted random pick（全量回退，与 OPT-R11 B1 流式两趟等价）。
+            let mut rng = rand::thread_rng();
+            pick_weighted_streaming(
+                || {
+                    guard
+                        .iter()
+                        .filter(|n| !excluded.iter().any(|e| e == &n.addr))
+                        .filter(|n| self.matches(n, &spec, now))
+                },
+                &mut rng,
+            )
+        };
 
         // 4. Bind new session.
         // OPT-R4 A7：落表前过准入（超长/满水位新 key 不落表，只用无状态选中节点）。
@@ -549,12 +662,40 @@ impl RouterEngine {
         selected
     }
 
+    /// GW-6：从指定桶内做加权随机选路（排除 excluded、复核 quarantine/matches）。
+    /// 桶内节点已按 weight>0 预过滤且 tier/country/proto 均与 key 一致，此处只
+    /// 做 excluded + matches 二次复核（matches 内含 quarantine 双检）。
+    /// 复杂度 O(桶大小) 而非 O(全池大小)，桶通常十几到几百个节点。
+    fn select_from_bucket(
+        &self,
+        key: &BucketKey,
+        excluded: &[String],
+        spec: &RoutingSpec,
+        now: Instant,
+        rng: &mut impl Rng,
+    ) -> Option<Arc<ProxyNode>> {
+        let buckets_guard = self.buckets.load();
+        let bucket = buckets_guard.get(key)?;
+        pick_weighted_streaming(
+            || {
+                bucket.iter().filter(|n| {
+                    !excluded.iter().any(|e| e == &n.addr) && self.matches(n, spec, now)
+                })
+            },
+            rng,
+        )
+    }
+
     /// 全量原子替换池子（稳定 API：控制面热更新，零停机）。
     /// 生产流量走快照读；测试与运维手工调用。allow 保留供控制面演进。
     #[allow(dead_code)]
     pub fn reload_nodes(&self, new_nodes: Vec<ProxyNode>) {
-        self.pools
-            .store(Arc::new(new_nodes.into_iter().map(Arc::new).collect()));
+        let pools_vec: Vec<Arc<ProxyNode>> = new_nodes.into_iter().map(Arc::new).collect();
+        let buckets = Self::build_buckets(&pools_vec);
+        let hot_nodes = Self::build_hot_nodes(&pools_vec);
+        self.pools.store(Arc::new(pools_vec));
+        self.buckets.store(Arc::new(buckets));
+        self.hot_nodes.store(Arc::new(hot_nodes));
     }
 
     /// 按 provider 前缀原子替换（FreePool 合并入口）。
@@ -568,7 +709,11 @@ impl RouterEngine {
             .map(Arc::clone)
             .collect();
         next.extend(nodes.into_iter().map(Arc::new));
+        let buckets = Self::build_buckets(&next);
+        let hot_nodes = Self::build_hot_nodes(&next);
         self.pools.store(Arc::new(next));
+        self.buckets.store(Arc::new(buckets));
+        self.hot_nodes.store(Arc::new(hot_nodes));
         // OPT-R4 B11：merge（含空快照）后顺带清理僵尸因子。
         self.prune_free_scales();
     }
@@ -591,7 +736,84 @@ impl RouterEngine {
                 }
             })
             .collect();
+        let buckets = Self::build_buckets(&next);
+        let hot_nodes = Self::build_hot_nodes(&next);
         self.pools.store(Arc::new(next));
+        self.buckets.store(Arc::new(buckets));
+        self.hot_nodes.store(Arc::new(hot_nodes));
+    }
+
+    /// GW-6 自动调权：将付费节点（`provider` 不以 `free` 开头）权重设为
+    /// `clamp(base_weight * boost_percent / 100, 1, 200)`；
+    /// `boost_percent=100` 时还原基准权重。`free` 节点不受影响。
+    /// 权重变更后原子重建池＋分桶索引，下一轮选路立即生效，无需重启网关。
+    ///
+    /// 基准权重在首次调用时按各节点当时权重记录，后续调用以已记录基准为准，
+    /// 避免反复上调导致权重阶梯式膨胀；免费池干旱恢复后，调用方以
+    /// `boost_percent=100` 还原。
+    pub fn set_paid_weight_boost(&self, boost_percent: u32) {
+        let boost = boost_percent.clamp(1, 500);
+        let guard = self.pools.load();
+        let next: Vec<Arc<ProxyNode>> = guard
+            .iter()
+            .map(|n| {
+                if n.provider.starts_with("free") {
+                    return Arc::clone(n);
+                }
+                let base = *self
+                    .paid_base_weight
+                    .entry(n.addr.clone())
+                    .or_insert_with(|| n.weight);
+                let mut updated = (**n).clone();
+                updated.weight = base.saturating_mul(boost).saturating_div(100).clamp(1, 200);
+                Arc::new(updated)
+            })
+            .collect();
+        let buckets = Self::build_buckets(&next);
+        let hot_nodes = Self::build_hot_nodes(&next);
+        self.pools.store(Arc::new(next));
+        self.buckets.store(Arc::new(buckets));
+        self.hot_nodes.store(Arc::new(hot_nodes));
+    }
+
+    // =====================================================================
+    // GW-5 Admin REST API 只读查询访问器（Phase 1：节点/租户管理后台数据源）。
+    // 全部为只读，不修改任何运行时状态，可安全并发调用。
+    // =====================================================================
+
+    /// 按 `ip:port` 地址精确查找单个节点（Admin API `/api/v1/nodes/{addr}` 用）。
+    pub fn get_node_by_addr(&self, addr: &str) -> Option<Arc<ProxyNode>> {
+        let guard = self.pools.load();
+        guard.iter().find(|n| n.addr == addr).cloned()
+    }
+
+    /// 按条件列举节点（Admin API `/api/v1/nodes` 用）。
+    /// 对 tier/country 做大小写不敏感匹配；proto 与 `EgressProto` 的字符串表示对齐。
+    pub fn list_nodes(&self, filter: &NodeFilter) -> Vec<Arc<ProxyNode>> {
+        let guard = self.pools.load();
+        let tier = filter.tier.as_deref().map(|t: &str| t.to_ascii_lowercase());
+        let country = filter
+            .country
+            .as_deref()
+            .map(|c: &str| c.to_ascii_lowercase());
+        let proto = filter
+            .proto
+            .as_deref()
+            .map(|p: &str| p.to_ascii_lowercase());
+        guard
+            .iter()
+            .filter(|n| {
+                tier.as_deref()
+                    .is_none_or(|t| n.tier.eq_ignore_ascii_case(t))
+                    && country
+                        .as_deref()
+                        .is_none_or(|c| n.country.eq_ignore_ascii_case(c))
+                    && proto
+                        .as_deref()
+                        .is_none_or(|p| format!("{:?}", n.proto).to_ascii_lowercase() == *p)
+            })
+            .cloned()
+            .collect()
     }
 
     /// OPT-R4 B11：清理僵尸因子——池内已无对应 vendor×country 节点即删键。
@@ -1842,6 +2064,79 @@ mod tests {
             );
         }
         assert_eq!(r.quarantine_len(), 1, "五个变体应落同一条目");
+    }
+
+    // ---- Admin API：`remove_quarantine`（解除隔离，`set_quarantine` 的对称操作）----
+
+    /// 解除目标 ip：内层条目被删、**空内层回收外层 domain**（与 sweep 同语义，
+    /// 否则 Admin DELETE 每次调用都留一个空外层，key 空间客户端可控 ⇒ 泄漏）。
+    /// 解除的条目必须真的从选路判定中消失。
+    #[test]
+    fn admin_remove_quarantine_removes_target_and_recycles_empty_outer() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("a.example", "10.0.0.1", 600);
+        assert_eq!(r.quarantine_len(), 1);
+        assert_eq!(r.quarantine_domains(), 1);
+
+        assert!(
+            r.remove_quarantine("a.example", "10.0.0.1"),
+            "已隔离条目必须可解除"
+        );
+        assert_eq!(r.quarantine_len(), 0, "解除后内层不得残留");
+        assert_eq!(r.quarantine_domains(), 0, "空内层必须回收外层 domain");
+        let now = Instant::now();
+        assert!(
+            !r.is_quarantined("a.example", "10.0.0.1", now),
+            "解除后的 (domain, ip) 必须恢复可用"
+        );
+    }
+
+    /// 同 domain 下的另一条隔离**不得被牵连**：解除 10.0.0.1 后 10.0.0.2 仍隔离，
+    /// 外层 domain 因内层非空而保留。
+    #[test]
+    fn admin_remove_quarantine_keeps_other_ip_in_same_domain() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("a.example", "10.0.0.1", 600);
+        r.set_quarantine("a.example", "10.0.0.2", 600);
+        assert_eq!(r.quarantine_len(), 2);
+
+        assert!(r.remove_quarantine("a.example", "10.0.0.1"));
+        assert_eq!(r.quarantine_len(), 1, "只解除目标 ip 一条");
+        assert_eq!(r.quarantine_domains(), 1, "内层非空 ⇒ 外层保留");
+        let now = Instant::now();
+        assert!(!r.is_quarantined("a.example", "10.0.0.1", now));
+        assert!(
+            r.is_quarantined("a.example", "10.0.0.2", now),
+            "同域另一节点的隔离不得被解除操作牵连"
+        );
+    }
+
+    /// 幂等与归一化：
+    /// - 未隔离过的条目返回 false（重复解除无害，不 panic 不造假成功）；
+    /// - 写入与解除共用同一 `normalize_domain` 口径（`A.COM:443` ≡ `a.com`）；
+    /// - 空 domain 不触碰外层表。
+    #[test]
+    fn admin_remove_quarantine_idempotent_normalized_and_empty_domain() {
+        let r = RouterEngine::new(vec![]);
+        r.set_quarantine("A.COM:443", "10.0.0.1", 600);
+        assert!(
+            r.remove_quarantine("a.COM", "10.0.0.1"),
+            "解除与写入必须共用归一口径（大小写/端口变体同一条目）"
+        );
+        assert!(
+            !r.remove_quarantine("A.COM:443", "10.0.0.1"),
+            "重复解除应 false"
+        );
+        assert!(
+            !r.remove_quarantine("never-set.example", "10.0.0.1"),
+            "未隔离过的 domain 应 false"
+        );
+        let len_before = r.quarantine_len();
+        assert!(
+            !r.remove_quarantine("", "10.0.0.1"),
+            "空 domain 不得触碰外层表"
+        );
+        assert_eq!(r.quarantine_len(), len_before);
     }
 
     /// 本轮**顺带修掉的潜在缺陷**：旧扁平 key 用 `:` 拼接，而 `normalize_domain`

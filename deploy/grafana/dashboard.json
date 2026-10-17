@@ -114,6 +114,59 @@
         }
       ],
       "gridPos": { "h": 6, "w": 12, "x": 12, "y": 18 }
+    },
+    {
+      "id": 8,
+      "title": "Per-provider 成功率 (2xx 占比)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(proxy_requests_total{status=\"2xx\"}[5m])) / sum by (provider) (rate(proxy_requests_total[5m])) * 100",
+          "refId": "A",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 18, "x": 0, "y": 24 }
+    },
+    {
+      "id": 9,
+      "title": "免费池节点水位",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "free_pool_nodes_total",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 24 }
+    },
+    {
+      "id": 10,
+      "title": "SOCKS 桥错误总数",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "socks_bridge_errors_total",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 24, "y": 24 }
+    },
+    {
+      "id": 11,
+      "title": "隔离条目水位",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "quarantine_nodes",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 30, "y": 24 }
     }
   ]
 }

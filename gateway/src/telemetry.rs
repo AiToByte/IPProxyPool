@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::metrics::MetricsRegistry;
+use crate::redis_shard::RedisStreamSharder;
 
 /// OPT-R15：`telemetry_sink_up{backend="redis"}` 的 backend 标签。
 /// Redis 挂了 ⇒ 数据进不了 stream，`ChSinkWorker` 也就无源可读，整条遥测链断在第一级。
@@ -43,6 +44,10 @@ pub struct TelemetryEvent {
     /// 跨实例同毫秒同 seq 的理论碰撞由 pid 隔离。
     #[serde(default)]
     pub event_id: String,
+    /// GW-6 链路追踪 ID（`{unix_ms}-{pid}-{seq}`，贯穿五阶段；老 JSON 缺失时
+    /// 按 `""` 反序列化，不影响既有查询）。
+    #[serde(default)]
+    pub trace_id: String,
     pub client_ip: String,
     pub target_domain: String,
     pub out_ip: String,
@@ -148,7 +153,6 @@ fn encode_batch(
 pub struct TelemetryWorker {
     receiver: mpsc::Receiver<TelemetryEvent>,
     redis_conn: ConnectionManager,
-    stream_key: String,
     batch_size: usize,
     flush_interval: Duration,
     /// OPT-4 丢弃计数：flush 重试一次仍失败时累加于此。
@@ -163,6 +167,8 @@ pub struct TelemetryWorker {
     metrics: Arc<MetricsRegistry>,
     /// R2-4 空 id 回填序号（正常只走 emit 配号；直调 worker 的单测/旧代码走这里）。
     fallback_seq: u64,
+    /// GW-6：Redis Stream 分片数（默认 1=单 stream，兼容现有行为）。
+    stream_shards: usize,
 }
 
 impl TelemetryWorker {
@@ -170,23 +176,25 @@ impl TelemetryWorker {
     ///
     /// - `flush_dropped` 必须与 metrics 注册表共享同一个 `Arc`（见 `main.rs`），
     ///   以便丢弃数实时进 `telemetry_dropped_total`；
-    /// - 签名变更（OPT-4/R2-4）：调用方（main + live 单测）需同步传入计数器。
+    /// - 签名变更（OPT-4/R2-4/GW-6）：调用方（main + live 单测）需同步传入计数器
+    ///   与分片数；`stream_key` 内部由 `RedisStreamSharder` 决定（shards=1 时即
+    ///   `stream:proxy:telemetry`，与历史行为一致）。
     pub fn new(
         receiver: mpsc::Receiver<TelemetryEvent>,
         redis_conn: ConnectionManager,
-        stream_key: String,
         flush_dropped: Arc<AtomicU64>,
         metrics: Arc<MetricsRegistry>,
+        stream_shards: usize,
     ) -> Self {
         Self {
             receiver,
             redis_conn,
-            stream_key,
             batch_size: TELEMETRY_BATCH_SIZE,
             flush_interval: TELEMETRY_FLUSH_INTERVAL,
             flush_dropped,
             metrics,
             fallback_seq: 0,
+            stream_shards: stream_shards.max(1),
         }
     }
 
@@ -228,44 +236,62 @@ impl TelemetryWorker {
                 event.event_id = format!("{}-fallback-{}", event.timestamp, self.fallback_seq);
             }
         }
-        let batch_len = batch.len() as u64;
-        let mut pipe = redis::pipe();
-        // A2：只统计实际进 pipe 的 queued；序列化失败单独计数，不按整批累加。
-        let queued = encode_batch(&batch, &self.stream_key, &mut pipe, |e| {
-            serde_json::to_string(e).ok()
-        });
-        let ser_failed = batch_len.saturating_sub(queued);
-        if ser_failed > 0 {
-            self.flush_dropped.fetch_add(ser_failed, Ordering::Relaxed);
+        // GW-6：按 shard 分流。shards=1 时走原单 stream 逻辑（零行为变更）。
+        let sharder = RedisStreamSharder::new(self.stream_shards);
+        let mut shard_batches: Vec<Vec<TelemetryEvent>> = vec![Vec::new(); sharder.shards()];
+        for event in batch {
+            let i = sharder.shard_for_domain(&event.target_domain);
+            shard_batches[i].push(event);
         }
 
-        // OPT-4：失败 → 睡 100ms 重发一次 → 仍失败则丢弃并计数（原来静默丢）。
-        // R2-9：重试是同一 pipe 重放（自动 ID 下产生新条目，重复由 sink 侧
-        // payload `event_id` 去重窗对消）。
-        // A2：queued==0 说明整批序列化失败（buffer 已被 take，不能静默 return
-        // 漏计）：上面已单独计数，这里打 warn 后返回；空 pipe 不 query。
-        if queued == 0 {
-            log::warn!("[TelemetryWorker] serialize failed, dropped {batch_len} events");
-            // OPT-R15：序列化失败**不**标记落地端不健康——那是网关自己的问题，
-            // 标到 Redis/ClickHouse 上会把责任指错方向，也无法靠改依赖解决。
-            return;
-        }
-        let mut conn = self.redis_conn.clone();
-        if let Err(first) = pipe.query_async::<()>(&mut conn).await {
-            log::warn!("[TelemetryWorker] flush failed ({first:?}), retrying once");
-            // OPT-R15：首次失败即置 `up=0`（语义是"最近一次尝试"，告警侧用持续时间过滤毛刺）。
-            self.metrics.mark_sink_failed(SINK_BACKEND_REDIS);
-            tokio::time::sleep(TELEMETRY_FLUSH_RETRY_DELAY).await;
-            let mut retry_conn = self.redis_conn.clone();
-            if let Err(second) = pipe.query_async::<()>(&mut retry_conn).await {
-                // A2：按实际进 pipe 的 queued 计数（原来按整批 batch_len，
-                // 含未进 pipe 的序列化失败，虚高），供 SLA 审计。
-                self.flush_dropped.fetch_add(queued, Ordering::Relaxed);
-                log::error!("[TelemetryWorker] retry failed, dropped {queued} events: {second:?}");
+        for (i, shard_batch) in shard_batches.into_iter().enumerate() {
+            if shard_batch.is_empty() {
+                continue;
             }
-        } else {
-            // OPT-R15：XADD 成功——Redis 这一级健康。
-            self.metrics.mark_sink_ok(SINK_BACKEND_REDIS);
+            let stream_key = sharder.stream_key_for(i);
+            let mut pipe = redis::pipe();
+            // A2：只统计实际进 pipe 的 queued；序列化失败单独计数，不按整批累加。
+            let queued = encode_batch(&shard_batch, &stream_key, &mut pipe, |e| {
+                serde_json::to_string(e).ok()
+            });
+            let ser_failed = (shard_batch.len() as u64).saturating_sub(queued);
+            if ser_failed > 0 {
+                self.flush_dropped.fetch_add(ser_failed, Ordering::Relaxed);
+            }
+
+            // OPT-4：失败 → 睡 100ms 重发一次 → 仍失败则丢弃并计数。
+            // R2-9：重试是同一 pipe 重放（自动 ID 下产生新条目，重复由 sink 侧
+            // payload `event_id` 去重窗对消）。
+            // A2：queued==0 说明整批序列化失败：上面已单独计数，这里打 warn 后返回；
+            // 空 pipe 不 query。
+            if queued == 0 {
+                log::warn!(
+                    "[TelemetryWorker] shard {i} serialize failed, dropped {} events",
+                    shard_batch.len()
+                );
+                // OPT-R15：序列化失败**不**标记落地端不健康——那是网关自己的问题，
+                // 标到 Redis/ClickHouse 上会把责任指错方向，也无法靠改依赖解决。
+                continue;
+            }
+            let mut conn = self.redis_conn.clone();
+            if let Err(first) = pipe.query_async::<()>(&mut conn).await {
+                log::warn!("[TelemetryWorker] shard {i} flush failed ({first:?}), retrying once");
+                // OPT-R15：首次失败即置 `up=0`（语义是"最近一次尝试"，告警侧用持续时间过滤毛刺）。
+                self.metrics.mark_sink_failed(SINK_BACKEND_REDIS);
+                tokio::time::sleep(TELEMETRY_FLUSH_RETRY_DELAY).await;
+                let mut retry_conn = self.redis_conn.clone();
+                if let Err(second) = pipe.query_async::<()>(&mut retry_conn).await {
+                    // A2：按实际进 pipe 的 queued 计数（原来按整批 batch_len，
+                    // 含未进 pipe 的序列化失败，虚高），供 SLA 审计。
+                    self.flush_dropped.fetch_add(queued, Ordering::Relaxed);
+                    log::error!(
+                        "[TelemetryWorker] shard {i} retry failed, dropped {queued} events: {second:?}"
+                    );
+                }
+            } else {
+                // OPT-R15：XADD 成功——Redis 这一级健康。
+                self.metrics.mark_sink_ok(SINK_BACKEND_REDIS);
+            }
         }
     }
 }
@@ -277,6 +303,7 @@ mod tests {
     fn sample() -> TelemetryEvent {
         TelemetryEvent {
             event_id: "7-123-0".to_string(),
+            trace_id: String::new(),
             client_ip: "10.0.1.2".to_string(),
             target_domain: "api.target.com".to_string(),
             out_ip: "185.220.101.5".to_string(),
@@ -410,16 +437,17 @@ mod tests {
                 return;
             }
         };
-        let stream_key = format!("stream:proxy:telemetry:test:{}", std::process::id());
         let (tx, rx) = mpsc::channel::<TelemetryEvent>(TELEMETRY_CHANNEL_CAP);
         // OPT-4：live 工人持独立计数器（与线上 main 的共享装配语义一致，单测不污染全局）。
         let dropped = Arc::new(AtomicU64::new(0));
+        // GW-6：shards=1 时 key 固定为 `stream:proxy:telemetry`（与新建逻辑一致）。
+        let stream_key = crate::redis_shard::TELEMETRY_STREAM_BASE.to_string();
         let worker = TelemetryWorker::new(
             rx,
             manager.clone(),
-            stream_key.clone(),
             dropped,
             Arc::new(MetricsRegistry::new()),
+            1, // stream_shards：单 stream，兼容现有行为
         );
         tokio::spawn(worker.run());
         // R2-4：publisher 持独立通道计数器（live 只断言落库，不污染 flush 口径）。

@@ -336,6 +336,7 @@ mod tests {
     fn valid_payload() -> String {
         serde_json::to_string(&TelemetryEvent {
             event_id: "sink-1".to_string(),
+            trace_id: String::new(),
             client_ip: "c".to_string(),
             target_domain: "d.example".to_string(),
             out_ip: "o".to_string(),

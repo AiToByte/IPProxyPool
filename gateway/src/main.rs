@@ -129,6 +129,7 @@ pub mod test_allocs {
 #[global_allocator]
 static GLOBAL_ALLOC: test_allocs::Counting = test_allocs::Counting;
 
+mod admin;
 mod analytics;
 mod bandit;
 mod ch_sink;
@@ -140,8 +141,10 @@ mod geo;
 mod janitor;
 mod metrics;
 mod model;
+mod net_connector;
 mod pool;
 mod prober;
+mod redis_shard;
 mod router;
 mod socks_bridge;
 mod socks_handshake;
@@ -149,6 +152,7 @@ mod telemetry;
 mod tenant;
 mod vendor_arbitrage;
 
+use admin::{router as admin_router, AdminState, AutotuneConfig};
 use analytics::AnalyticsEngine;
 use bandit::{LinUCBEngine, DEFAULT_ALPHA};
 use ch_sink::ChSinkWorker;
@@ -169,7 +173,8 @@ use rand::Rng;
 use redis::aio::ConnectionManager;
 use router::RouterEngine;
 use socks_bridge::SocksBridge;
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use telemetry::{TelemetryEvent, TelemetryPublisher, TelemetryWorker, TELEMETRY_CHANNEL_CAP};
@@ -699,13 +704,19 @@ async fn setup_gateway() -> Server {
     }
 
     if let Some(ref conn) = redis_conn {
+        // GW-6：Redis Stream 分片数（默认 1=单 stream，兼容现有行为）。
+        let redis_stream_shards: usize = std::env::var("REDIS_STREAM_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(redis_shard::REDIS_STREAM_SHARDS_DEFAULT);
         // Telemetry batch worker → Redis Stream（OPT-4：传入共享丢弃计数器）。
         let tele_worker = TelemetryWorker::new(
             rx_opt.take().expect("telemetry rx held for worker"),
             conn.clone(),
-            STREAM_KEY.to_string(),
             telemetry_dropped.clone(),
             metrics.clone(),
+            redis_stream_shards,
         );
         // OPT-R6 V1：telemetry 此前是裸 spawn。**有意不复用 `supervise_until`**：
         // `TelemetryWorker` 持有 `mpsc::Receiver`，它既非 `Clone` 又**一次性**——
@@ -741,7 +752,7 @@ async fn setup_gateway() -> Server {
         let cb_metrics = metrics.clone();
         tokio::spawn(supervise_until(
             "circuit_breaker",
-            cb_metrics,
+            cb_metrics.clone(),
             move || {
                 PassiveCircuitBreaker::new(
                     cb_conn.clone(),
@@ -749,6 +760,7 @@ async fn setup_gateway() -> Server {
                     CONSUMER_GROUP.to_string(),
                     "worker_01".to_string(),
                     cb_router.clone(),
+                    cb_metrics.clone(),
                 )
                 .run()
             },
@@ -916,11 +928,18 @@ async fn setup_gateway() -> Server {
 
     // 4b. GW-4 vendor SLA arbitrage (lazy CH: query errors hold weights).
     // R2-8：CH 连接 + 审计间隔 env 化；supervisor 包重启计数 + backoff。
-    let analytics = Arc::new(AnalyticsEngine::new(
+    // OPT-R7：`CH_BATCH_SIZE` env 可调批量插入尺寸（默认 5000，下限 1）。
+    let ch_batch_size: usize = std::env::var("CH_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(analytics::ANALYTICS_BATCH_SIZE);
+    let analytics = Arc::new(AnalyticsEngine::new_with_batch(
         &env_str("CLICKHOUSE_URL", CLICKHOUSE_URL),
         &env_str("CLICKHOUSE_USER", CLICKHOUSE_USER),
         &env_str("CLICKHOUSE_PASSWORD", CLICKHOUSE_PASSWORD),
         &env_str("CLICKHOUSE_DB", CLICKHOUSE_DB),
+        ch_batch_size,
     ));
     match analytics.ping().await {
         Ok(()) => log::info!("[GW-4] ClickHouse online, arbitrage audits live"),
@@ -1042,6 +1061,7 @@ async fn setup_gateway() -> Server {
                         // NEXT-A4：隔离水位同步（过期清理后读 len，gauge 语义）。
                         sweep_metrics
                             .set_quarantine_nodes(sweep_router.quarantine_len() as u64);
+                        sweep_metrics.set_quarantine_domains(sweep_router.quarantine_domains() as u64);
                         let arms = gateway::prune_stale_arms(&sweep_arms, &sweep_router);
                         let bridged = sweep_bridge.evict_idle();
                         if sessions + quarantines + arms + bridged > 0 {
@@ -1126,6 +1146,41 @@ async fn setup_gateway() -> Server {
         "Pingora Smart Proxy Gateway (GW-4 tenants + arbitrage + metrics) on {gateway_addr}"
     );
     server.add_service(proxy_service);
+
+    // GW-5 Admin REST API：独立端口（:9092），与数据面 :8916 和指标 :9091 完全隔离。
+    // 由 axum 驱动，所有端点走 `X-Admin-Key` 认证（env `ADMIN_API_KEY`）；
+    // 未设置时服务仍启动，但全部 401（fail-closed），不泄露任何节点/租户信息。
+    let admin_addr = env_str("ADMIN_ADDR", "127.0.0.1:9092");
+    let admin_api_key = std::env::var("ADMIN_API_KEY").unwrap_or_default();
+    if admin_api_key.is_empty() {
+        log::warn!(
+            "[GW-5] ADMIN_API_KEY 未设置：Admin API 服务启动但全部请求将返回 401（fail-closed）。\
+             生产环境请显式设置 ADMIN_API_KEY 为强随机值。"
+        );
+    }
+    let admin_state = AdminState {
+        router: router.clone(),
+        tenant_mgr: tenant_mgr.clone(),
+        metrics: metrics.clone(),
+        admin_api_key,
+        autotune: Arc::new(AutotuneConfig::new()),
+    };
+    let admin_app = admin_router(admin_state);
+    let admin_listener_addr = admin_addr.clone();
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&admin_listener_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("[GW-5] Admin 服务绑定 {admin_listener_addr} 失败: {e:?}");
+                return;
+            }
+        };
+        log::info!("[GW-5] Admin REST API on http://{admin_listener_addr}/api/v1");
+        if let Err(e) = axum::serve(listener, admin_app).await {
+            log::error!("[GW-5] Admin 服务退出: {e:?}");
+        }
+    });
+
     server
 }
 
