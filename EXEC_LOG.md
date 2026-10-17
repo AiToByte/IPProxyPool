@@ -1441,3 +1441,5 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **push 实证（代理 7890；版本政策「bump 提交后打 tag 并推送」首次执行）**：前置分叉检查 0 behind / 3 ahead（可快进）；匿名 `git ls-remote origin HEAD` ✓（HEAD=8991dd2，网络通）；`git push origin master` → `8991dd2..46179e2 master -> master` exit 0；`git push origin v0.2.0` → `* [new tag] v0.2.0 -> v0.2.0` exit 0。凭据走 credential.helper=manager 静默通过。
   - **发版后遗留转痕**：GitHub Actions 首跑（含 supply-chain job）由本次 push 触发，本机未核运行状态（「未实跑」遗留转为远端可观测项）。
 - **未 commit。**
+- **v0.2.0 发版后自查修正（同晚，a51036f 推送后数分钟）**：发现 a51036f 的 .gitignore 只改了注释、`log/**/*.txt` 规则本体漏写——status 仍见 `?? log/admin_ui_walkthrough/`（6 个 txt 裸露），立即补规则落位；本条即诚实留痕，单一小提交修正、不改已推送历史（不做 force push / rebase）。
+- **未 commit。**

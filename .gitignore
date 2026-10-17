@@ -80,6 +80,7 @@ web/admin/dist/
 # 只限定 log/：将来若需入库的界面设计稿等放别的目录。
 log/*.png
 log/**/*.png
+log/**/*.txt
 
 # --- Docker 本地数据目录（防未来误加；当前均为具名卷，无宿主挂载） ---
 data/
