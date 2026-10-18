@@ -18,7 +18,8 @@ on:
 
 jobs:
   live:
-    runs-on: ubuntu-latest
+    # 与 ci.yml 同口径 pin ubuntu-26.04（迁移窗口 2026-10-19；见 ci.yml gates 注释）。
+    runs-on: ubuntu-26.04
     # 依赖真实 CH，冷编译较慢；不设 timeout 以免误杀（门禁失败会自然红）。
     services:
       redis:

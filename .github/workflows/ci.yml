@@ -24,7 +24,10 @@ on:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    # Runner 显式 pin ubuntu-26.04：ubuntu-latest 将于 2026-10-19 起迁 Ubuntu 26
+    # （actions/runner-images#14748）。提前一天主动切换，借本轮全绿 CI 验证 26 镜像
+    # 上的四门；标签跟随该 series 最新 patch 镜像（ubuntu26/20261012.163 已可用）。
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: gateway
@@ -110,7 +113,7 @@ jobs:
 
   # OPT-R4 C8：脚本/配置漂移门（端口/头名/规则在合入前拦截；cargo 门在上）。
   static-checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - name: PowerShell scripts (PSScriptAnalyzer, errors only)
@@ -417,7 +420,7 @@ jobs:
   # hash key). This job runs in parallel with gates/static-checks, so it does
   # not lengthen the critical path after warmup.
   supply-chain:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
