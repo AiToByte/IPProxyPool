@@ -1507,3 +1507,13 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
 
 **诚实边界**：本轮 Rust 代码改动（`admin.rs` 超时层 + 审计层 + 3 个新测试）**未经本机 `cargo test`/`clippy` 实跑**，仅 `cargo fmt` 通过。已由 CI 承接验证 —— 推送后需观测 run 结果。
   - **本机门复跑的供应链门网络抖动（2026-10-18 晚，诚实留档）**：`check_supply_chain.py` 一次复跑判红，报 `cargo audit found issues`。**根因不是漏洞，是 RustSec DB 拉取失败**（`error sending request for url .../advisory-db.git/info/refs` —— GitHub 侧网络抖动）。三重取证：① `cargo deny check` 独立跑**四段全绿**（`advisories ok, bans ok, licenses ok, sources ok`，deny 有自己的 DB）；② `github.com/RustSec/advisory-db` HEAD = 200（网络本身可达，属瞬时失败）；③ `cargo audit --no-fetch` 用缓存 DB 跑出 **exit 0 / 0 漏洞**，仅 4 个 unmaintained warning（即项目已知且已由 `deny.toml unmaintained = "workspace"` 策略挡直依的那 4 个）。故**代码与依赖状态无变化**，此红是环境噪声。教训呼应本机铁律：判红供应链门前先看报错原文是「拉库失败」还是「真漏洞」——两者在输出上都叫 FAIL，但处置完全相反（前者重试，后者改依赖）。
+- **⚠️ commit 后 CI 判红与修复（`run 39139863120`；承步骤 49、50）***：
+  - **推送**：`70792ee..d854991 master -> master`（3 提交，按 CONTRIBUTING §4「一次提交只含一个步骤」拆为 admin 修复 / 告警接线 / 留痕）。`gh run watch` 首次 404 的原因**不是 run 不存在**：本机 locale 把 `gh run list` 的 JSON 输出转成了科学计数法（`3.913986312e+10`），拼出的 ID 尾数被改；真实 run ID `39139863120`（经 `gh api` 取原始 JSON 确认）。属本机工具输出被 locale 改写，与本仓记录的 PowerShell GBK 截断同类。
+  - **判红（gates / clippy）**：`error: this assertion has a constant value` —— `clippy::assertions_on_constants`（rust 1.99）指向我在步骤 49 写的 `assert!(ADMIN_TIMEOUT_SECS > 0)`。
+  - **定性：lint 抓到的是真缺陷，不是风格问题。** `ADMIN_TIMEOUT_SECS` 是 `const u64 = 30`，`30 > 0` 在**编译期**即确定 ⇒ 该断言永不为假，把它改小也不会红（只会重新编译）⇒ **零鉴别力的假绿测试**。讽刺处：我自己在同一测试的 doc 注释里已写下正确担忧（「只断言 1 的话，把 timeout 设成 1ns 也能通过，是假绿」），实现却恰好落进那个陷阱 —— **写下正确判据 ≠ 实现符合判据**，这是本次最值得记的一条。
+  - **修法（贯彻「测试必须证明行为，不能自证」）**：
+    1. `TimeoutLayer` 构造点抽为 `build_router(state, timeout: Duration)`；生产 `router()` 传 30s 常量，测试可注入极短值。
+    2. 改写为**行为验证**：注入 1ms 超时 + 真挂起 10s 的 handler，断言得 **408**。「超时层生效」由行为证明 —— 删掉 `TimeoutLayer` 或把它挪到 handler 之后，本测试立即失败。
+    3. 保留并强化「快速路径不误伤」测试（生产超时下 health 仍 200）。两条成对：缺前者则超时层可能整体失效，缺后者则可能整体关停。
+    4. 补注一个自己踩的坑：首版误用 `#[tokio::test(start_paused = true)]`。`oneshot` 是内存直驱 Service，`TimeoutLayer` 内部走 tokio **real-time** timer —— 暂停时钟会让 timeout 永不触发、测试一路挂到 CI 超时。改回真实时间（1ms vs 10s 的量级差足够稳定，不依赖时钟精度）。
+  - **门禁复验**：fmt 绿；16 道 Python 门全绿；新门 `check_observability_truth.py` 复验仍有效（实证 `TimeoutLayer` 剥离注释后**仍在代码中**为 true，而 `CorsLayer`/`TraceLayer` 剥离后为 false —— 门正确区分「真使用」与「只在注释里提及」）。**cargo test/clippy 再次交 CI。**

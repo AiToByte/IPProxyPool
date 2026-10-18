@@ -288,7 +288,42 @@ const ADMIN_TIMEOUT_SECS: u64 = 30;
 /// 故：`cors` feature 从 `Cargo.toml` 移除，让依赖清单与真实代码一致，
 /// 防止再次出现"声明了但没实现"。
 pub fn router(state: AdminState) -> Router {
-    let api = Router::new()
+    build_router(state, std::time::Duration::from_secs(ADMIN_TIMEOUT_SECS))
+}
+
+/// 组装路由：超时时长**参数化**。
+///
+/// # 为何参数化（而不是把 `TimeoutLayer::new(...)` 直接写在 `router()` 里）
+///
+/// 因为「超时层真的会在超时后掐断请求」这件事**只能用极短超时实测**：
+/// 生产值是 30s，没有任何测试愿意等 30s 来验证超时。若不参数化，就只能
+/// 退而求其次去 `assert!(ADMIN_TIMEOUT_SECS > 0)` —— 而 `ADMIN_TIMEOUT_SECS`
+/// 是 `const`，`30 > 0` 在**编译期**就确定，该断言永不为假、也抓不到任何
+/// 回归（改小常量它也不红，只会重新编译）。CI 的 clippy 正是以
+/// `assertions_on_constants` lint 判它红（实测 run，rust 1.99）——**这个
+/// lint 抓到的是真缺陷：那个测试没有任何鉴别力。**
+///
+/// 参数化后，测试可以传 1ms 并配一个真会挂起的 handler，从而证明
+/// 「超时层生效」与「层序正确」两件事，而不是靠断言常量自证。
+fn build_router(state: AdminState, timeout: std::time::Duration) -> Router {
+    build_router_with(state, timeout, Router::new())
+}
+
+/// 同 [`build_router`]，但允许向 `/api/v1` **内部**追加路由（仅测试用）。
+///
+/// # 为何需要这个参数
+///
+/// 校验「超时层生效」必须让请求真的走到一个会挂起的 handler 上。而
+/// `TimeoutLayer` 装在 **`.nest("/api/v1", …)` 的内层** —— 若测试把慢路由
+/// 挂在 nest **之外**（`router().route("/slow", …)`），该路由根本不经
+/// timeout 层，会直接返回 200，让「超时层失效」与「测试挂错位置」两种情况
+/// 长得一模一样。故必须能把路由注入 nest 内部。
+fn build_router_with(
+    state: AdminState,
+    timeout: std::time::Duration,
+    extra: Router<AdminState>,
+) -> Router {
+    let api = extra
         // Health（轻量，可供负载均衡器探活）
         .route("/health", get(health_handler))
         // OpenAPI 文档（供前端与客户端代码生成）
@@ -337,8 +372,6 @@ pub fn router(state: AdminState) -> Router {
     //   - timeout 在 auth 外层：任何请求都受 timeout 约束，不给慢请求
     //     无限占用连接的机会（Admin 端点全是内存操作，30s 远高于正常耗时）。
     let audit = middleware::from_fn(audit_logging);
-    let timeout =
-        tower_http::timeout::TimeoutLayer::new(std::time::Duration::from_secs(ADMIN_TIMEOUT_SECS));
 
     Router::new()
         .nest(
@@ -347,7 +380,7 @@ pub fn router(state: AdminState) -> Router {
                 state.clone(),
                 auth_middleware,
             ))
-            .layer(timeout),
+            .layer(tower_http::timeout::TimeoutLayer::new(timeout)),
         )
         .layer(audit)
         .fallback(api_not_found_fallback)
@@ -1194,18 +1227,60 @@ mod tests {
 
     // ---- OPT-R17：超时层与审计层（补齐此前"注释声称存在、代码里没有"的两层）----
 
-    /// 超时层真实存在：`ADMIN_TIMEOUT_SECS` 是**生效**的，不是摆设。
+    /// 超时层**真的会掐断**超时的请求（超时层的红测有效性证明）。
     ///
-    /// 锁两件事：
-    ///   1. 该常量 > 0（配成 0 会让所有请求立即 408，等于把 Admin API 关掉）；
-    ///   2. **快速路径不受影响** —— 内存操作必须仍能正常返回 200。
-    ///      只断言 1 的话，把 timeout 设成 1ns 也能"通过"，是假绿。
+    /// # 为什么必须实测，而不是断言常量
+    ///
+    /// 首版写的是 `assert!(ADMIN_TIMEOUT_SECS > 0)`。它是**假绿**：
+    /// `ADMIN_TIMEOUT_SECS` 是 `const u64 = 30`，`30 > 0` 在编译期即确定，
+    /// 断言永不为假，也抓不到任何回归（把它改小同样不会红，只会重新编译）。
+    /// CI 的 clippy 以 `assertions_on_constants` lint 判红（实测 run，
+    /// rust 1.99）——**该 lint 抓到的是真缺陷，不是风格问题**。
+    ///
+    /// 现改为：用 `build_router` 注入 1ms 超时 + 一个真会挂起 10s 的 handler，
+    /// 断言得到 **408**。这样"超时层生效"是被**行为**证明的 ——
+    /// 有人删掉 `TimeoutLayer` 或把它挪到 handler 之后，本测试立即失败。
+    #[tokio::test]
+    async fn timeout_layer_actually_cuts_off_a_hanging_handler() {
+        // 1ms 超时 + 挂起 10s 的 handler ⇒ 必然 408。
+        // 用真实时间（不用 `start_paused`）：`oneshot` 在内存里直接驱动
+        // Service，`TimeoutLayer` 内部走 tokio 的 real-time timer，
+        // 暂停时钟会让 timeout 永不触发、测试挂到 CI 超时。
+        //
+        // 慢路由经 `build_router_with` 注入到 `/api/v1` **内部** —— 挂在 nest
+        // 之外的话根本不经过 TimeoutLayer，测试会误判成「超时层失效」。
+        let app = super::build_router_with(
+            test_state(vec![], &[]),
+            std::time::Duration::from_millis(1),
+            super::Router::new().route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    axum::Json(serde_json::json!({"never": true}))
+                }),
+            ),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/slow")
+            .header("X-Admin-Key", KEY)
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            res.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "挂起 10s 的请求在 1ms 超时下必须被掐断为 408 —— \
+             若返回 200，说明 TimeoutLayer 未生效或位置错误"
+        );
+    }
+
+    /// 快速路径**不受**超时层误伤（防止"防护"变成"关停"）。
+    ///
+    /// 与上一条成对：上一条证明超时层会掐断慢请求，这一条证明正常的内存操作
+    /// 仍能及时返回。两条缺一，超时层就可能整体失效或整体误伤。
     #[tokio::test]
     async fn timeout_layer_does_not_break_the_fast_path() {
-        assert!(
-            super::ADMIN_TIMEOUT_SECS > 0,
-            "超时上限配成 0 会让每个 Admin 请求立即 408（等于关停 Admin API）"
-        );
         let app = super::router(test_state(
             vec![test_node("127.0.0.1", 39_001, "US", "residential")],
             &[],
@@ -1220,7 +1295,8 @@ mod tests {
         assert_eq!(
             res.status(),
             StatusCode::OK,
-            "加了 timeout 层后，健康检查必须仍是 200（否则是误伤而非防护）"
+            "生产超时（{}s）下，健康检查必须仍是 200（否则是误伤而非防护）",
+            super::ADMIN_TIMEOUT_SECS
         );
     }
 
