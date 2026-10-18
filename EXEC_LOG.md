@@ -1452,3 +1452,8 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **CI 侧仅有注记（非失败，留观）**：runner Node 20→24 强迁提示；`ubuntu-latest` 将自 2026-10-19 起迁 Ubuntu 26（actions/runner-images#14748）。
   - **本机 sweep 勘误**：17:48 终扫一度 14/15：漏设 `RUSTUP_HOME` 致 supply-chain 门假红（rustup 报 no default）；按惯例补带后 15/15 复绿——环境惯例（每次先 `$env:RUSTUP_HOME`）重申为本机铁律。
 - **未 commit。**
+- **CI runner 主动提前 pin ubuntu-26.04（2026-10-18；用户指令「把 runner pin 做了」）**：迁移窗口（ubuntu-latest 自 2026-10-19 起 Ubuntu 26，actions/runner-images#14748）**前一天主动切换**，风险窗口归零而非被动迁移后回想。
+  - **变更**：ci.yml 三 job（gates / static-checks / supply-chain）+ live.yml 手动 job 的 `runs-on: ubuntu-latest` → `runs-on: ubuntu-26.04`，ci.yml gates 留 rationale 注释（标签跟随 series 最新 patch 镜像，ubuntu26/20261012.163 已于 10-13 发布、抽取标签可用性实证后才动手）。windows-latest 无迁移公告，不动。行动前置侦察：确认标签可用 → runner-images releases（gh api 匿名限流走 gh 认证态）→ 编辑（共 4 处 runs-on + 2 处注释）。
+  - **实证**：提交 `447a6c3` push → run **39105518772** 首跑全绿 on ubuntu-26.04：gates 2m5s（fmt / clippy / unit tests / allocation-contract / release bandit / bench compile / Cargo.lock unchanged 全过）、supply-chain 29s、windows-powershell 2m7s、static-checks ~6m（含 Gateway Docker image build 在 26 镜像构建过）；`gh run watch --exit-status` = 0。
+  - **新观察注记（信息性，非失败）**：static-checks 提示 setup-java@v4 已弃用（建议迁 v5，列为后续小项未擅动）；Node 20 强迁注记维持（checkout@v4 已强制跑 Node 24，无行为影响）。
+- **未 commit。**
