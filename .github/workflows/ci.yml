@@ -131,6 +131,25 @@ jobs:
         # 缺 BOM 时 Windows PowerShell 5.1 会按 GBK 代码页解析中文注释 →
         # 乱码乃至解析失败（事故背景见 docs/FREE_BASELINE.md）。
         run: python3 tools/check_ps1_bom.py
+      # OPT-R17: configuration files must NOT carry a UTF-8 BOM.
+      #
+      # This is the exact inverse of the step above, and the pairing is
+      # deliberate: git strips UTF-8 BOMs (documented in .gitattributes,
+      # OPT-R7 D1), so a BOM can only be reintroduced from the working tree
+      # side (IDE "UTF-8 with BOM", PowerShell 5.1 Set-Content -Encoding UTF8).
+      #
+      # Verified failure this gate locks: gateway/Cargo.toml carried a BOM,
+      # so Swatinem/rust-cache could not parse the manifest and fell back to
+      # caching the WHOLE FILE -- silently losing the per-Cargo.lock-hash key
+      # that the OPT-R9 A4 caching work was meant to provide. Cargo itself
+      # tolerates the BOM (build/tests passed), which is exactly why this
+      # degraded silently instead of failing loudly.
+      #
+      # Kept as a separate script rather than a branch inside check_ps1_bom.py:
+      # that file's entire logic assumes "must HAVE a BOM". Mixing an
+      # opposite-direction rule in would make the file unreadable.
+      - name: Config files carry no UTF-8 BOM (OPT-R17)
+        run: python3 tools/check_no_bom.py
       # OPT-R16 E6: static gate for shell: powershell steps (PS 5.1) whose
       # run: body must stay pure ASCII. Added because run 37117250483 step #4
       # failed with "Missing closing ')'" caused by an em dash inside the

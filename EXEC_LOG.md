@@ -1517,3 +1517,11 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
     3. 保留并强化「快速路径不误伤」测试（生产超时下 health 仍 200）。两条成对：缺前者则超时层可能整体失效，缺后者则可能整体关停。
     4. 补注一个自己踩的坑：首版误用 `#[tokio::test(start_paused = true)]`。`oneshot` 是内存直驱 Service，`TimeoutLayer` 内部走 tokio **real-time** timer —— 暂停时钟会让 timeout 永不触发、测试一路挂到 CI 超时。改回真实时间（1ms vs 10s 的量级差足够稳定，不依赖时钟精度）。
   - **门禁复验**：fmt 绿；16 道 Python 门全绿；新门 `check_observability_truth.py` 复验仍有效（实证 `TimeoutLayer` 剥离注释后**仍在代码中**为 true，而 `CorsLayer`/`TraceLayer` 剥离后为 false —— 门正确区分「真使用」与「只在注释里提及」）。**cargo test/clippy 再次交 CI。**
+- **CI 全绿 + 顺手修 BOM（`run 39140248626`；承步骤 51）***：
+  - **CI 首跑全绿**：`gates` 2m13s（fmt / clippy / unit tests / allocation-contract / release bandit / bench compile / Cargo.lock unchanged 全过 —— 即步骤 51 的 clippy 修复与「超时层行为验证」测试**经真实编译与执行确认**；后者能通过即证明 1ms 超时确实返回 408，删掉 TimeoutLayer 就会红）、`static-checks` 5m31s（含新增的 OPT-R17 真值门）、`windows-powershell` 2m16s、`supply-chain` 25s；`gh run watch --exit-status` = 0。
+  - **新告警（非本轮引入）**：supply-chain job 的 ANNOTATIONS 区出现 `Error parsing Cargo.toml manifest, fallback to caching entire file`（`.github#20`）。根因：`gateway/Cargo.toml` 带 UTF-8 BOM（EF BB BF）⇒ `Swatinem/rust-cache` 的 TOML 解析器读不了 manifest ⇒ **回退到整文件缓存**，静默丢掉按 `Cargo.lock` 哈希的细粒度 key（OPT-R9 A4 引入 rust-cache 的初衷）。
+  - **取证「非本轮引入」**：逐提交检查 —— `70792ee`（本轮动手前的 HEAD）/ `8139136` / `defdeae` 三个提交的 blob **首字节均为 0xFEFF** ⇒ BOM 早于本轮存在，**不是我的回归**。
+  - **危害定级：低但非零**。Cargo 本身容忍 BOM（`cargo metadata` exit 0、CI 构建与 302 测试全过），故**不会失败、只会变慢** —— 恰是本仓最关注的那类「静默降级」。且上个 run（`39107482467`）刚记录过「ANNOTATIONS 区消零」，本条等于把该清零状态打破，故一并收口。
+  - **修法**：`[System.IO.File]::WriteAllBytes` 精确剥离前 3 字节（不用 `Set-Content`），git diff 确认**仅首行 BOM 变化、其余内容零改动**（4104→4101 字节，`[package]` 可正常解析）。
+  - **第 14 道门 `tools/check_no_bom.py`**：要求 7 个配置类文件（`gateway/Cargo.toml`、`deny.toml`、`docker-compose.yml`、`deploy/alertmanager.yml`、两个 prometheus yml、`dashboard.json`）**不得**带 BOM。刻意与既有 `check_ps1_bom.py`（要求 .ps1 **必须**有 BOM）**分成两个文件**而非合成一个带分支的门 —— 后者的全部逻辑都围绕「必须有 BOM」组织，混入会让人反复确认当前走的是哪条规则。双向验证：加回 BOM → 判红并指出文件；剥离 → 绿。
+  - **本轮又一次差点自己踩进同一个坑**：批量替换 `CAPABILITY-AUDIT.md` 里的门数时用了 `Set-Content -Encoding UTF8`，**正是 BOM 的成因**（PS 5.1 会写 BOM，且该命令还会重排编码）—— 已 `git checkout` 还原并改用 edit 工具逐处替换。**教训：BOM 门立起来之后，它第一个抓到的就是我自己。**

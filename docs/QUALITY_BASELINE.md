@@ -25,7 +25,7 @@
 | 其中：真 live 测试 | **4** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
 | 其中：串行分配契约测试 | 2 | 需 `--test-threads=1 --include-ignored --exact` |
 | release bandit 臂数 | 8 臂均 <200ns | `cargo test --locked --release bandit` |
-| Python 静态门 | 13 个 | `python tools/check_*.py` |
+| Python 静态门 | 14 个 | `python tools/check_*.py` |
 
 ### 7 个忽略测试的构成
 

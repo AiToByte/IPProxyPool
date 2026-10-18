@@ -69,6 +69,14 @@
   **自己的说明注释**满足（注释里为解释「为什么不加 CORS」写了
   `CorsLayer::permissive()` 字样）而**假绿** —— 这比「门失效」更糟，它让门
   看起来在工作。修正为**剥离注释后**再检索。
+- 第 14 道静态门 `tools/check_no_bom.py`：要求**配置类文件不得带 UTF-8 BOM**
+  （与 `check_ps1_bom.py` 恰好反向，故独立成文件而非加分支）。实证缺陷：
+  `gateway/Cargo.toml` 带 BOM ⇒ `Swatinem/rust-cache` 解析 manifest 失败、
+  回退到**整文件缓存**，静默丢掉按 `Cargo.lock` 哈希的细粒度 key
+  （OPT-R9 A4 引入 rust-cache 的初衷）。Cargo 本身容忍 BOM，所以**构建与
+  测试全绿、只是缓存悄悄退化** —— 这类「不失败只变慢」的问题最难发现。
+  **非本轮引入**：`70792ee`（本轮动手前的 HEAD）即已带 BOM。双向验证：
+  加回 BOM → 判红；剥离 → 绿。
 
 ## [0.2.0] - 2026-10-17
 
