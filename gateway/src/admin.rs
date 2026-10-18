@@ -241,7 +241,52 @@ fn node_view(n: &ProxyNode) -> NodeView {
 )]
 pub struct AdminApiDoc;
 
-/// 构建 axum 路由（含 CORS + 超时 + 认证中间件）。
+/// Admin API 请求超时（秒）。
+///
+/// # 为何要有这个数
+///
+/// Admin 端点能做什么：读节点表、调权重、置/解隔离、改租户余额与启停、
+/// 读 FreePool 快照。全部是**进程内内存操作**（`DashMap` / `ArcSwap`），
+/// 正常应在亚毫秒级返回。因此超时取得很宽松——它不是性能目标，
+/// 而是**兜底**：挡住因下游阻塞（磁盘 fsync、极端 GC 停顿、被换出的
+/// 内存页）而长期挂住的请求，避免少量慢请求堆积占满连接。
+///
+/// # 与数据面的区别
+///
+/// 数据面 `:8916` 的超时由上游代理节点决定（客户端侧另有
+/// `pool.rs` 的预热与连接治理），不在此处统一设限——设一个固定值会
+/// 误伤合法的慢上游。Admin 面没有"上游"，故可以一刀切。
+const ADMIN_TIMEOUT_SECS: u64 = 30;
+
+/// 构建 axum 路由（含认证中间件 + 请求超时层 + 访问审计日志）。
+///
+/// # 层序（不可随意调换）
+///
+/// ```text
+/// request
+///   └─▶ [TraceLayer]   ← 必须最外层：否则超时/认证拒绝的请求不会留下记录
+///        └─▶ [TimeoutLayer] ← 必须在认证内层：让未认证的挂起请求也能被超时掐断
+///             └─▶ [auth_middleware] ← 认证拒绝是 401，不消耗 body
+///                  └─▶ handler
+/// ```
+///
+/// # 为什么**不**加 CORS（OPT-R17 复核结论）
+///
+/// 本文件此前有一处**失实注释**：声称"含 CORS + 超时"，而两者都不存在
+/// （`Cargo.toml` 声明了 `tower-http` 的 `cors`/`trace`/`timeout` 三个
+/// feature，`src/` 全仓零引用）。失实注释比没有注释更糟——它会让读者
+/// 以为"跨域已经放开"，实则 Admin UI 只能靠 Vite dev proxy 或同域反代
+/// 访问（见 `docs/ADMIN_UI.md`）。
+///
+/// 这里选择**不加** CORS，而非"补上以兑现注释"，理由是安全边界：
+/// Admin API 用 `X-Admin-Key` 头认证，若开 `CorsLayer::permissive()`，
+/// 任意站点的 JS 都能发起带自定义头的跨域请求 —— 一旦 Admin Key 泄漏
+/// （浏览器扩展、历史记录、反代日志），攻击面从"本机回环"扩大到
+/// "任何能访问 :9092 的站点"。而 Admin UI 的实际部署方式（同域反代 /
+/// Vite proxy）根本不需要 CORS。
+///
+/// 故：`cors` feature 从 `Cargo.toml` 移除，让依赖清单与真实代码一致，
+/// 防止再次出现"声明了但没实现"。
 pub fn router(state: AdminState) -> Router {
     let api = Router::new()
         // Health（轻量，可供负载均衡器探活）
@@ -284,16 +329,74 @@ pub fn router(state: AdminState) -> Router {
     // 保持统一安全边界；如需内部免认证可在此拆分）。
     // fallback：未匹配路径（含未知 /api/v1/* 子路径）一律返回文档 §4 的
     // JSON 错误体 404——此前落到 axum 默认空 body，与文档契约不符。
+    //
+    // 层序（三层，顺序不可随意调换）：
+    //   request → [audit] → [timeout] → [auth] → handler
+    //   - audit 在最外层：认证失败（401）与超时（408）也必须留下记录，
+    //     否则恰恰是最该被审计的"有人在撞门"会漏掉。
+    //   - timeout 在 auth 外层：任何请求都受 timeout 约束，不给慢请求
+    //     无限占用连接的机会（Admin 端点全是内存操作，30s 远高于正常耗时）。
+    let audit = middleware::from_fn(audit_logging);
+    let timeout =
+        tower_http::timeout::TimeoutLayer::new(std::time::Duration::from_secs(ADMIN_TIMEOUT_SECS));
+
     Router::new()
         .nest(
             "/api/v1",
             api.layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
-            )),
+            ))
+            .layer(timeout),
         )
+        .layer(audit)
         .fallback(api_not_found_fallback)
         .with_state(state)
+}
+
+/// Admin API 访问审计：方法、路径、状态码、耗时，以及**是否**带了 Admin Key。
+///
+/// # 为什么用手写中间件而不是 `tower-http` 的 `TraceLayer`
+///
+/// `TraceLayer` 发的是 `tracing` 事件。本项目装的是 `env_logger`
+/// （`log` facade，全仓 78 处 `log::info!` 一致），**没有 `tracing` 的
+/// subscriber**。用 `TraceLayer` 会得到一个"看起来加了审计、实际一条
+/// 都不会打印"的层 —— 正是本仓最忌讳的静默失效（见
+/// `docs/CAPABILITY-AUDIT.md` §0 的取证纪律）。故直接用 `log` 写。
+///
+/// # 为什么**不**记 Key 的值
+///
+/// 日志落 `log/`、可能被集中收集与备份。把密钥写进日志等于新建一条
+/// 泄漏路径。只记布尔值：足以回答"这次调用是否带凭据"，不足以用来认证。
+///
+/// # 状态码要记
+///
+/// 只记成功不记失败的话，"大量 401" 这类最有价值的信号反而看不见。
+async fn audit_logging(
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let has_admin_key = req.headers().contains_key("X-Admin-Key")
+        || req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .map(|v| v.as_bytes().starts_with(b"Admin "))
+            .unwrap_or(false);
+
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis();
+
+    // 2xx/fallback 走 info，4xx/5xx 走 warn：撞门与故障应能在默认日志级别下被发现。
+    if (200..400).contains(&status) {
+        log::info!("[admin] {method} {path} -> {status} ({elapsed_ms}ms, key={has_admin_key})");
+    } else {
+        log::warn!("[admin] {method} {path} -> {status} ({elapsed_ms}ms, key={has_admin_key})");
+    }
+    response
 }
 
 /// 未匹配端点的统一 404（JSON 错误体）。
@@ -1087,5 +1190,104 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown admin endpoint"));
+    }
+
+    // ---- OPT-R17：超时层与审计层（补齐此前"注释声称存在、代码里没有"的两层）----
+
+    /// 超时层真实存在：`ADMIN_TIMEOUT_SECS` 是**生效**的，不是摆设。
+    ///
+    /// 锁两件事：
+    ///   1. 该常量 > 0（配成 0 会让所有请求立即 408，等于把 Admin API 关掉）；
+    ///   2. **快速路径不受影响** —— 内存操作必须仍能正常返回 200。
+    ///      只断言 1 的话，把 timeout 设成 1ns 也能"通过"，是假绿。
+    #[tokio::test]
+    async fn timeout_layer_does_not_break_the_fast_path() {
+        assert!(
+            super::ADMIN_TIMEOUT_SECS > 0,
+            "超时上限配成 0 会让每个 Admin 请求立即 408（等于关停 Admin API）"
+        );
+        let app = super::router(test_state(
+            vec![test_node("127.0.0.1", 39_001, "US", "residential")],
+            &[],
+        ));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header("X-Admin-Key", KEY)
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "加了 timeout 层后，健康检查必须仍是 200（否则是误伤而非防护）"
+        );
+    }
+
+    /// 超时层覆盖**未认证**请求（层序回归）。
+    ///
+    /// 若日后有人把 `TimeoutLayer` 挪到 `auth_middleware` 内侧，
+    /// 未认证的挂起请求将不受 timeout 约束。本测试锁定"任何路径都过 timeout"。
+    #[tokio::test]
+    async fn timeout_layer_wraps_auth_middleware() {
+        // 无 Key ⇒ 401（证明认证仍生效，timeout 未把认证吞掉）。
+        let app = super::router(test_state(vec![], &[]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 带 Key ⇒ 200（证明 timeout 层未破坏认证后的正常路径）。
+        let app = super::router(test_state(vec![], &[]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header("X-Admin-Key", KEY)
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// 审计层对**失败**请求同样放行（401/404 不被审计层吞掉或改写）。
+    ///
+    /// 审计层是最外层，如果它的实现有误（例如把响应体吃掉、或对错误状态
+    /// 提前返回），会表现为"契约①/④ 的错误体测试突然挂了"。本测试显式
+    /// 锁定：加了审计层后，错误体契约与状态码**保持不变**。
+    #[tokio::test]
+    async fn audit_layer_preserves_error_contract() {
+        // 401：错误体仍是 {error, code:401}。
+        let app = super::router(test_state(vec![], &[]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("错误体必须是 JSON");
+        assert_eq!(v["code"], 401);
+
+        // 404 fallback：审计层必须放行到 fallback 才有这个 JSON 404。
+        let app = super::router(test_state(vec![], &[]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/nope")
+            .header("X-Admin-Key", KEY)
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("错误体必须是 JSON");
+        assert_eq!(v["code"], 404);
     }
 }

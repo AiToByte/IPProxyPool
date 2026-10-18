@@ -21,9 +21,27 @@
 
 ## [Unreleased]
 
-（暂无）
+### Fixed
 
----
+- **Admin API 的「声明即失实」**（OPT-R17 复核实证）：`gateway/Cargo.toml` 声明
+  `tower-http` 的 `cors`/`trace`/`timeout` 三个 feature，而 `src/` 全仓
+  **零引用**；`admin.rs::router` 的文档注释更声称「含 CORS + 超时」——
+  **两者都不存在**。三重后果：读者以为跨域已放开（实则 UI 只能靠 Vite
+  proxy/同域反代）、以为有请求超时（实则慢请求可长期占满连接）、以为有
+  访问审计（实则改权重/隔离/余额这类写操作**无任何轨迹**）。
+  处置：
+  - **真正补上 `TimeoutLayer`**（`ADMIN_TIMEOUT_SECS = 30`，套在认证中间件
+    外层，使未认证的挂起请求同样受约束），新增 3 个测试锁层序与错误体契约；
+  - **新增 `audit_logging` 中间件**（用 `log` 而非 `TraceLayer`：后者发的是
+    `tracing` 事件，本项目装的是 `env_logger`，无 subscriber ⇒ 会得到
+    「加了审计却一条不打印」的静默失效）。记录方法/路径/状态码/耗时，
+    4xx/5xx 走 `warn`。**只记是否带 Key，绝不记值**（日志会进 `log/` 并被
+    备份，写入密钥等于新建泄漏路径）；
+  - **移除 `cors` 与 `trace` feature**，让依赖清单与真实代码一致。
+    不补 CORS 是安全选择：`X-Admin-Key` 头认证 + permissive CORS 会让
+    任意站点的 JS 都能发起带凭据的跨域请求。
+  - 副作用：Cargo.lock 中 `tower-http` 的 `tracing` 传递依赖随之移除
+    （实证 `tracing` 本就是死重量，非本仓其它代码所需）。
 
 ## [0.2.0] - 2026-10-17
 

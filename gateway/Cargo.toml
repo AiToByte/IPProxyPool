@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "pingora-proxy-gateway"
 version = "0.2.0"
 edition = "2021"
@@ -64,9 +64,22 @@ nonzero_ext = "0.3"
 
 # GW-5 Admin REST API (Phase 1): axum HTTP 框架 + utoipa OpenAPI 自动生成。
 # 与数据面 Pingora 完全隔离，独立端口 (:9092)，独立认证 (ADMIN_API_KEY)。
+#
+# OPT-R17：`tower-http` 的 feature 清单此前与真实代码**不一致**——
+# 声明了 cors/trace/timeout 三个 feature，而 src/ 零引用（admin.rs 注释还
+# 声称"含 CORS + 超时"，两处都不实）。逐项处置：
+#   - timeout：**保留并真正启用**（admin.rs 的 TimeoutLayer，Admin 端点全为
+#     内存操作，30s 兜底防慢请求占满连接）。
+#   - trace：**移除**。TraceLayer 发的是 `tracing` 事件，本项目装的是
+#     env_logger（log facade），无 tracing subscriber ⇒ 会得到"加了审计却一条
+#     不打印"的静默失效。审计改由 admin.rs 的 `audit_logging` 用 `log` 手写。
+#   - cors：**移除**。Admin API 走 X-Admin-Key 头认证，开 permissive CORS
+#     会让任意站点的 JS 都能发起带凭据的跨域请求，把攻击面从本机回环扩大到
+#     任何能访问 :9092 的站点；Admin UI 的实际部署（同域反代 / Vite proxy）
+#     不需要 CORS。详见 admin.rs::router 的说明。
 axum = "0.7"
 utoipa = "5.0"
-tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+tower-http = { version = "0.5", features = ["timeout"] }
 tower = "0.5"
 
 # P3 exit-IP 画像：MaxMind DB 读取（DB 文件运营方配给，见 GEOIP_MMDB_PATH；
