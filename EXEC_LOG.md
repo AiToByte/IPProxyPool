@@ -1457,3 +1457,10 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **实证**：提交 `447a6c3` push → run **39105518772** 首跑全绿 on ubuntu-26.04：gates 2m5s（fmt / clippy / unit tests / allocation-contract / release bandit / bench compile / Cargo.lock unchanged 全过）、supply-chain 29s、windows-powershell 2m7s、static-checks ~6m（含 Gateway Docker image build 在 26 镜像构建过）；`gh run watch --exit-status` = 0。
   - **新观察注记（信息性，非失败）**：static-checks 提示 setup-java@v4 已弃用（建议迁 v5，列为后续小项未擅动）；Node 20 强迁注记维持（checkout@v4 已强制跑 Node 24，无行为影响）。
 - **未 commit。**
+- **CI 动作 major 迁移、Node20 弃用注记清零（2026-10-18；承接 runner pin 同晚）**：
+  - **起因**：ubuntu-26.04 迁移窗口前主动 pin runner 后，CI 注记暴露两条弃用告警——Node20 被强迁 Node 24（涉及 actions/checkout@v4、setup-dotnet@v4、setup-java@v4）与 `setup-java v4 no longer receives updates`。
+  - **版本查证（releases API，不猜）**：actions/checkout 最新 v7.0.1、setup-java 最新 v6.1.0（2026-10-14）、setup-dotnet 最新 v6.0.0（2026-07-16）；四个 checkout major 在 2026-07-20 同日各发维护版（GitHub 多 major 并行维护，迁到最新 major 才是正解）。
+  - **变更**：ci.yml ×4 + live.yml ×1 checkout v4→v7、setup-java v4→v6、setup-dotnet v4→v6；gates steps 头留 rationale 注释。inputs 兼容面核查：checkout 无 with（无面）、temurin+java-version 21、dotnet-version 8.0.x 均为跨 major 稳定输入。**rust-cache@v2 与 upload-artifact@v4 无任何弃用告警，不动**（范围纪律：只治被点名的）。
+  - **实证**：提交 `e0b7abf` push → run **39107482467** 四 job 全绿：gates 2m7s、static-checks 5m43s（含 .NET/Java SDK 编译 run 步 = setup-dotnet@v6/setup-java@v6 实证可用）、supply-chain 22s、windows-powershell 2m21s；run **ANNOTATIONS 区消失**（Node20 强迁提示与 setup-java@v4 弃用提示双双清零）；`gh run watch --exit-status` = 0。
+  - **注记**：本次无新增观察项——CI 侧注记面已完全干净。
+- **未 commit。**
