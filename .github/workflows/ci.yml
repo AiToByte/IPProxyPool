@@ -32,7 +32,9 @@ jobs:
       run:
         working-directory: gateway
     steps:
-      - uses: actions/checkout@v4
+      # Node20 弃用注记清零（2026-10-18）：checkout v4→v7、setup-java v4→v6、
+      # setup-dotnet v4→v6；inputs（temurin+21 / 8.0.x）跨 major 兼容，本轮 CI 全绿实证。
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -115,7 +117,7 @@ jobs:
   static-checks:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: PowerShell scripts (PSScriptAnalyzer, errors only)
         shell: pwsh
         run: |
@@ -221,7 +223,7 @@ jobs:
         run: python3 tools/check_node_sdk.py
       - name: .NET + Java SDK compile
         # 显式固定 SDK 版本：runner 预装版本会漂移，而 SDK 代码可能用到新语法。
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
@@ -229,7 +231,7 @@ jobs:
         run: |
           python3 tools/check_jvm_sdk.py --java
       - name: .NET SDK compile (run)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "8.0.x"
       - name: .NET SDK compile (run2)
@@ -304,7 +306,7 @@ jobs:
   windows-powershell:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `shell: powershell` 就是 **Windows PowerShell 5.1**（不是 pwsh）——
       # 这正是本 job 的意义所在。
       - name: PSScriptAnalyzer (Windows PowerShell 5.1)
@@ -422,7 +424,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
