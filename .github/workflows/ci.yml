@@ -138,6 +138,28 @@ jobs:
       # pointed at the runner's temp .ps1, so it was not reproducible locally.
       - name: CI shell compatibility (PS 5.1 run blocks stay ASCII)
         run: python3 tools/check_ci_shell_compat.py
+      # OPT-R17: observability / dependency-declaration truthfulness gate.
+      #
+      # Two verified failures from the OPT-R17 capability audit, both of the
+      # same shape: "the config or docs say something exists that the code
+      # does not implement". Neither turns any test red, which is exactly
+      # why both survived CI:
+      #   A. gateway/Cargo.toml declared tower-http features
+      #      ["cors", "trace", "timeout"] while src/ referenced tower-http
+      #      ZERO times, and admin.rs's own doc comment claimed "CORS +
+      #      timeout". Result: no request timeout, no access audit trail,
+      #      and a comment promising a cross-origin policy that did not exist.
+      #   B. docs/OPERATION.md (27KB ops manual) never mentioned
+      #      "alertmanager" at all, so an operator reading it could not tell
+      #      that the 15 alert rules do NOT page anyone (receiver: "empty").
+      #
+      # Bidirectionally verified at authoring time. One trap worth recording:
+      # the gate greps source with COMMENTS STRIPPED. Without that, the gate is
+      # satisfied by its own rationale prose -- it reported green on an
+      # injected regression because the explanatory comment happened to
+      # contain the literal token "CorsLayer".
+      - name: Observability + dependency truthfulness (OPT-R17)
+        run: python3 tools/check_observability_truth.py
       - name: No plaintext credentials in process argv (OPT-R8 A5)
         # 凭据进 argv 会被同机任意用户读到（Get-CimInstance Win32_Process /
         # /proc/<pid>/cmdline）。正确做法是环境变量（REDISCLI_AUTH /

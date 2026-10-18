@@ -1464,3 +1464,45 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **实证**：提交 `e0b7abf` push → run **39107482467** 四 job 全绿：gates 2m7s、static-checks 5m43s（含 .NET/Java SDK 编译 run 步 = setup-dotnet@v6/setup-java@v6 实证可用）、supply-chain 22s、windows-powershell 2m21s；run **ANNOTATIONS 区消失**（Node20 强迁提示与 setup-java@v4 弃用提示双双清零）；`gh run watch --exit-status` = 0。
   - **注记**：本次无新增观察项——CI 侧注记面已完全干净。
 - **未 commit。**
+
+---
+
+## 2026-10-18 — OPT-R17 能力复核：修掉三类「声明即失实」（步骤 49、50）
+
+### 步骤 49：Admin API 「声明即失实」+ 告警投递接线（用户指令：先完成三件事）
+
+**触发**：能力复核报告（`docs/CAPABILITY-AUDIT.md` 同批）实证出两类**不会让任何测试变红**的失实。
+
+**失实 A — 依赖 feature 声明了但从未使用**
+- 实证：`gateway/Cargo.toml` 声明 `tower-http = { features = ["cors","trace","timeout"] }`，而 `src/` 全仓对 `tower-http` **零引用**（Cargo.lock 两条 tower-http 记录纯属其它依赖的传递依赖）；`admin.rs:244` 注释写「构建 axum 路由（含 CORS + 超时 + 认证中间件）」——**两者都不存在**。
+- 危害三重：① 读者以为跨域已放开（实则 UI 只能靠 Vite proxy/同域反代）② 以为有请求超时（实则慢请求可长期占满连接）③ 以为有访问审计（实则改权重/隔离/余额这类写操作**无任何轨迹**）。
+- 处置：
+  - **真正补上 `TimeoutLayer`**：`ADMIN_TIMEOUT_SECS = 30`，套在认证中间件**外层**，使未认证的挂起请求同样受约束。新增 3 测试锁层序与错误体契约。
+  - **新增 `audit_logging` 中间件**，**用 `log` 手写而非 `TraceLayer`** —— 关键判断：TraceLayer 发的是 `tracing` 事件，本项目装的是 `env_logger`（全仓 78 处 `log::info!`），**无 tracing subscriber** ⇒ 会得到「加了审计却一条不打印」的静默失效，正是本轮要消除的那类问题。记录方法/路径/状态码/耗时，4xx/5xx 走 `warn`；**只记是否带 Key、绝不记值**（日志进 `log/` 并可能被备份，写入密钥等于新建泄漏路径）。
+  - **移除 `cors` 与 `trace`**，让依赖清单与真实代码一致。不补 CORS 是**安全选择**：`X-Admin-Key` 头认证 + permissive CORS 会让任意站点的 JS 都能发起带凭据跨域请求，攻击面从「本机回环」扩大到「任何能访问 :9092 的站点」。
+- 副产物：移除 `trace` 后 `Cargo.lock` 恰好少一行 `tracing` 传递依赖 —— **实证 `tracing` 本就是死重量**（非本仓其它代码所需）。
+
+**失实 B — 告警投递链路：注释与实际相反**
+- 查明真实现状：`deploy/prometheus/prometheus.yml` 的 `alerting.alertmanagers` 块**早已接好**（指向 `alertmanager:9093`）。真正的三个断点是：
+  1. `docker-compose.yml` 注释称「取消注释＋重启 prom 即投递」并挂 `alertmanager.yml` 到 **prometheus** 容器 —— **该挂载无效且多余**：收件人配置由 **alertmanager 自己**读 `/etc/alertmanager/alertmanager.yml`，Prometheus 根本不读该文件。误导性注释与挂载均已删。
+  2. `alertmanager` 服务被 `profiles: ["observability"]` 隔离 ⇒ 默认 `docker compose up -d` **不起它**，而 `alerting:` 无条件指向它 ⇒ 默认部署下告警链路是断的。已移出 profile，与 Redis/Prom 同级默认启动。
+  3. `docs/OPERATION.md`（27KB 运维手册）**全文不出现 "alertmanager"** —— 运维读手册无法得知 15 条告警**不会送达任何人**。已新增 §4.1 写明三段链路各自真实状态 + 4 条常见误解澄清。
+- 结果：**链路默认可达、投递默认关闭**（receiver 仍是刻意的 `empty`，避免开发环境误报真实渠道）。运维从「只能去 Prometheus UI 干看」升级为「可在 Alertmanager UI 分组/silence/ack」。
+
+**新门 `tools/check_observability_truth.py`（第 13 道）**
+- 锁两类失实：依赖 feature 未被引用；告警投递未文档化。
+- **双向验证**：注入 `features = ["cors"]` → 判红并指出 `CorsLayer` 缺失；删掉 OPERATION.md 告警小节 → 判红；还原 → 绿。
+- **过程中踩中并修正的陷阱（值得留档）**：门初版按「全文 grep 符号」实现，结果被**自身的说明注释**满足 —— 注释里为解释「为什么不加 CORS」写了 `CorsLayer::permissive()` 字样，于是注入回归后门**仍报绿**。这比「门失效」更糟：它让门**看起来**在工作。修正为**剥离注释后**再检索（`strip_comments`，状态机处理 `//` 与 `/* */`，并避免误伤 URL 里的 `//`）。**这是双向验证唯一能发现此类问题的手段。**
+- 另修一处噪声：未登记映射的常规 feature（`tokio/full` 等 40+ 个）初版逐个 note，会把真信号淹没 —— 改为安静跳过（呼应 OPT-R12「`check_auth_docs.py` 曾把正确澄清句当失实句」的教训）。
+
+**门禁**：fmt 绿 · **16 道 Python 门全绿** · cargo deny 四段 + audit exit 0（证实移除 feature 未引入漏洞）· compose 结构与 YAML 解析绿（alertmanager 已无 profile、prometheus 侧已无无效挂载、收件人配置正确挂到 alertmanager 自身）· CI workflow ASCII 门绿。`cargo test`/`clippy` **待 CI**（见步骤 50）。
+
+### 步骤 50：本机 Rust 验证能力诊断（初判被推翻）
+
+**初判错误**：报告里写「本机 rustup 无 toolchain，无法验证」——**部分错误**。
+- **真实根因不是没装，是 `RUSTUP_HOME` 环境变量指向空目录** `D:\DevSoft\rustup`（`rustup toolchain list` 报 no installed toolchains 有误导性）；真实安装在 **`D:\DevSoft\Rust`**（GNU，rustc 1.89.0，含 clippy/rustfmt）。项目 EXEC_LOG 早有「每次补带 `$env:RUSTUP_HOME`」的本机铁律，本轮正是在其失效形态上栽了一次。
+- 带正确 `RUSTUP_HOME`/`CARGO_HOME` 后：`cargo fmt --check` **绿**（并修正了本轮改动的格式）· `cargo deny` 四段 + `cargo audit` **绿**（0 漏洞）。
+- `cargo check` 仍失败：原生 crate（ring/libz-ng-sys/lz4/zstd）需 C 编译器，机器上仅 binutils（ar/ld/dlltool，dlltool 已从 RustRover 找到并加入 PATH）**无 `gcc.exe`**，亦无 MSVC（`C:\Program Files\Microsoft Visual Studio` 不存在）。**按用户决策**：余下 test/clippy 交由 CI（ubuntu runner 有完整 gcc），不做多余环境改动。
+- **附带实测（独立于代码的环境问题）**：`rustup` 在本环境以 **~0.05 MB/s** 龟速下载组件，而直连 `Invoke-WebRequest` 实测 **73.5 MB/s** —— 瓶颈在 rustup 自身的 HTTP 续传逻辑而非网络。多次尝试（`--profile minimal`、minimal+clippy/rustfmt、`RUSTUP_IO_THREADS=16`、`RUSTUP_MAX_RETRIES=5`）均因超时中断，`.partial` 文件从 27.1MB 仅推进到 35.3MB。已停止折腾，避免在环境上继续投入。
+
+**诚实边界**：本轮 Rust 代码改动（`admin.rs` 超时层 + 审计层 + 3 个新测试）**未经本机 `cargo test`/`clippy` 实跑**，仅 `cargo fmt` 通过。已由 CI 承接验证 —— 推送后需观测 run 结果。

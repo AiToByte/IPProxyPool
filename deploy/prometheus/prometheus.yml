@@ -5,8 +5,19 @@ global:
 rule_files:
   - /etc/prometheus/rules.yml
 
-# OPT-R5 O9：Alertmanager 接线（compose alertmanager 服务 profile-gated；
-# `docker compose --profile observability up -d alertmanager` 后重载 prom 即投递；receiver 仍 empty）。
+# OPT-R5 O9：Alertmanager 接线。**此块早已生效**（此前 docker-compose.yml 里
+# 却注释着"取消注释即接线"，属失实注释，OPT-R17 已更正）。
+#
+# 链路现状（OPT-R17 取证）：
+#   Prometheus ──alerting──▶ Alertmanager ──▶ receiver
+#                              (默认起)        ("empty" ⇒ 不外发)
+#
+# 即：**告警已能到达 Alertmanager**（可在其 UI 分组/silence/ack），
+# 但**不会外发给人**，因为 deploy/alertmanager.yml 的 receiver 是刻意留空的
+# "empty"（避免开发环境误报真实渠道）。要真正收到通知，改那个文件的
+# route.receiver 并重启 alertmanager 容器即可，本文件无需改动。
+# 详见 docs/OPERATION.md §告警投递。
+#
 # 注记：顶层键必须是 alerting: 包 alertmanagers:（裸 alertmanagers: 会整库起不来，冒烟实锤已修正）。
 alerting:
   alertmanagers:

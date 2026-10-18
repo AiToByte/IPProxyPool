@@ -69,10 +69,28 @@ services:
       # free_pool_fwd_latency_ms_bucket）恰恰需要跨重启累计才能算 P99/均值——
       # 这是一个「以为有 observability，实际每次重启归零」的静默失效。
       - prometheus-data:/prometheus
-      # OPT-R4 C9：Alertmanager 接线（文件已备；取消注释＋**重启** prom 即投递）。
-      # 注：Prometheus 默认禁用 `/-/reload`（需启动参数 --web.enable-lifecycle），
-      # 故改规则/接线后**必须 restart prom 容器**，单纯 reload 无效。
-      # - ./deploy/alertmanager.yml:/etc/prometheus/alertmanager.yml:ro
+      # OPT-R4 C9：Alertmanager 接线**已在 prometheus.yml 内完成**
+      # （`alerting.alertmanagers.targets: ["alertmanager:9093"]`，
+      #  见 deploy/prometheus/prometheus.yml）。
+      #
+      # OPT-R17 更正两处失实（此前会让人以为"接线还没做"）：
+      #  ① 本条**曾**注释着「取消注释＋重启 prom 即投递」并挂着
+      #     `- ./deploy/alertmanager.yml:/etc/prometheus/alertmanager.yml:ro`。
+      #     那是**多余且无效**的：Alertmanager 的收件人配置由 **alertmanager
+      #     容器自己**读 `/etc/alertmanager/alertmanager.yml`（见下方
+      #     alertmanager 服务的 volumes），Prometheus 侧根本不需要这个文件，
+      #     挂进去也不会被读取。真正需要改的是 `deploy/alertmanager.yml` 的
+      #     `route.receiver`，改完重启 **alertmanager** 容器（不是 prom）。
+      #  ② 故把这条误导性挂载删除，避免"照着注释操作却毫无效果"。
+      #
+      # 投递链路现状（OPT-R17 实测取证）：链路已通到 Alertmanager，
+      # 但 `route.receiver: "empty"` 是**刻意**的空接收器（开发环境避免误报
+      # 到真实渠道）⇒ **告警不会外发给人**。要真正收到通知，必须按
+      # deploy/alertmanager.yml 头部说明启用 webhook 或 email 并填入
+      # 真实凭据（凭据不入仓）。详见 docs/OPERATION.md §告警投递。
+
+      # 改 alertmanager.yml 后需 restart（Prometheus 默认禁用 /-/reload，
+      # 但本次改的是 alertmanager 侧配置，prom 侧**无需**重启）。
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -181,16 +199,28 @@ services:
       redis:
         condition: service_healthy
 
-  # OPT-R5 O9：alertmanager（profile-gated opt-in；仿 redis-exporter；
-  # receiver 仍 empty 占位，只先可见不投递）。
-  # 用法：docker compose --profile observability up -d alertmanager
+  # OPT-R5 O9：alertmanager。
+  #
+  # OPT-R17：去掉 `profiles: ["observability"]` —— 此前 profile-gated 意味着
+  # `docker compose up -d` **不起**它，而 prometheus.yml 的 `alerting:` 块
+  # 无条件指向 `alertmanager:9093`。结果是：默认部署下 Prometheus 持续重试
+  # 一个不存在的 target，告警既不外发、也不出现在 Alertmanager 侧
+  # （Prometheus 只在自己 UI 显示 firing）。这是"以为接了告警、实际没接"。
+  #
+  # 保持默认起、但 receiver 仍是 `empty`（不误报到真实渠道）——即
+  # **链路默认可达、投递默认关闭**：运维能在 Alertmanager UI 看到告警分组、
+  # 做 silence（静默）与 ack（确认），把 `empty` 从"丢弃黑洞"升格为
+  # "可操作的观察窗"。
+  #
+  # 用法：docker compose up -d alertmanager（现已属默认服务，无需 --profile）
   alertmanager:
     image: prom/alertmanager:v0.27.0
-    profiles: ["observability"]
     container_name: ipproxy-alertmanager
+    restart: unless-stopped
     ports:
       - "127.0.0.1:9093:9093"
     volumes:
+      # 收件人配置由 **alertmanager 自己**读这个路径（Prometheus 不读它）。
       - ./deploy/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
     command:

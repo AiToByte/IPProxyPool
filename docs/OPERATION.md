@@ -173,6 +173,63 @@ python tools/probe_free_pool.py --launch --wait 420
 OPT-3 计费口径（已冻结）：只计最后一次 attempt 的出站字节，失败 attempt
 的字节在重试前清零，不进账单；`logging` 侧不做补偿。
 
+## 4.1 告警投递（Alertmanager）
+
+> **本节为 OPT-R17 新增。** 此前本文档**完全没有**提到 Alertmanager，而
+> `deploy/prometheus/rules.yml` 里的告警**默认不会送达任何人**——这是
+> 一处会导致"以为有告警、实际收不到"的静默失效，故单列一节说明现状。
+
+### 4.1.1 链路现状（务必先读）
+
+```
+Prometheus ──alerting.alertmanagers──▶ Alertmanager ──route.receiver──▶ 你的渠道
+   :9090            (已接线, 常驻)        :9093          ("empty")
+                                                    ▲
+                                          刻意留空 ⇒ 收到即丢弃
+```
+
+三段链路各自的真实状态：
+
+| 段 | 状态 | 说明 |
+|----|------|------|
+| Prometheus → Alertmanager | ✅ **已接线** | `deploy/prometheus/prometheus.yml` 的 `alerting.alertmanagers` 指向 `alertmanager:9093` |
+| Alertmanager 服务 | ✅ **默认起** | OPT-R17 起从 `--profile observability` 移出，`docker compose up -d` 即启动 |
+| Alertmanager → 人 | ❌ **不外发** | `deploy/alertmanager.yml` 的 `route.receiver: "empty"`，收到即丢弃 |
+
+**结论**：15 条告警规则**会触发**，也会**到达 Alertmanager**（可在其 UI
+分组、静默、确认），但**不会外发**给任何人。这是**刻意的**——
+开发/本地环境误报到真实渠道会造成告警疲劳。
+
+### 4.1.2 如何真正收到通知
+
+1. 编辑 `deploy/alertmanager.yml`，按文件头说明**启用其一**：
+   - `webhook_configs`（最通用：钉钉/企业微信/Slack/自建网关）
+   - `email_configs`（SMTP）
+2. 同步把 `route.receiver` 改为该 receiver 名（默认 `"empty"`）。
+3. **重启 alertmanager 容器**（改的是 alertmanager 自己的配置，Prometheus 无需重启）：
+   ```powershell
+   docker compose restart alertmanager
+   ```
+4. 验证：
+   ```powershell
+   curl.exe -s http://127.0.0.1:9093/-/ready          # 期望 "ready"
+   curl.exe -s http://127.0.0.1:9093/api/v2/alerts    # 期望能看到当前告警
+   curl.exe -s http://127.0.0.1:9090/api/v1/alertmanagers   # 期望 Alertmanager 为 up
+   ```
+
+> **凭据红线**：含 token 的 webhook URL / SMTP 密码**绝不要提交进仓库**。
+> 做法见 `deploy/alertmanager.yml` 末尾「凭据注入」节（推荐 `env_file` +
+> 启动脚本生成运行时配置）。CI 有 `tools/check_no_plaintext_creds.py` 拦截。
+
+### 4.1.3 常见误解（OPT-R17 实测澄清）
+
+| 误解 | 实际 |
+|------|------|
+| "要改 `prometheus.yml` 才能接线" | ❌ 早已接好，**不需要**改 |
+| "要在 prometheus 容器里挂 `alertmanager.yml`" | ❌ 那是 **alertmanager 容器**读的路径，挂进 prometheus 不会被读取 |
+| "改完配置要 `restart prometheus`" | ❌ 改的是 alertmanager 侧配置，重启 **alertmanager** 即可 |
+| "告警规则没写对，所以没告警" | 规则在 Prometheus `/alerts` 页面可见；`empty` 只影响**外发**，不影响规则求值 |
+
 ## 5. Spike 结论（本轮不落地，详见 `docs/SPIKE_R2.md`）
 
 - **eBPF Sockmap**：收益在内网小包高频场景最大；本网关瓶颈在出站 TLS

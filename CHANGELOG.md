@@ -42,6 +42,33 @@
     任意站点的 JS 都能发起带凭据的跨域请求。
   - 副作用：Cargo.lock 中 `tower-http` 的 `tracing` 传递依赖随之移除
     （实证 `tracing` 本就是死重量，非本仓其它代码所需）。
+- **告警投递链路的注释与实际相反**（OPT-R17）：`docker-compose.yml` 曾注释着
+  「取消注释＋重启 prom 即投递」并挂载 `alertmanager.yml` 到 prometheus
+  容器——**该挂载无效且多余**（Prometheus 不读它；收件人配置由 Alertmanager
+  自己读 `/etc/alertmanager/alertmanager.yml`）。误导性注释与挂载均已移除。
+  澄清：`prometheus.yml` 的 `alerting:` 块**早已接好**，从不需要改动。
+- **Alertmanager 默认不启动**：此前 `profiles: ["observability"]` 使
+  `docker compose up -d` 不起它，而 `prometheus.yml` 的 `alerting:` 块
+  无条件指向 `alertmanager:9093` ⇒ 默认部署下告警链路是断的。已移出
+  profile，与 Redis/Prom 同级默认启动。结果是**链路默认可达、投递默认关闭**
+  （receiver 仍是刻意的 `empty`）：运维可在 Alertmanager UI 分组/silence/ack，
+  而非只能去 Prometheus UI 干看。
+
+### Added
+
+- `docs/OPERATION.md` 新增「§4.1 告警投递（Alertmanager）」小节：
+  写明三段链路各自的**真实状态**（Prometheus→Alertmanager ✅ 已接线、
+  Alertmanager 服务 ✅ 默认起、Alertmanager→人 ❌ `receiver: "empty"`
+  故不外发），并附 4 条常见误解澄清。此前 27KB 运维手册**全文不出现
+  "alertmanager"**，运维读手册无法得知告警不会送达任何人。
+- 第 13 道静态门 `tools/check_observability_truth.py`：锁两类「文档/配置
+  声称存在、代码里不存在」的失实（依赖 feature 未被引用；告警投递未文档化）。
+  **双向验证**：注入 `features = ["cors"]` → 判红指出 `CorsLayer` 缺失；
+  删掉 OPERATION.md 告警小节 → 判红；还原 → 绿。
+  过程中踩中一个值得记录的陷阱：门最初按「全文 grep 符号」实现，结果被
+  **自己的说明注释**满足（注释里为解释「为什么不加 CORS」写了
+  `CorsLayer::permissive()` 字样）而**假绿** —— 这比「门失效」更糟，它让门
+  看起来在工作。修正为**剥离注释后**再检索。
 
 ## [0.2.0] - 2026-10-17
 
