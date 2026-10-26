@@ -1,7 +1,7 @@
 # 功能说明文档 / Feature Catalog
 
 > 双语：中文在前，English after.
-> 口径基线：D3（Key 门默认开＋回环监听）、306 单测＋4 真 live（权威数字见 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)）。每项按“是什么／为什么／怎么看／配置项”四段写。
+> 口径基线：D3（Key 门默认开＋回环监听）、326 单测＋4 真 live（权威数字见 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)）。每项按“是什么／为什么／怎么看／配置项”四段写。
 
 ## 中文
 
@@ -74,6 +74,13 @@
 - **为什么**：10 分钟从零到可观测；合入前拦截漂移；灾时按手册恢复。
 - **怎么看**：`ipp.ps1 status` 九行；CI 绿；`backup/<stamp>/` 四件套；`tools/restore.ps1 --dry-run`。
 - **配置项**：`.env.example`→`.env`；compose profiles（gateway/observability）。
+
+### F11 控制面节点热更新
+
+- **是什么**：Admin API/UI 运行时新增/删除托管节点、按 `provider+country` 调权、隔离；`NODES_FILE` 原子持久化（临时文件+fsync+rename），重启后保持；免费池 `free-*` 与测试注入节点不落盘。
+- **为什么**：此前只能改 seeds/环境变量重启；Windows 上网关约 300s 自退出，纯内存变更必丢，所以持久化是能力成立的前提。
+- **怎么看**：`POST/DELETE /api/v1/nodes`；`data/nodes.json`（Unix `0600`）；重启前后 `GET /api/v1/nodes` 对比；启动行 `[NodeRegistry] managed=… file=…`；破坏并发回归测试。
+- **配置项**：`NODES_FILE`（空串关闭持久化）、`ADMIN_ADDR`、`ADMIN_API_KEY`；容器用 `gateway-data` 卷挂载 `/app/data`。
 
 ### 相关文档 / Related docs
 
@@ -150,3 +157,10 @@
 - **Why**: zero→observable in 10 minutes; drift blocked pre-merge; disaster recovery by handbook.
 - **Observe**: `ipp.ps1 status` nine lines; CI green; `backup/<stamp>/` four artifacts; `tools/restore.ps1 --dry-run`.
 - **Config**: `.env.example`→`.env`; compose profiles (gateway/observability).
+
+### F11 Control-Plane Node Hot-Update
+
+- **What**: Admin API/UI adds/removes managed nodes at runtime, adjusts weights by `provider+country`, and quarantines; `NODES_FILE` persists atomically (temp file+fsync+rename), surviving restarts; free-pool `free-*` and test-injected nodes are never persisted.
+- **Why**: previously required editing seeds/env and restarting; on Windows the gateway exits after ~300s, so an in-memory-only change would always be lost.
+- **Observe**: `POST/DELETE /api/v1/nodes`; `data/nodes.json` (`0600` on Unix); compare `GET /api/v1/nodes` across restart; boot line `[NodeRegistry] managed=… file=…`; concurrency regression tests.
+- **Config**: `NODES_FILE` (empty disables persistence), `ADMIN_ADDR`, `ADMIN_API_KEY`; container uses the `gateway-data` volume at `/app/data`.

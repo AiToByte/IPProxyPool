@@ -74,6 +74,51 @@ OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
 > 一条 `WARN`，并逐条给出整改动作。三者缺一不告警，因此本机开发与生产
 > 正确配置都不会被这条打扰。
 
+### 2.1 控制面节点热更新（步骤 52）
+
+不重启网关增删节点，且重启后保持：
+
+```powershell
+# 启动参数（均可选；ADMIN_API_KEY 必须设，否则 Admin API 全部 401）
+$env:ADMIN_API_KEY = "<强随机值>"
+$env:ADMIN_ADDR = "127.0.0.1:9092"                   # 缺省；容器内须 0.0.0.0:9092
+$env:NODES_FILE = "D:\IPProxyPool\data\nodes.json"   # 缺省 data/nodes.json；空串=关闭持久化
+.\gateway\target\debug\pingora-proxy-gateway.exe
+```
+
+```powershell
+# 新增（IPv4；tier 仅三档；free-* 前缀保留给免费池）
+curl.exe -s -X POST http://127.0.0.1:9092/api/v1/nodes `
+  -H "X-Admin-Key: <key>" -H "Content-Type: application/json" `
+  -d '{\"ip\":\"203.0.113.10\",\"port\":8080,\"country\":\"US\",\"tier\":\"residential\",\"provider\":\"vendor-a\",\"weight\":100}'
+
+# 删除托管节点；重启后仍不在
+curl.exe -s -X DELETE http://127.0.0.1:9092/api/v1/nodes/203.0.113.10:8080 `
+  -H "X-Admin-Key: <key>"
+```
+
+运维要点：
+
+- **文件存在即权威**：`NODES_FILE` 存在时启动只读文件，硬编码 seeds 仅在文件不存在时使用。
+  文件损坏/版本不符会**拒绝启动**（不会静默回退 seeds）。
+- **写入顺序**：临时文件 + fsync → 原子 rename → 应用选路池。落盘失败返回 `500`
+  且内存不变；应用失败会尝试回滚文件。跨进程无文件锁，同一个 `NODES_FILE`
+  只能由一个网关进程写（多实例请各自分文件）。
+- **不落盘**：免费池 `free-*`（每轮 merge 重建）与 `TEST_POOL_NODES`（测试注入）。
+  免费节点不可删除；要摘除请把权重调为 `0`（下次 merge 后权重由免费池策略重新决定）。
+- **调权持久化**：`PATCH /nodes/{addr}/weight` 对托管节点按 `provider+country`
+  整组落盘（0=摘除）；自动调权（干旱抬权）刻意不落盘。
+- **凭据**：节点文件含上游 `username`/`password` 明文，Unix 创建为 `0600`，
+  Windows 依赖目录 ACL；`.gitignore` 已忽略 `data/`。备份按凭据对待。
+- **恢复**：停网关 → 修复/替换 `nodes.json` → 启动。删除该文件会让下次启动
+  重新使用 seeds（等于重置托管清单），操作前先备份。
+- **容器**：`docker compose --profile gateway up -d gateway` 映射
+  `127.0.0.1:9092`，`NODES_FILE=/app/data/nodes.json`，命名卷 `gateway-data`
+  跨 recreate/down-up 保留；`.env` 里覆盖 `ADMIN_API_KEY`
+  （缺省 `change-me-admin-key` 仅开发用）。
+
+---
+
 ## 3. 三家真 Key 灰度（GW-R2，用户给 Key 后执行）
 
 1. Key 入库：走 secret 管理（禁进仓库），staging 先配 1 家 1 国；
@@ -97,7 +142,7 @@ OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
 | 熔断 key | `quarantine:{domain}:{ip}` | TTL 到自愈；内存 TTL 独立，DEL 键不清内存 |
 | Stream 堆积 | `XLEN stream:proxy:telemetry` | 持续增长=CB 消费组 lag，查 `XINFO GROUPS`；R2-5 起 XADD 带 MAXLEN ~10 万（消费组全挂时老数据先丢，XLEN 封顶）；sink 启动清幽灵消费者，毒丸/重复即时 ack 不进仓 |
 | 后台并发 | 网关日志 `[Prober]/[Prewarmer]/[Sweep]/[Arbitrage]` | R2-7 起三 60s ticker 启动错峰（`staggered start` 行对齐验证）；prober 20 并发 + Client 闲置 10min 淘汰；prewarmer 建链/握手探测 100 并发封顶（http 建链＋socks greeting，P2-6 起），`tickets`==探测节点数（票据环已删） |
-| 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；后台 CB/sink/arbitrage/free_pool 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
+| 配置覆盖 | 启动环境变量 | R2-8 起 `REDIS_URL/CLICKHOUSE_URL(_USER/_PASSWORD/_DB)/GATEWAY_ADDR/METRICS_ADDR/*_INTERVAL_SECS` 全 env 化（缺省沿用 code 常量，compose 有示例）；步骤 52 增 `ADMIN_ADDR/ADMIN_API_KEY/NODES_FILE`（详见 §2.1）；后台 CB/sink/arbitrage/free_pool 由 supervisor 托管（panic/退出即 backoff 重启，`supervisor_restarts_total{worker}` 计数）；数据面日志 5xx 全量、其余 1/1000（`gateway_logs_sampled_total` 可观测）；`/metrics` 读超时 5s + 并发 64 封顶 |
 | 免费线水位 | `free_pool_nodes_total` / 日志`[FreePool] tick` | 默认关闭（`FREE_ENABLED=1` 开）；水位突降=源站熔断（`free_pool_source_suspended{source}=1`）或质检门限过严（`free_pool_verify_total` 看 fail 分布）；country 缺省 ZZ，只服务无归属要求的流量；`FREE_REQUIRE_ELITE=1` 时仅 Elite 进池 |
 | 免费线健康 | `free_pool_source_yield_total` / `free_pool_anonymity_total` | yield 骤降=源站挂；transparent 占比突增=源站质量恶化，考虑开 REQUIRE_ELITE；单节点转发延迟看 registry 日志（debug） |
 | SOCKS 桥 | `free_pool_nodes_by_proto{proto}` / 日志`[SocksBridge]` | P2 起仅显式 `X-Proxy-Proto: socks5/socks4` 请求走桥；默认流量永不命中 socks（router 默认隔离＋peer 守卫＋粘滞 proto 复核三保险）；body 超 `SOCKS_MAX_BODY_BYTES`（默认 10MB）按失败计＋warn＋换节点重试 |

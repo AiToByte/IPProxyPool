@@ -41,6 +41,7 @@
 ### 5. 并发纪律
 
 - `parking_lot`/DashMap 守卫不跨 `await`（临时克隆后释放）；会话→隔离单向嵌套，无死锁。
+- 池写统一持 `RouterEngine.write_lock`（`NodeRegistry → RouterEngine` 锁序；读路径走 `ArcSwap` 快照无锁），禁止在锁内做 I/O/跨 `await`。
 - FreePool 信号量许可持有跨 await（TCP 50／FullCheck 20）；prewarmer 建链 100；prober 20＋Client 闲置 10min 淘汰。
 - 后台 CB/sink/arbitrage/free_pool 由 supervisor 托管（panic/退出 backoff 1s→60s 重启＋计数）；release 用 `unwind`（abort 会架空 supervisor）。
 - 生产代码零 `unwrap/expect`（仅 main 三处启动 fail-fast）；算术除零/`as` 转换逐点有界。
@@ -50,6 +51,9 @@
 | Key | 默认 | 说明 |
 |-----|------|------|
 | `GATEWAY_ADDR`／`METRICS_ADDR` | `127.0.0.1:8916`／`127.0.0.1:9091`（D3 起回环收紧；容器/局域网显式覆写 `0.0.0.0`） | 监听地址 |
+| `ADMIN_ADDR` | `127.0.0.1:9092` | Admin API 监听；容器内须 `0.0.0.0:9092` |
+| `ADMIN_API_KEY` | 空（fail-closed） | Admin 认证；未设则全部 401 |
+| `NODES_FILE` | `data/nodes.json` | 托管节点持久化；空串关闭；文件损坏拒绝启动 |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | 缺失即降级（遥测仅日志） |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | 缺失即 hold 权重 |
 | `REQUIRE_API_KEY` | `1`（D3 起默认开门；`0` 显式关闭） | 无头 403（开发带 `default_key` 头） |
@@ -107,6 +111,7 @@
 ### 5. Concurrency discipline
 
 - `parking_lot`/DashMap guards never cross `await` (clone-then-release); single nesting direction session→quarantine, deadlock-free.
+- All pool writes hold `RouterEngine.write_lock` (lock order `NodeRegistry → RouterEngine`; reads use lock-free `ArcSwap` snapshots); no I/O or `await` inside the critical section.
 - FreePool semaphore permits held across await (TCP 50 / FullCheck 20); prewarmer link cap 100; prober 20 + 10min idle client eviction.
 - Background CB/sink/arbitrage/free_pool supervised (panic/exit backoff 1s→60s restart + counting); release uses `unwind` (abort would defeat the supervisor).
 - Zero production `unwrap/expect` (only three startup fail-fasts in main); division-by-zero/`as` casts audited bounded.
@@ -116,6 +121,9 @@
 | Key | Default | Notes |
 |-----|---------|-------|
 | `GATEWAY_ADDR` / `METRICS_ADDR` | `127.0.0.1:8916` / `127.0.0.1:9091` (loopback since D3; override `0.0.0.0` for containers/LAN) | listen addresses |
+| `ADMIN_ADDR` | `127.0.0.1:9092` | Admin API listen; use `0.0.0.0:9092` in containers |
+| `ADMIN_API_KEY` | empty (fail-closed) | Admin auth; all requests 401 until set |
+| `NODES_FILE` | `data/nodes.json` | managed-node persistence; empty disables; corrupt file aborts startup |
 | `REDIS_URL` | `redis://127.0.0.1:6379/` | degraded (log-only telemetry) when missing |
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | hold weights when missing |
 | `REQUIRE_API_KEY` | `1` (gate on by default since D3; `0` disables) | headerless 403 (send dev `default_key`) |

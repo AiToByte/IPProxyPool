@@ -61,14 +61,85 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 
 ---
 
+### POST `/api/v1/nodes` — 运行时新增节点（热更新 + 持久化）
+
+新增一个**托管节点**：校验通过后先原子落盘，再应用到实时选路池，下一请求即可命中，无需重启。落盘失败返回 `500` 且内存不变；应用失败会尝试把文件回滚到旧清单。
+
+**请求体**（`AddNodeRequest`）：
+
+```json
+{
+  "ip": "203.0.113.10",
+  "port": 8080,
+  "country": "US",
+  "tier": "residential",
+  "provider": "vendor-a",
+  "weight": 100,
+  "proto": "http",
+  "username": "optional-user",
+  "password": "optional-pass"
+}
+```
+
+**字段约束**：
+
+| 字段 | 必填 | 约束 |
+|------|------|------|
+| `ip` | 是 | **仅 IPv4**（IPv6 的 `ip:port` 有歧义，明确拒绝）|
+| `port` | 是 | `1..=65535` |
+| `country` | 是 | 两个 ASCII 字母；落盘前归一为大写 |
+| `tier` | 是 | `datacenter` / `residential` / `mobile`（`free` 由免费池管理，拒绝）|
+| `provider` | 是 | 非空、≤64 字节、无控制字符；**不得**为 `free` 或以 `free-` 开头 |
+| `weight` | 否 | `0..=100`，缺省 100（0 = 摘除）|
+| `proto` | 否 | `http` / `socks5` / `socks4`，缺省 `http` |
+| `username` / `password` | 否 | 必须**成对**出现；都省略即无认证 |
+| `addr` | — | 服务端由 `ip:port` 派生，不接受客户端指定 |
+
+**响应**：`201 Created` + 归一化后的 `NodeView`（`country` 已大写、`addr` 已重建）。
+
+**冲突**：与实时池中任意节点同 `addr`（含免费池 `free-*` 与 `TEST_POOL_NODES` 注入）返回 `409`。
+
+**容量**：托管节点上限 10000，超出返回 `400`。
+
+---
+
+### DELETE `/api/v1/nodes/{addr}` — 运行时删除托管节点
+
+删除一个**托管节点**：先原子落盘（从持久化清单移除），成功后再从实时池移除；重启后仍不存在。
+
+**响应**：`200 OK`
+
+```json
+{ "addr": "203.0.113.10:8080", "removed": true }
+```
+
+**不可删除的节点（`409` + 可执行建议）**：
+
+- 免费池 `free-*`：每轮 merge 会重建，删了很快回来。要用
+  `PATCH /api/v1/nodes/{addr}/weight` 把权重改为 `0` 摘除（免费节点是运行时策略，
+  不写入托管文件）。
+- `TEST_POOL_NODES` 注入：测试通道，不在托管清单、不持久化，重启即消失。
+
+节点本身不存在返回 `404`；落盘/应用失败返回 `500`（已尝试回滚，内存与文件保持一致）。
+
+---
+
 ### PATCH `/api/v1/nodes/{addr}/weight` — 运行时调整节点权重
 
 按该节点所属的 `provider + country` 维度整组调权（与 `router::adjust_vendor_weight` 口径一致），生效于下一轮选路，无需重启网关。
 
 **请求体**：
+
 ```json
 { "weight": 100 }
 ```
+
+**约束与持久化**：
+
+- 范围 `0..=100`（`0` = 摘除），越界返回 `400`。
+- 命中**托管节点**时，新权重会同步写入 `NODES_FILE`——把坏节点调成 `0` 后重启仍然不会复活。
+- `free-*` / `TEST_POOL_NODES` 节点只改运行时（自动调权与免费池策略不落盘）。
+- 没有命中任何托管节点时不写文件（避免无意义 fsync）。
 
 **响应**：调权后的 `NodeView`，未找到返回 `404`。
 
@@ -201,6 +272,26 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 | `proto` | string | 出站协议：`Http` / `Socks5` / `Socks4` |
 | `exit_ip` | string\|null | 真实 egress 出口 IP（FreePool FullCheck 实测）|
 
+### AddNodeRequest
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `ip` | string | 是 | IPv4 地址 |
+| `port` | integer | 是 | 1..65535 |
+| `country` | string | 是 | 两个字母国家码（归一为大写）|
+| `tier` | string | 是 | `datacenter` / `residential` / `mobile` |
+| `provider` | string | 是 | 供应商标识（不得占用 `free-` 前缀）|
+| `weight` | integer | 否 | 0..100，缺省 100 |
+| `proto` | string | 否 | `http` / `socks5` / `socks4`，缺省 `http` |
+| `username` / `password` | string | 否 | 成对出现；都省略即无认证 |
+
+### RemoveNodeResponse
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `addr` | string | 被删除节点的 `ip:port` |
+| `removed` | boolean | 成功时为 `true` |
+
 ### TenantSummary / TenantDetail
 
 | 字段 | 类型 | 说明 |
@@ -272,7 +363,9 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 |--------|------|------|
 | `401` | 认证失败 | 缺失/错误 `X-Admin-Key`，或 `ADMIN_API_KEY` 未配置。**错误文案刻意不区分「未配置」与「不对」**（fail-closed，不给探测者区分信号）|
 | `404` | 资源不存在 | 节点/租户；未匹配路径同样返回本形状（fallback）|
-| `400` | 请求体非法 | 非 JSON / 字段类型错；`balance_usd` 非有限值（NaN/±Infinity）|
+| `400` | 请求体/字段非法 | 非 JSON / 字段类型错；节点字段越界（IP/端口/国家码/tier/provider/weight/凭据）；`balance_usd` 非有限值（NaN/±Infinity）|
+| `409` | 状态冲突 | 新增节点地址已存在；删除免费池 `free-*` 或测试注入节点（不可持久化管理）|
+| `500` | 服务端失败 | 节点表落盘/应用失败；**此时内存与文件已尝试保持一致**，错误体不谎报成功 |
 
 未匹配方法（如对只读端点发 DELETE）由 axum 返回 `405`，body 不在统一错误体口径内。
 
@@ -291,7 +384,17 @@ curl -s http://127.0.0.1:9092/api/v1/health \
 curl -s http://127.0.0.1:9092/api/v1/nodes?tier=free \
   -H "X-Admin-Key: ops-secret-key"
 
-# 调整节点权重
+# 新增托管节点（立即生效并写入 NODES_FILE）
+curl -s -X POST http://127.0.0.1:9092/api/v1/nodes \
+  -H "X-Admin-Key: ops-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"203.0.113.10","port":8080,"country":"US","tier":"residential","provider":"vendor-a","weight":100,"proto":"http"}'
+
+# 删除托管节点（重启后仍不存在）
+curl -s -X DELETE http://127.0.0.1:9092/api/v1/nodes/203.0.113.10:8080 \
+  -H "X-Admin-Key: ops-secret-key"
+
+# 调整节点权重（托管节点会同步落盘）
 curl -s -X PATCH http://127.0.0.1:9092/api/v1/nodes/1.2.3.4:8080/weight \
   -H "X-Admin-Key: ops-secret-key" \
   -H "Content-Type: application/json" \
@@ -343,8 +446,23 @@ curl -s http://127.0.0.1:9092/api/v1/health
 ## 6. 部署注意 / Deployment
 
 - Admin 服务缺省绑定 `127.0.0.1:9092`，可通过环境变量 `ADMIN_ADDR` 覆写。
+  容器内必须设为 `0.0.0.0:9092`，否则宿主端口映射无法访问。
 - 生产环境 **必须** 设置 `ADMIN_API_KEY` 为强随机值，否则 Admin 接口全部返回 401。
 - Admin 服务由网关进程内托管（`tokio::spawn`），随网关一起启停，无需额外进程。
+
+### 节点持久化 / Node Persistence
+
+- 托管节点写入 `NODES_FILE`，缺省 `data/nodes.json`（相对进程工作目录）；
+  `NODES_FILE=""` 显式关闭持久化（仅内存，重启即丢）。
+- **文件存在即权威**：启动时文件存在就以文件为准，硬编码 seeds 只在文件不存在时使用。
+  文件损坏/版本不符会**拒绝启动**（不会静默回退 seeds，避免“以为配置生效”）。
+- 写入顺序为「临时文件 + fsync → 原子 rename → 应用到选路池」；跨进程**没有**
+  文件锁，同一个 `NODES_FILE` 只能由一个网关进程写。容器部署使用命名卷
+  `gateway-data` 挂载 `/app/data`。
+- 文件包含上游代理的 `username`/`password` 明文：Unix 下由进程创建为 `0600`；
+  Windows 依赖目录 ACL。备份/迁移时按凭据文件对待，不要提交到 Git
+  （`.gitignore` 已忽略 `data/`）。
+- 免费池 `free-*` 与 `TEST_POOL_NODES` 注入节点**不写入**该文件。
 
 ---
 

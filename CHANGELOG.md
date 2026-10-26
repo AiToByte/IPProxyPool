@@ -56,6 +56,16 @@
 
 ### Added
 
+- **控制面节点热更新（步骤 52）**：`POST /api/v1/nodes` /
+  `DELETE /api/v1/nodes/{addr}` 运行时增删托管节点，`PATCH .../weight`
+  对托管节点同步落盘；`NODES_FILE`（缺省 `data/nodes.json`）用
+  临时文件+fsync+rename 原子替换，文件存在即以文件为准（损坏拒绝启动），
+  `NODES_FILE=""` 关闭持久化。`RouterEngine` 新增池写串行锁，修复
+  FreePool merge 与 Admin 调权/增删并发时的 lost update；同时修复
+  `scale_vendor_weights` 漏重建 buckets（factor=0 摘除对桶快路径无效）。
+  Admin UI 节点页新增表单与删除；compose 暴露 `:9092` 并挂
+  `gateway-data` 卷。Admin API 错误映射补 409/500；新增 20 个单测
+  （306→326）与真实二进制 E2E（新增→重启仍在→删除→重启仍不在）。
 - `docs/OPERATION.md` 新增「§4.1 告警投递（Alertmanager）」小节：
   写明三段链路各自的**真实状态**（Prometheus→Alertmanager ✅ 已接线、
   Alertmanager 服务 ✅ 默认起、Alertmanager→人 ❌ `receiver: "empty"`

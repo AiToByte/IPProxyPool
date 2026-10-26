@@ -19,7 +19,7 @@
 
 | 指标 | 值 | 复现命令 |
 | ---- | -- | -------- |
-| 单元测试通过数 | **306** | `cd gateway && cargo test --locked --workspace` |
+| 单元测试通过数 | **326** | `cd gateway && cargo test --locked --workspace` |
 | 单元测试失败数 | **0** | 同上 |
 | 忽略测试数 | **7** | 同上 |
 | 其中：真 live 测试 | **4** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
@@ -58,7 +58,7 @@ cargo test --locked --workspace router::tests::opt_r11_b1_pick_weighted_streamin
 改动测试后：
 
 1. 跑全量：`cd gateway && cargo test --locked --workspace`，读 `test result:` 行。
-2. 若 `ignored` 数变了，同步更新上面「6 个忽略测试的构成」清单。
+2. 若 `ignored` 数变了，同步更新上面「7 个忽略测试的构成」清单。
 3. 更新本文件表格的三个数字。
 4. 跑 `python tools/check_doc_consistency.py`，它会把所有活文档的数字与本文件对齐。
 5. 在 `EXEC_LOG.md` 记录实测输出。
