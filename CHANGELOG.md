@@ -24,9 +24,11 @@
 ### Security
 
 - 升级 `rustls-webpki 0.103.15→0.103.16`（RUSTSEC-2026-0382：证书校验可能接受
-  不受信任的中间证书）与 `webpki-roots 1.0.9→1.0.10`（RUSTSEC-2026-0381：
-  内置根证书信任了已撤销的 emSign 中间证书）。仅改 `Cargo.lock`，无 API 变更；
-  本机 `cargo audit --no-fetch` 由 2 vulnerabilities 归零，326 单测/clippy 仍绿。
+  不受信任的中间证书）、`webpki-roots 1.0.9→1.0.10`（RUSTSEC-2026-0381：
+  内置根证书信任了已撤销的 emSign 中间证书）与 `tokio 1.53.1→1.53.3`
+  （RUSTSEC-2026-0386：`AsyncFd` 构造违反 I/O safety，`cargo deny` 判为
+  `unsound`）。仅改 `Cargo.lock`，无 API 变更；本机 `cargo audit --no-fetch`
+  由 2 vulnerabilities 归零、`cargo deny check` 四项全 ok，326 单测/clippy 仍绿。
 
 ### Fixed
 
