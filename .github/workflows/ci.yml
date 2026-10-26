@@ -222,6 +222,16 @@ jobs:
       # 同属「对外表述 vs 实际行为」类，故同样用静态门锁住。
       - name: Auth config docs state the real semantics
         run: python3 tools/check_auth_docs.py
+      # 步骤 52：Admin 路由 ↔ 文档双向门（静态、无网络）。
+      #
+      # 实测风险：新增 POST/DELETE /nodes 时，`admin.rs` 与 `ADMIN_API.md`
+      # 必须同步；只改一边 CI 仍全绿——文档写了但没注册（调用 404），或
+      # 注册了但没写（客户端不知道）。本门只比对 `### METHOD \`/api/v1/...\``
+      # 标题与 `build_router_with` 的 `.route(...)`，**不做全文 grep**（否则
+      # 说明/示例里的路径会让门假绿，OPT-R17 教训）。变异自测：注入未文档化
+      # 路由 → 红；文档写 ghost 端点 → 红；路由只出现在注释 → 绿。
+      - name: Admin routes match documented endpoints (bidirectional)
+        run: python3 tools/check_admin_routes_documented.py
       # OPT-R14 A2：free 池**契约**门（确定性，不依赖公网）。
       #
       # 刻意**不做**"healthy 节点数 ≥ N"的数量门：公网免费代理存活率天然 churn

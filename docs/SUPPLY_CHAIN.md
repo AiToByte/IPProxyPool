@@ -80,7 +80,7 @@ prometheus/protobuf 链）。但 0.x 的 minor 升级即 breaking change，
 
 ### 3.3 升级验收标准（届时执行）
 
-1. 编译通过 + 全量门禁绿（326 单测、clippy、14 门）。
+1. 编译通过 + 全量门禁绿（326 单测、clippy、15 门）。
 2. Windows 300s+ 存活实测（OPT-R14 方法复用）。
 3. 端到端压测复跑（`tools/bench_gateway.py`），QPS 不低于本次基线。
 4. `cargo deny check` + `cargo audit` 全绿（含 unmaintained 重 triage）。

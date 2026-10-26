@@ -56,6 +56,12 @@
 
 ### Added
 
+- 第 15 道静态门 `tools/check_admin_routes_documented.py`：双向校验
+  `gateway/src/admin.rs` 的 `.route(...)` 与 `docs/ADMIN_API.md` 的
+  `### METHOD` 标题，防「代码加了路由文档没写（客户端 404）」与「文档写了
+  代码没注册（调用必失败）」。只做结构化比对，**不做全文 grep**，避免说明
+  文字/curl 示例让门假绿。变异自测：注入未文档化路由→红；文档写 ghost
+  端点→红；路由只出现在注释→绿。
 - **控制面节点热更新（步骤 52）**：`POST /api/v1/nodes` /
   `DELETE /api/v1/nodes/{addr}` 运行时增删托管节点，`PATCH .../weight`
   对托管节点同步落盘；`NODES_FILE`（缺省 `data/nodes.json`）用
