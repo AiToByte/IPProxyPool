@@ -24,6 +24,23 @@ export interface NodeWeightRequest {
   weight: number;
 }
 
+export interface AddNodeRequest {
+  ip: string;
+  port: number;
+  country: string;
+  tier: string;
+  provider: string;
+  weight: number;
+  proto?: string;
+  username?: string;
+  password?: string;
+}
+
+export interface RemoveNodeResponse {
+  addr: string;
+  removed: boolean;
+}
+
 export interface NodeQuarantineRequest {
   ttl_secs: number;
 }
@@ -149,6 +166,18 @@ export class AdminApiClient {
 
   async getNode(addr: string): Promise<NodeView> {
     const { data } = await this.client.get<NodeView>(`/nodes/${encodeURIComponent(addr)}`);
+    return data;
+  }
+
+  async addNode(req: AddNodeRequest): Promise<NodeView> {
+    const { data } = await this.client.post<NodeView>("/nodes", req);
+    return data;
+  }
+
+  async deleteNode(addr: string): Promise<RemoveNodeResponse> {
+    const { data } = await this.client.delete<RemoveNodeResponse>(
+      `/nodes/${encodeURIComponent(addr)}`,
+    );
     return data;
   }
 
