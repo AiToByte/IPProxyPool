@@ -8,6 +8,7 @@ use crate::janitor;
 use crate::model::{EgressProto, ProxyNode, RoutingSpec};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 #[cfg(test)]
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -101,6 +102,18 @@ pub struct RouterEngine {
     /// R2-6：池内节点以 `Arc` 持有。读路径只做 `Arc` 克隆（一次原子 +1，
     /// 不碰 `ip/country/tier/provider` 四个 `String`）；控制面整体替换仍无锁。
     pools: ArcSwap<Vec<Arc<ProxyNode>>>,
+    /// 步骤 52：**所有池写入**的串行化锁。
+    ///
+    /// # 为什么必须有
+    ///
+    /// 此前 `reload_nodes` / `replace_vendor_nodes` / `adjust_vendor_weight` /
+    /// `set_paid_weight_boost` / `scale_vendor_weights` 各自做
+    /// `load → 构造新 Vec → store`，彼此不互斥。FreePool 的 merge 与 Admin
+    /// 调权/增删并发时，**后写者会整体覆盖先写者**（lost update）：例如
+    /// merge 刚加入的免费节点被一次调权写回旧快照洗掉，或新增的托管节点被
+    /// merge 覆盖。读路径仍无锁（ArcSwap 快照），锁只在低频写路径持有，
+    /// 临界区内不做 I/O、不跨 `.await`。
+    write_lock: Mutex<()>,
     /// 会话绑定同样存 `Arc`（粘滞命中直接返回引用计数句柄，零 `String` 克隆）。
     session_store: DashMap<String, (Arc<ProxyNode>, Instant)>,
     /// Key = `{domain}:{ip}`, value = quarantine expiry.
@@ -197,6 +210,7 @@ impl RouterEngine {
         let hot_nodes = Self::build_hot_nodes(&pools_vec);
         Self {
             pools: ArcSwap::from_pointee(pools_vec),
+            write_lock: Mutex::new(()),
             session_store: DashMap::new(),
             quarantine_map: DashMap::new(),
             free_scale: DashMap::new(),
@@ -686,22 +700,32 @@ impl RouterEngine {
         )
     }
 
+    /// 在**已持有 `write_lock`** 的前提下，原子替换池与派生索引。
+    ///
+    /// 所有池写入统一走这里，避免“有人重建 buckets、有人忘了重建”的口径分叉
+    /// （`scale_vendor_weights` 步骤 52 前就漏了 buckets，导致桶快路径无视缩放）。
+    fn store_nodes(&self, next: Vec<Arc<ProxyNode>>) {
+        let buckets = Self::build_buckets(&next);
+        let hot_nodes = Self::build_hot_nodes(&next);
+        self.pools.store(Arc::new(next));
+        self.buckets.store(Arc::new(buckets));
+        self.hot_nodes.store(Arc::new(hot_nodes));
+    }
+
     /// 全量原子替换池子（稳定 API：控制面热更新，零停机）。
     /// 生产流量走快照读；测试与运维手工调用。allow 保留供控制面演进。
     #[allow(dead_code)]
     pub fn reload_nodes(&self, new_nodes: Vec<ProxyNode>) {
+        let _guard = self.write_lock.lock();
         let pools_vec: Vec<Arc<ProxyNode>> = new_nodes.into_iter().map(Arc::new).collect();
-        let buckets = Self::build_buckets(&pools_vec);
-        let hot_nodes = Self::build_hot_nodes(&pools_vec);
-        self.pools.store(Arc::new(pools_vec));
-        self.buckets.store(Arc::new(buckets));
-        self.hot_nodes.store(Arc::new(hot_nodes));
+        self.store_nodes(pools_vec);
     }
 
     /// 按 provider 前缀原子替换（FreePool 合并入口）。
     /// 只移除 `provider.starts_with(prefix)` 的旧节点并追加新集；其余节点复用
     /// 旧 `Arc`（引用不断，粘滞绑定/臂状态不受影响）；空 `nodes` 即清空该前缀。
     pub fn replace_vendor_nodes(&self, prefix: &str, nodes: Vec<ProxyNode>) {
+        let _guard = self.write_lock.lock();
         let guard = self.pools.load();
         let mut next: Vec<Arc<ProxyNode>> = guard
             .iter()
@@ -709,13 +733,47 @@ impl RouterEngine {
             .map(Arc::clone)
             .collect();
         next.extend(nodes.into_iter().map(Arc::new));
-        let buckets = Self::build_buckets(&next);
-        let hot_nodes = Self::build_hot_nodes(&next);
-        self.pools.store(Arc::new(next));
-        self.buckets.store(Arc::new(buckets));
-        self.hot_nodes.store(Arc::new(hot_nodes));
+        drop(guard);
+        self.store_nodes(next);
         // OPT-R4 B11：merge（含空快照）后顺带清理僵尸因子。
         self.prune_free_scales();
+    }
+
+    /// 步骤 52：控制面新增节点（热更新，无需重启）。
+    ///
+    /// 重复 `addr`（含 FreePool / `TEST_POOL_NODES` 注入的同地址节点）返回
+    /// `Err`；成功时**下一请求即可命中**。本方法只改内存——持久化由
+    /// `NodeRegistry` 在调用前落盘（锁序固定为 registry → router）。
+    pub fn add_node(&self, node: ProxyNode) -> Result<(), String> {
+        let _guard = self.write_lock.lock();
+        let guard = self.pools.load();
+        if guard.iter().any(|n| n.addr == node.addr) {
+            return Err(format!("node {} already exists", node.addr));
+        }
+        let mut next: Vec<Arc<ProxyNode>> = guard.iter().cloned().collect();
+        next.push(Arc::new(node));
+        drop(guard);
+        self.store_nodes(next);
+        Ok(())
+    }
+
+    /// 步骤 52：控制面删除节点，返回被删节点（不存在 ⇒ `None`）。
+    ///
+    /// 粘滞会话不需要手工清理：选路粘滞快路径会用 `still_live` 复核当前池，
+    /// 节点一旦不在池中就自动迁移（见 `select_node_excluding`）。
+    pub fn remove_node(&self, addr: &str) -> Option<ProxyNode> {
+        let _guard = self.write_lock.lock();
+        let guard = self.pools.load();
+        let removed = guard
+            .iter()
+            .find(|n| n.addr == addr)
+            .map(|n| (**n).clone())?;
+        let next: Vec<Arc<ProxyNode>> = guard.iter().filter(|n| n.addr != addr).cloned().collect();
+        drop(guard);
+        self.store_nodes(next);
+        // 自动调权基准表也要清，否则同 addr 重新加入后会沿用旧基准。
+        self.paid_base_weight.remove(addr);
+        Some(removed)
     }
 
     /// 供应商套利调权（0=摘除熔断，100=恢复满权）。
@@ -723,6 +781,7 @@ impl RouterEngine {
     /// R2-6：写时复制——未命中节点复用旧 `Arc`（零克隆），命中节点重建
     ///（`addr` 随 `..base.clone()` 原样继承，`ip:port` 未变故恒一致）。
     pub fn adjust_vendor_weight(&self, vendor: &str, country: &str, weight: u32) {
+        let _guard = self.write_lock.lock();
         let guard = self.pools.load();
         let next: Vec<Arc<ProxyNode>> = guard
             .iter()
@@ -736,11 +795,8 @@ impl RouterEngine {
                 }
             })
             .collect();
-        let buckets = Self::build_buckets(&next);
-        let hot_nodes = Self::build_hot_nodes(&next);
-        self.pools.store(Arc::new(next));
-        self.buckets.store(Arc::new(buckets));
-        self.hot_nodes.store(Arc::new(hot_nodes));
+        drop(guard);
+        self.store_nodes(next);
     }
 
     /// GW-6 自动调权：将付费节点（`provider` 不以 `free` 开头）权重设为
@@ -752,6 +808,7 @@ impl RouterEngine {
     /// 避免反复上调导致权重阶梯式膨胀；免费池干旱恢复后，调用方以
     /// `boost_percent=100` 还原。
     pub fn set_paid_weight_boost(&self, boost_percent: u32) {
+        let _guard = self.write_lock.lock();
         let boost = boost_percent.clamp(1, 500);
         let guard = self.pools.load();
         let next: Vec<Arc<ProxyNode>> = guard
@@ -769,11 +826,8 @@ impl RouterEngine {
                 Arc::new(updated)
             })
             .collect();
-        let buckets = Self::build_buckets(&next);
-        let hot_nodes = Self::build_hot_nodes(&next);
-        self.pools.store(Arc::new(next));
-        self.buckets.store(Arc::new(buckets));
-        self.hot_nodes.store(Arc::new(hot_nodes));
+        drop(guard);
+        self.store_nodes(next);
     }
 
     // =====================================================================
@@ -832,6 +886,7 @@ impl RouterEngine {
     /// 写时复制同 `adjust_vendor_weight`；`factor<=0` 即摘除（matches 滤 0），
     /// 复检 upsert 按 health 重置权重即恢复；`factor>1` 不用（free 永不自动抬权，调用方保证）。
     pub fn scale_vendor_weights(&self, vendor: &str, country: &str, factor: f64) {
+        let _guard = self.write_lock.lock();
         // NEXT-B6：因子同步记表（含 factor<=0 显式摘除，合并后依然生效）。
         // OPT-R4 B11：显式 1.0 等价缺省——删键不残留（表随 scale 插入永不清理即僵尸）。
         if factor == 1.0 {
@@ -859,7 +914,10 @@ impl RouterEngine {
                 }
             })
             .collect();
-        self.pools.store(Arc::new(next));
+        drop(guard);
+        // 步骤 52：此前只 store `pools`，漏重建 buckets/hot_nodes ⇒ **对全指定
+        // tier+country+proto 的桶快路径仍拿旧权重选路**（factor=0 摘除对桶无效）。
+        self.store_nodes(next);
     }
 }
 
@@ -1011,6 +1069,129 @@ mod tests {
                 80,
             ),
         ]
+    }
+
+    // ===== 步骤 52：控制面增删 + 全池写串行化 =====
+
+    fn spec_exact(tier: &str, country: &str, proto: EgressProto) -> RoutingSpec {
+        RoutingSpec {
+            country: Some(country.to_string()),
+            session_id: None,
+            tier: Some(tier.to_string()),
+            target_domain: "example.com".to_string(),
+            proto: Some(proto),
+        }
+    }
+
+    #[test]
+    fn control_plane_add_and_remove_node() {
+        let r = RouterEngine::new(fixtures());
+        let n = ProxyNode::new(
+            "10.9.9.9".to_string(),
+            9000,
+            None,
+            None,
+            "DE".to_string(),
+            "datacenter".to_string(),
+            "vendor-x".to_string(),
+            50,
+        );
+        r.add_node(n.clone()).expect("add");
+        assert_eq!(
+            r.get_node_by_addr("10.9.9.9:9000")
+                .map(|n| n.provider.clone()),
+            Some("vendor-x".to_string())
+        );
+        assert!(r.add_node(n).is_err(), "duplicate must be rejected");
+
+        let removed = r.remove_node("10.9.9.9:9000").expect("removed");
+        assert_eq!(removed.ip, "10.9.9.9");
+        assert!(r.get_node_by_addr("10.9.9.9:9000").is_none());
+        assert!(r.remove_node("10.9.9.9:9000").is_none());
+    }
+
+    #[test]
+    fn scale_to_zero_applies_to_bucket_fast_path() {
+        // 回归：步骤 52 前 `scale_vendor_weights` 只 store `pools`、不重建
+        // `buckets`，全指定 tier+country+proto 的桶快路径仍会选中 factor=0
+        // 已摘除的节点（旧行为：`select_node` 仍返回 Some）。
+        let free = ProxyNode::new(
+            "10.0.0.7".to_string(),
+            8080,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        let r = RouterEngine::new(vec![free]);
+        let spec = spec_exact("free", "ZZ", EgressProto::Http);
+        assert!(r.select_node(&spec).is_some(), "before derate");
+        r.scale_vendor_weights("free-gh0", "ZZ", 0.0);
+        assert!(
+            r.select_node(&spec).is_none(),
+            "factor=0 must be invisible to the bucket fast path"
+        );
+    }
+
+    #[test]
+    fn concurrent_managed_adds_and_free_merges_do_not_lose_updates() {
+        // 步骤 52 的核心回归：没有 write_lock 时，二者都是
+        // `load → 构造 → store`，后写者会整体覆盖先写者（丢更新）。
+        let r = RouterEngine::new(vec![]);
+        let free_node = || {
+            ProxyNode::new(
+                "10.0.0.250".to_string(),
+                8080,
+                None,
+                None,
+                "ZZ".to_string(),
+                "free".to_string(),
+                "free-gh0".to_string(),
+                10,
+            )
+        };
+        r.replace_vendor_nodes("free-", vec![free_node()]);
+
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let r = &r;
+                s.spawn(move || {
+                    for i in 0..25 {
+                        let n = ProxyNode::new(
+                            format!("10.1.{t}.{i}"),
+                            8080,
+                            None,
+                            None,
+                            "US".to_string(),
+                            "datacenter".to_string(),
+                            format!("vendor-{t}"),
+                            10,
+                        );
+                        r.add_node(n).expect("add under contention");
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let r = &r;
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        r.replace_vendor_nodes("free-", vec![free_node()]);
+                    }
+                });
+            }
+        });
+
+        let snap = r.snapshot_all();
+        let managed = snap
+            .iter()
+            .filter(|n| n.provider.starts_with("vendor-"))
+            .count();
+        let free = snap.iter().filter(|n| n.provider == "free-gh0").count();
+        assert_eq!(managed, 100, "no managed add may be lost");
+        assert_eq!(free, 1, "free merge must not duplicate or vanish");
+        assert_eq!(snap.len(), 101);
     }
 
     #[test]

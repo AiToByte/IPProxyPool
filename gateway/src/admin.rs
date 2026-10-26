@@ -25,7 +25,8 @@ use crate::metrics::{
     AnonymityStat, BreakerSnapshot, BreakerTriggerStat, FreePoolSnapshot, FreePoolSourceStat,
     MetricsRegistry, ProtoStat, SuspendedStat, VerifyStat,
 };
-use crate::model::ProxyNode;
+use crate::model::{EgressProto, ProxyNode};
+use crate::node_registry::{NodeRegistry, RegistryError, MAX_WEIGHT};
 use crate::router::{NodeFilter, RouterEngine};
 use crate::tenant::{TenantDetail, TenantManager, TenantSummary};
 
@@ -37,6 +38,12 @@ use crate::tenant::{TenantDetail, TenantManager, TenantSummary};
 #[allow(dead_code)]
 pub struct AdminState {
     pub router: Arc<RouterEngine>,
+    /// 步骤 52：托管节点注册表（运行时增删 + 持久化）。
+    ///
+    /// 与 `router` 的分工：`router` 是**实时池**（托管节点 + FreePool 的
+    /// `free-*` + `TEST_POOL_NODES` 注入）；`nodes` 只持有运维通过控制面
+    /// 增删的托管节点，是 `NODES_FILE` 的唯一内容来源。
+    pub nodes: Arc<NodeRegistry>,
     pub tenant_mgr: Arc<TenantManager>,
     pub metrics: Arc<MetricsRegistry>,
     /// 管理 API 密钥（与网关 `X-API-Key` 独立，不可互换）。
@@ -49,6 +56,7 @@ impl Clone for AdminState {
     fn clone(&self) -> Self {
         Self {
             router: Arc::clone(&self.router),
+            nodes: Arc::clone(&self.nodes),
             tenant_mgr: Arc::clone(&self.tenant_mgr),
             metrics: Arc::clone(&self.metrics),
             admin_api_key: self.admin_api_key.clone(),
@@ -108,6 +116,28 @@ pub fn error_response(
 /// handler 统一错误返回类型（`IntoResponse` 两个分支各自实现即可）。
 pub type ApiError = (StatusCode, Json<ErrorResponse>);
 
+/// 步骤 52：`RegistryError` → HTTP 契约映射。
+///
+/// - `Validation` → 400（字段非法）
+/// - `Duplicate` / `NotManaged` → 409（地址冲突 / 免费池或测试节点不可删）
+/// - `NotFound` → 404
+/// - `Persist` / `Apply` → 500（落盘/应用失败；不谎报成功）
+///
+/// 500 额外 `error!` 留完整原因（含文件路径），响应体仍只给用户可读摘要。
+fn registry_error_response(e: RegistryError) -> ApiError {
+    use RegistryError::*;
+    let status = match &e {
+        Validation(_) => StatusCode::BAD_REQUEST,
+        Duplicate(_) => StatusCode::CONFLICT,
+        NotFound(_) => StatusCode::NOT_FOUND,
+        Persist(_) | Apply(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        log::error!("[Admin] node registry error: {e}");
+    }
+    error_response(status, e.to_string())
+}
+
 /// 健康检查响应。
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
@@ -143,6 +173,38 @@ pub struct NodeWeightRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct NodeQuarantineRequest {
     pub ttl_secs: u64,
+}
+
+fn default_node_weight() -> u32 {
+    100
+}
+
+/// 新增节点请求（步骤 52，`POST /api/v1/nodes`）。
+///
+/// 字段校验在 `NodeRegistry::add` 里统一做（返回 400 的具体原因）；
+/// `proto` 缺省 `http`，`weight` 缺省 100（满权）。
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddNodeRequest {
+    pub ip: String,
+    pub port: u16,
+    pub country: String,
+    pub tier: String,
+    pub provider: String,
+    #[serde(default = "default_node_weight")]
+    pub weight: u32,
+    #[serde(default)]
+    pub proto: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// 删除节点响应（步骤 52，`DELETE /api/v1/nodes/{addr}`）。
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RemoveNodeResponse {
+    pub addr: String,
+    pub removed: bool,
 }
 
 /// 租户余额修改请求。
@@ -193,7 +255,9 @@ fn node_view(n: &ProxyNode) -> NodeView {
     paths(
         health_handler,
         list_nodes_handler,
+        add_node_handler,
         get_node_handler,
+        delete_node_handler,
         patch_node_weight_handler,
         post_node_quarantine_handler,
         delete_node_quarantine_handler,
@@ -212,6 +276,8 @@ fn node_view(n: &ProxyNode) -> NodeView {
             NodeFilter,
             NodeWeightRequest,
             NodeQuarantineRequest,
+            AddNodeRequest,
+            RemoveNodeResponse,
             TenantBalanceRequest,
             TenantActiveRequest,
             NodeView,
@@ -246,8 +312,9 @@ pub struct AdminApiDoc;
 /// # 为何要有这个数
 ///
 /// Admin 端点能做什么：读节点表、调权重、置/解隔离、改租户余额与启停、
-/// 读 FreePool 快照。全部是**进程内内存操作**（`DashMap` / `ArcSwap`），
-/// 正常应在亚毫秒级返回。因此超时取得很宽松——它不是性能目标，
+/// 读 FreePool 快照。绝大多数是**进程内内存操作**（`DashMap` / `ArcSwap`），
+/// 正常应在亚毫秒级返回；步骤 52 起节点增删会同步落盘（临时文件 + fsync +
+/// rename，KB 级），正常仍在毫秒级。因此超时取得很宽松——它不是性能目标，
 /// 而是**兜底**：挡住因下游阻塞（磁盘 fsync、极端 GC 停顿、被换出的
 /// 内存页）而长期挂住的请求，避免少量慢请求堆积占满连接。
 ///
@@ -337,7 +404,9 @@ fn build_router_with(
         .route("/openapi.json", get(openapi_handler))
         // 节点管理
         .route("/nodes", get(list_nodes_handler))
+        .route("/nodes", post(add_node_handler))
         .route("/nodes/:addr", get(get_node_handler))
+        .route("/nodes/:addr", delete(delete_node_handler))
         .route("/nodes/:addr/weight", patch(patch_node_weight_handler))
         .route(
             "/nodes/:addr/quarantine",
@@ -377,7 +446,8 @@ fn build_router_with(
     //   - audit 在最外层：认证失败（401）与超时（408）也必须留下记录，
     //     否则恰恰是最该被审计的"有人在撞门"会漏掉。
     //   - timeout 在 auth 外层：任何请求都受 timeout 约束，不给慢请求
-    //     无限占用连接的机会（Admin 端点全是内存操作，30s 远高于正常耗时）。
+    //     无限占用连接的机会（绝大多数端点亚毫秒；节点增删含一次同步落盘，
+    //     30s 仍远高于正常耗时）。
     let audit = middleware::from_fn(audit_logging);
 
     Router::new()
@@ -540,6 +610,84 @@ async fn list_nodes_handler(
     Json(nodes.iter().map(|n| node_view(n)).collect())
 }
 
+/// POST `/api/v1/nodes` —— 运行时新增节点（步骤 52）。
+///
+/// # 写入语义
+///
+/// 先由 `NodeRegistry` 校验并落盘（`NODES_FILE`），成功后才应用到
+/// `RouterEngine`；落盘失败返回 500 且**内存不变**。详见
+/// `node_registry.rs` 模块头。
+///
+/// # 为什么先查 `router` 再查 registry
+///
+/// `router` 是实时池，包含 FreePool 的 `free-*` 与 `TEST_POOL_NODES` 注入
+/// ——它们不在托管清单里，但同 `addr` 同样必须判 409，否则会加出一个
+/// “同地址重复节点”。
+#[utoipa::path(
+    post,
+    path = "/api/v1/nodes",
+    tag = "nodes",
+    request_body = AddNodeRequest,
+    responses(
+        (status = 201, description = "节点已创建并生效", body = NodeView),
+        (status = 400, description = "字段非法（IP/端口/tier/country/provider/weight/凭据）", body = ErrorResponse),
+        (status = 409, description = "地址已存在", body = ErrorResponse),
+        (status = 500, description = "持久化/应用失败（内存未变更）", body = ErrorResponse)
+    )
+)]
+async fn add_node_handler(
+    State(state): State<AdminState>,
+    payload: Result<AxumJson<AddNodeRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<NodeView>), ApiError> {
+    let AxumJson(req) = payload
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?;
+
+    let proto = match req.proto.as_deref() {
+        None => EgressProto::Http,
+        Some(tok) => EgressProto::from_token(tok).ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("proto {tok:?} must be one of http/socks5/socks4"),
+            )
+        })?,
+    };
+
+    let node = ProxyNode::new(
+        req.ip,
+        req.port,
+        req.username,
+        req.password,
+        req.country,
+        req.tier,
+        req.provider,
+        req.weight,
+    )
+    .with_proto(proto);
+
+    // 实时池判重（含 free-* 与测试注入）；registry 只覆盖托管节点。
+    if state.router.get_node_by_addr(&node.addr).is_some() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            format!("node {} already exists", node.addr),
+        ));
+    }
+
+    let added = state
+        .nodes
+        .add(node, |n| state.router.add_node(n.clone()))
+        .map_err(registry_error_response)?;
+
+    log::info!(
+        "[Admin] node added: {} provider={} tier={} country={} proto={:?}",
+        added.addr,
+        added.provider,
+        added.tier,
+        added.country,
+        added.proto
+    );
+    Ok((StatusCode::CREATED, Json(node_view(&added))))
+}
+
 /// GET `/api/v1/nodes/{addr}` —— 节点详情。
 #[utoipa::path(
     get,
@@ -564,6 +712,78 @@ async fn get_node_handler(
             format!("node {addr} not found"),
         )),
     }
+}
+
+/// DELETE `/api/v1/nodes/{addr}` —— 运行时删除**托管**节点（步骤 52）。
+///
+/// # 拒绝删除的两类节点（409，附可执行建议）
+///
+/// - `free-*`：由 FreePool 每轮 merge 重建，删了几秒后就会回来——假操作。
+///   要排除请用 `PATCH /nodes/{addr}/weight {"weight":0}`（权重持久化到
+///   托管节点；免费节点是运行时策略，重启后由 FreePool 重新决定）。
+/// - `TEST_POOL_NODES` 注入：测试通道，不在托管清单里，重启即消失。
+///
+/// 真正的托管节点：删除会**先落盘**再移出实时池，重启后仍不在。
+#[utoipa::path(
+    delete,
+    path = "/api/v1/nodes/{addr}",
+    tag = "nodes",
+    params(
+        ("addr" = String, Path, description = "节点地址 ip:port")
+    ),
+    responses(
+        (status = 200, description = "节点已删除", body = RemoveNodeResponse),
+        (status = 404, description = "节点不存在", body = ErrorResponse),
+        (status = 409, description = "非托管节点（free-* 或测试注入）", body = ErrorResponse),
+        (status = 500, description = "持久化/应用失败（已尝试回滚）", body = ErrorResponse)
+    )
+)]
+async fn delete_node_handler(
+    State(state): State<AdminState>,
+    Path(addr): Path<String>,
+) -> Result<Json<RemoveNodeResponse>, ApiError> {
+    let Some(existing) = state.router.get_node_by_addr(&addr) else {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("node {addr} not found"),
+        ));
+    };
+
+    if existing.provider.to_ascii_lowercase().starts_with("free-")
+        || existing.provider.eq_ignore_ascii_case("free")
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "node {addr} is managed by FreePool and will be re-added on the next merge; \
+                 use PATCH /api/v1/nodes/{addr}/weight with weight=0 instead"
+            ),
+        ));
+    }
+
+    let removed = state
+        .nodes
+        .remove(&addr, |a| state.router.remove_node(a).is_some())
+        .map_err(|e| match e {
+            RegistryError::NotFound(_) => error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "node {addr} is not operator-managed (e.g. injected via TEST_POOL_NODES); \
+                     it is not persisted and will disappear on restart"
+                ),
+            ),
+            other => registry_error_response(other),
+        })?;
+
+    log::info!(
+        "[Admin] node removed: {} provider={} (persisted)",
+        removed.addr,
+        removed.provider
+    );
+    Ok(Json(RemoveNodeResponse {
+        addr: removed.addr,
+        removed: true,
+    }))
 }
 
 /// PATCH `/api/v1/nodes/{addr}/weight` —— 运行时调整节点权重（生效于下一轮选路）。
@@ -597,6 +817,16 @@ async fn patch_node_weight_handler(
     // 按 provider+country 精确匹配调权（与 router::adjust_vendor_weight 口径一致）。
     // 先取出节点的 provider/country，再按该维度整组调权，避免只改单节点
     // 导致下次 merge 被覆盖。
+    //
+    // 步骤 52：权重范围收口到 0..=100（0=摘除），并把**托管节点**的新权重
+    // 同步落盘——否则“调 0 摘除一个坏节点”会在重启后满血复活。自动调权
+    // （`set_paid_weight_boost`）是运行时策略，刻意不落盘。
+    if payload.weight > MAX_WEIGHT {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("weight must be 0..={MAX_WEIGHT}"),
+        ));
+    }
     let target = match state.router.get_node_by_addr(&addr) {
         Some(n) => n,
         None => {
@@ -607,8 +837,17 @@ async fn patch_node_weight_handler(
         }
     };
     state
-        .router
-        .adjust_vendor_weight(&target.provider, &target.country, payload.weight);
+        .nodes
+        .set_group_weight(
+            &target.provider,
+            &target.country,
+            payload.weight,
+            |p, c, w| {
+                state.router.adjust_vendor_weight(p, c, w);
+                Ok(())
+            },
+        )
+        .map_err(registry_error_response)?;
     // 返回调权后的该节点视图（权重已生效）。
     match state.router.get_node_by_addr(&addr) {
         Some(n) => Ok(Json(node_view(&n))),
@@ -948,7 +1187,7 @@ async fn get_circuit_handler(State(state): State<AdminState>) -> Json<BreakerSna
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::{error_response, AdminApiDoc, AdminState, AutotuneConfig};
+    use super::{error_response, AdminApiDoc, AdminState, AutotuneConfig, NodeRegistry};
     use crate::router::RouterEngine;
     use crate::tenant::TenantManager;
     use crate::{metrics::MetricsRegistry, model::ProxyNode};
@@ -959,10 +1198,29 @@ mod tests {
     use tower::ServiceExt;
     use utoipa::OpenApi;
 
-    /// 结构编译验证（历史保留）。
+    /// 结构编译验证（历史保留）+ 步骤 52 新端点必须进 OpenAPI。
     #[test]
     fn openapi_doc_builds() {
-        let _doc = AdminApiDoc::openapi();
+        let doc = AdminApiDoc::openapi();
+        let nodes = doc
+            .paths
+            .paths
+            .get("/api/v1/nodes")
+            .expect("collection path");
+        assert!(nodes.get.is_some());
+        assert!(
+            nodes.post.is_some(),
+            "POST /api/v1/nodes must be documented"
+        );
+        let item = doc
+            .paths
+            .paths
+            .get("/api/v1/nodes/{addr}")
+            .expect("item path");
+        assert!(
+            item.delete.is_some(),
+            "DELETE /api/v1/nodes/{{addr}} must be documented"
+        );
     }
 
     #[test]
@@ -970,6 +1228,7 @@ mod tests {
         // 仅验证结构编译；运行时认证逻辑由下方 oneshot 全链路测试覆盖。
         let _state = AdminState {
             router: Arc::new(RouterEngine::new(vec![])),
+            nodes: Arc::new(NodeRegistry::in_memory(vec![])),
             tenant_mgr: Arc::new(TenantManager::new()),
             metrics: Arc::new(MetricsRegistry::new()),
             admin_api_key: "test-key".to_string(),
@@ -997,7 +1256,8 @@ mod tests {
             mgr.register_tenant("t", key, 10_000, 10_000, 1);
         }
         AdminState {
-            router: Arc::new(RouterEngine::new(nodes)),
+            router: Arc::new(RouterEngine::new(nodes.clone())),
+            nodes: Arc::new(NodeRegistry::in_memory(nodes)),
             tenant_mgr: Arc::new(mgr),
             metrics: Arc::new(MetricsRegistry::new()),
             admin_api_key: KEY.to_string(),
@@ -1340,6 +1600,158 @@ mod tests {
     /// 审计层是最外层，如果它的实现有误（例如把响应体吃掉、或对错误状态
     /// 提前返回），会表现为"契约①/④ 的错误体测试突然挂了"。本测试显式
     /// 锁定：加了审计层后，错误体契约与状态码**保持不变**。
+    // ===== 步骤 52：控制面节点增删 =====
+
+    #[tokio::test]
+    async fn add_and_delete_node_round_trip() {
+        let app = super::router(test_state(vec![], &[]));
+        let body = r#"{"ip":"203.0.113.10","port":8080,"country":"us","tier":"residential","provider":"vendor-a","weight":100,"proto":"http"}"#;
+        let (status, v) = send_json(app.clone(), "POST", "/api/v1/nodes", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "resp={v}");
+        assert_eq!(v["addr"], "203.0.113.10:8080");
+        assert_eq!(v["country"], "US", "country 必须归一为大写");
+        assert_eq!(v["tier"], "residential");
+        assert_eq!(v["provider"], "vendor-a");
+
+        // 新增即生效：详情立即可见。
+        let (status, v) =
+            send_json(app.clone(), "GET", "/api/v1/nodes/203.0.113.10:8080", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["weight"], 100);
+
+        // 删除 → 详情 404，再删也是 404（幂等语义如实返回）。
+        let (status, v) = send_json(
+            app.clone(),
+            "DELETE",
+            "/api/v1/nodes/203.0.113.10:8080",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resp={v}");
+        assert_eq!(v["removed"], true);
+
+        let (status, v) =
+            send_json(app.clone(), "GET", "/api/v1/nodes/203.0.113.10:8080", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(v["code"], 404);
+
+        let (status, _) = send_json(app, "DELETE", "/api/v1/nodes/203.0.113.10:8080", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn add_node_rejects_duplicate_and_invalid_fields() {
+        let app = super::router(test_state(
+            vec![test_node("127.0.0.5", 39_005, "US", "datacenter")],
+            &[],
+        ));
+
+        // 实时池同址（含 seeds / free-* / 测试注入）⇒ 409，而不是落出重复节点。
+        let dup = r#"{"ip":"127.0.0.5","port":39005,"country":"US","tier":"datacenter","provider":"other","weight":100}"#;
+        let (status, v) = send_json(app.clone(), "POST", "/api/v1/nodes", Some(dup)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(v["code"], 409);
+
+        // 坏 IP / IPv6 / 保留 provider / 越界权重 / 未配对凭据 / 未知 proto ⇒ 400。
+        for body in [
+            r#"{"ip":"not-an-ip","port":8080,"country":"US","tier":"datacenter","provider":"v","weight":100}"#,
+            r#"{"ip":"::1","port":8080,"country":"US","tier":"datacenter","provider":"v","weight":100}"#,
+            r#"{"ip":"203.0.113.11","port":8080,"country":"US","tier":"datacenter","provider":"free-gh0","weight":100}"#,
+            r#"{"ip":"203.0.113.12","port":8080,"country":"US","tier":"datacenter","provider":"v","weight":101}"#,
+            r#"{"ip":"203.0.113.13","port":8080,"country":"US","tier":"datacenter","provider":"v","weight":100,"password":"only"}"#,
+            r#"{"ip":"203.0.113.14","port":8080,"country":"US","tier":"datacenter","provider":"v","weight":100,"proto":"ftp"}"#,
+        ] {
+            let (status, v) = send_json(app.clone(), "POST", "/api/v1/nodes", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body} resp={v}");
+            assert_eq!(v["code"], 400);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_free_pool_node_is_rejected_with_actionable_error() {
+        let free = ProxyNode::new(
+            "127.0.0.9".to_string(),
+            39_009,
+            None,
+            None,
+            "ZZ".to_string(),
+            "free".to_string(),
+            "free-gh0".to_string(),
+            10,
+        );
+        let app = super::router(test_state(vec![free], &[]));
+        let (status, v) = send_json(app, "DELETE", "/api/v1/nodes/127.0.0.9:39009", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(v["code"], 409);
+        assert!(
+            v["error"].as_str().unwrap().contains("FreePool"),
+            "409 必须说明为什么删不掉: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unmanaged_test_node_is_rejected() {
+        let mut state = test_state(vec![], &[]);
+        // 模拟 TEST_POOL_NODES：实时池里有，托管清单里没有。
+        state.router = Arc::new(RouterEngine::new(vec![test_node(
+            "127.0.0.8",
+            39_008,
+            "US",
+            "datacenter",
+        )]));
+        let app = super::router(state);
+        let (status, v) = send_json(app, "DELETE", "/api/v1/nodes/127.0.0.8:39008", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("not operator-managed"),
+            "409 必须说明该节点不受控制面管理: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn weight_patch_persists_for_managed_nodes() {
+        let path = std::env::temp_dir().join(format!(
+            "ipp-admin-weight-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node = test_node("127.0.0.6", 39_006, "US", "datacenter");
+        let registry =
+            Arc::new(NodeRegistry::load(Some(path.clone()), vec![node.clone()]).expect("registry"));
+        let state = AdminState {
+            router: Arc::new(RouterEngine::new(vec![node])),
+            nodes: registry,
+            tenant_mgr: Arc::new(TenantManager::new()),
+            metrics: Arc::new(MetricsRegistry::new()),
+            admin_api_key: KEY.to_string(),
+            autotune: Arc::new(AutotuneConfig::new()),
+        };
+        let app = super::router(state);
+        let (status, _) = send_json(
+            app,
+            "PATCH",
+            "/api/v1/nodes/127.0.0.6:39006/weight",
+            Some(r#"{"weight":0}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 关键：重启视角重新加载文件，weight=0（坏节点不会满血复活）。
+        let reloaded = NodeRegistry::load(Some(path.clone()), vec![]).expect("reload");
+        assert_eq!(reloaded.snapshot()[0].weight, 0, "PATCH 调权必须持久化");
+
+        let _ = std::fs::remove_file(&path);
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".tmp.{}", std::process::id()));
+        let _ = std::fs::remove_file(std::path::PathBuf::from(tmp));
+    }
+
     #[tokio::test]
     async fn audit_layer_preserves_error_contract() {
         // 401：错误体仍是 {error, code:401}。

@@ -142,6 +142,7 @@ mod janitor;
 mod metrics;
 mod model;
 mod net_connector;
+mod node_registry;
 mod pool;
 mod prober;
 mod redis_shard;
@@ -165,6 +166,7 @@ use free_pool::{
 use gateway::{is_loopback_addr, SmartProxyGateway};
 use metrics::{serve_metrics, MetricsRegistry, METRICS_ADDR};
 use model::{ProxyNode, RoutingSpec};
+use node_registry::NodeRegistry;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pool::ConnectionPrewarmer;
@@ -411,7 +413,10 @@ async fn setup_gateway() -> Server {
 
     // 2. Initial mock egress pool (GW-4 arbitrage derates/restores via reload).
     // Third vendor (mock-c, GB/mobile) joins so the arbitrage has 3 to poll.
-    let initial_nodes = vec![
+    //
+    // 步骤 52：这组 seeds **只在 `NODES_FILE` 不存在时**作为托管清单初值；
+    // 文件一旦存在（控制面增删过节点），启动即以文件为准。
+    let seeds = vec![
         ProxyNode::new(
             "127.0.0.1".to_string(),
             8888,
@@ -458,7 +463,7 @@ async fn setup_gateway() -> Server {
     //   - **仅接受回环地址**：非 `127.0.0.1` / `localhost` / `::1` 的条目直接拒绝并告警，
     //     杜绝"用测试通道把任意公网地址塞进池"这一类误用。
     //   - 解析失败的条目跳过并 `warn`，不 panic（测试通道不该有能力打挂网关）。
-    let mut initial_nodes = initial_nodes;
+    let mut test_nodes = Vec::new();
     for spec in std::env::var("TEST_POOL_NODES")
         .unwrap_or_default()
         .split(',')
@@ -490,9 +495,45 @@ async fn setup_gateway() -> Server {
             f[5].parse().expect("checked"),
         );
         log::info!("[TEST_POOL_NODES] injected test node {}", node.addr);
-        initial_nodes.push(node);
+        test_nodes.push(node);
     }
-    let router = Arc::new(RouterEngine::new(initial_nodes));
+
+    // 2a. 控制面托管节点（步骤 52）：`NODES_FILE` 存在则以文件为准。
+    //
+    // 文件损坏/版本不符 ⇒ **拒绝启动**（配置损坏属误配；静默回退 seeds 会让
+    // 运维以为配置生效了）。`NODES_FILE=""` 显式关闭持久化（仅内存）。
+    // 免费池 `free-*` 与 `TEST_POOL_NODES` 都不进文件：前者每轮 merge 重建，
+    // 后者是测试通道、进程即弃。
+    let nodes_file_raw = std::env::var("NODES_FILE").ok();
+    let nodes_path = node_registry::path_from_env(nodes_file_raw.as_deref());
+    let node_registry = match NodeRegistry::load(nodes_path.clone(), seeds) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            let shown = nodes_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<persistence off>".to_string());
+            log::error!(
+                "[NodeRegistry] startup aborted: {e} (NODES_FILE={shown})。\
+                 损坏的节点表不会被静默忽略：修复或删除该文件后重启。"
+            );
+            std::process::exit(1);
+        }
+    };
+    match node_registry.path() {
+        Some(p) => log::info!(
+            "[NodeRegistry] managed={} file={} (free-*/TEST_POOL_NODES are never persisted)",
+            node_registry.len(),
+            p.display()
+        ),
+        None => log::info!(
+            "[NodeRegistry] managed={} persistence=off (NODES_FILE empty)",
+            node_registry.len()
+        ),
+    }
+    let mut live_nodes = node_registry.snapshot();
+    live_nodes.extend(test_nodes);
+    let router = Arc::new(RouterEngine::new(live_nodes));
 
     // 2b. GW-4 tenants: default key with wide limits keeps GW-1~3 curls green.
     // R2-3 burst=qps/10（单源口径，见 `TenantManager::default_burst_for_qps`）。
@@ -1160,6 +1201,7 @@ async fn setup_gateway() -> Server {
     }
     let admin_state = AdminState {
         router: router.clone(),
+        nodes: node_registry.clone(),
         tenant_mgr: tenant_mgr.clone(),
         metrics: metrics.clone(),
         admin_api_key,
