@@ -21,6 +21,13 @@
 
 ## [Unreleased]
 
+### Security
+
+- 升级 `rustls-webpki 0.103.15→0.103.16`（RUSTSEC-2026-0382：证书校验可能接受
+  不受信任的中间证书）与 `webpki-roots 1.0.9→1.0.10`（RUSTSEC-2026-0381：
+  内置根证书信任了已撤销的 emSign 中间证书）。仅改 `Cargo.lock`，无 API 变更；
+  本机 `cargo audit --no-fetch` 由 2 vulnerabilities 归零，326 单测/clippy 仍绿。
+
 ### Fixed
 
 - **Admin API 的「声明即失实」**（OPT-R17 复核实证）：`gateway/Cargo.toml` 声明
