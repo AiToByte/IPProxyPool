@@ -1560,3 +1560,13 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
 - 次轮 run `40329286597`（`8de0f5e`）四 job 全绿：gates / supply-chain / static-checks / windows-powershell，`conclusion=success`。
 
 **提交**：`4efe6c0` 计划 · `6974a9a` 后端 · `cfcf080` UI · `f043333` 部署 · `9d8bcc0` 文档 · `234b223` 新门 · `2043a52` 证书依赖 · `8de0f5e` tokio。远端 master=`8de0f5e`，工作树干净。
+
+---
+
+## 2026-10-26 — 步骤 54 立项：主动健康探测闭环
+
+- **方案落库**：plan/2026年10月26日-主动健康探测闭环实施计划.md；TASK_PLAN.md 追加步骤 54（未完成，[ ] + ⏳）。
+- **路线决策（先取证后选路）**：审计 §8 第 2 条「HTTPS 入站 + PAC」不是单步改动。取证：pingora-proxy-0.9.0/src/lib.rs 的 llow_connect_method_proxying 只放行 CONNECT method，proxy_h1.rs 无隧道逻辑；本仓 gateway.rs 无 CONNECT 分支，	ools/ipp_forward.py 对 CONNECT 显式 501。浏览器 HTTPS 必须走 CONNECT，故该条拆为「CONNECT → TLS 入站 → PAC」专项，本步不冒充完成。
+- **本步选择审计第 3 条**：现有 CanaryProber 每 60s 探测，但 main.rs 只写日志；RouterEngine 无主动健康字段，matches 只检查 weight/proto/country/tier/域级 quarantine；候选又只取 get_healthy_candidates，一旦摘除就永不再探测。
+- **设计要点**：Router 内 ctive_health + 阈值/冷却 + 安全阀（至少留 1 个 weight>0）；probe_candidates() 绕过 matches 探全池；Healthy/Degraded 清连续失败，仅 Dead 计入；信号量关闭跳过不记健康；新增 ctive_probe_results_total{result} / ctive_probe_unhealthy_nodes；PROBE_ACTIVE_HEALTH_ENABLED 总开关。
+- **状态**：仅完成计划落库，代码/测试/E2E 均未执行；下一步 T1（Router 状态与策略）。
