@@ -123,6 +123,7 @@ services:
     ports:
       - "127.0.0.1:8916:8916"
       - "127.0.0.1:9091:9091"
+      - "127.0.0.1:9092:9092"
     environment:
       # D3：与宿主缺省一致，门默认开启（本地开发带 default_key 头）。
       REQUIRE_API_KEY: "1"
@@ -134,6 +135,18 @@ services:
       # 容器内必须绑 0.0.0.0（D3 起宿主缺省已收 127.0.0.1，此处两者均显式覆写）。
       GATEWAY_ADDR: "0.0.0.0:8916"
       METRICS_ADDR: "0.0.0.0:9091"
+      # 步骤 52：Admin API。容器内若沿用缺省 127.0.0.1:9092，宿主端口映射
+      # 打到的是容器回环之外的地址，**连不上**；必须显式绑 0.0.0.0。
+      ADMIN_ADDR: "0.0.0.0:9092"
+      # 缺省值是开发用占位符（与 GF_SECURITY_ADMIN_PASSWORD 同口径）：
+      # 任何能访问宿主 127.0.0.1:9092 的本地进程都能改节点表。生产请用
+      # .env 覆盖为强随机值；留空则 fail-closed（所有 Admin 请求 401）。
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-change-me-admin-key}"
+      # 托管节点持久化。命名卷跨 recreate/down-up 保留；免费池 free-* 与
+      # TEST_POOL_NODES 不写此文件。文件含上游代理凭据（Unix 0600）。
+      NODES_FILE: "/app/data/nodes.json"
+    volumes:
+      - gateway-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -150,6 +163,9 @@ services:
   #     CLICKHOUSE_DB: "proxy"
   #     GATEWAY_ADDR: "0.0.0.0:8916"
   #     METRICS_ADDR: "127.0.0.1:9091"
+  #     ADMIN_ADDR: "0.0.0.0:9092"
+  #     ADMIN_API_KEY: "<强随机值>"
+  #     NODES_FILE: "/app/data/nodes.json"
   #     PROBE_INTERVAL_SECS: "60"
   #     SWEEP_INTERVAL_SECS: "60"
   #     ARBITRAGE_INTERVAL_SECS: "60"
@@ -232,5 +248,7 @@ volumes:
   clickhouse-data:
   grafana-data:
   alertmanager-data:
+  # 步骤 52：控制面托管节点持久化（/app/data/nodes.json）。
+  gateway-data:
   # OPT-R7 C2：Prometheus TSDB 持久化（此前缺失 ⇒ 每次 recreate 指标归零）。
   prometheus-data:
