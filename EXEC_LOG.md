@@ -1531,3 +1531,32 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
   - **发现两处基线漂移（另立步骤 53 修正）**：① `docs/QUALITY_BASELINE.md` 仍写 302 单测，实际 306（步骤 49–51 新增 4 个测试未同步；文档一致性门只比文档与基线、不比实际测试数，故未自动判红）；② `gateway/src/admin.rs` 的层序注释仍写 `[TraceLayer]`，而步骤 49 已改成手写 `audit_logging` —— **同一类“文档说 A、代码是 B”**。
 
 - **步骤 53：修正两处「文档说 A、代码是 B」的漂移**。① 基线漂移：`docs/QUALITY_BASELINE.md` 仍写 **302** 单测，实际 **306**（步骤 49–51 新增 4 个测试未同步）。**根因值得记**：`check_doc_consistency.py` 只比对「活文档 vs 基线」，**不比对「基线 vs 实际测试数」** —— 基线自身漂移时门禁全绿。本次靠换到本地编译器后跑 `cargo test` 才发现。处置：基线 302→306，同步 4 个活文档 7 处（README×2 / FEATURES / CAPABILITY-AUDIT / SUPPLY_CHAIN×3）；历史文件（CHANGELOG/TASK_PLAN/EXEC_LOG/plan）一字不改。顺带修 CAPABILITY-AUDIT「12 门」→「14 门」、SUPPLY_CHAIN「13 门」→「14 门」。② 注释漂移：`admin.rs` 层序注释仍写 `[TraceLayer]`，代码早已是手写 `audit_logging`（步骤 49 换掉 TraceLayer 的理由就是 `env_logger` 无 tracing subscriber）。按真实层序改写并注明“此前误写、已纠正”。门禁：doc-consistency 绿（tests=306）、fmt/clippy 绿。**遗留**：基线 vs 实际测试数无自动门禁，建议后续加。
+
+---
+
+## 2026-10-26 — 步骤 52：控制面节点热更新（T1~T8 完成，CI 全绿）
+
+**目标**：运行时增删节点 + 重启仍在 + 非法输入显式报错；补齐 Admin UI / compose / 文档 / 门禁。
+
+**交付**
+- 后端：新增 `gateway/src/node_registry.rs`（归一化校验、临时文件+fsync+rename 原子落盘、`NODES_FILE` 空串关闭、文件损坏拒绝启动、托管清单上限 10000）；`RouterEngine` 新增 `write_lock` 串行化**全部**池写（锁序 `NodeRegistry → RouterEngine`），并新增 `add_node`/`remove_node`；`PATCH weight` 对托管节点按 `provider+country` 持久化（0..=100）。
+- 顺带修真实缺陷：`scale_vendor_weights` 原先只 store `pools`、漏重建 buckets/hot_nodes ⇒ factor=0 对「全指定 tier+country+proto」桶快路径无效。用临时回退验证新测试**确实红**后修复。
+- Admin API：新增 `POST /api/v1/nodes`、`DELETE /api/v1/nodes/{addr}`；错误映射 400/404/409/500；`free-*` 与 `TEST_POOL_NODES` 删除返回 409 并给「权重调 0」的可执行建议；OpenAPI 同步。
+- UI：`useAdminApi` 增加 `addNode`/`deleteNode`；nodes 页新增表单（IPv4/端口/国家/档位/提供商/权重/协议/可选凭据）与行内删除；免费池节点前端提示改用权重 0。
+- 部署：compose 映射 `127.0.0.1:9092`、`ADMIN_ADDR=0.0.0.0:9092`、`NODES_FILE=/app/data/nodes.json`、`gateway-data` 命名卷；Dockerfile `EXPOSE 9092`；`.env.example` 增 `ADMIN_API_KEY`。
+- 文档：ADMIN_API 新端点/约束/错误码/持久化；OPERATION §2.1；README/FEATURES/ADMIN_UI/TECHNICAL/CAPABILITY-AUDIT/CHANGELOG；单测基线 306→326。
+- 第 15 道门 `tools/check_admin_routes_documented.py`：双向比对 `admin.rs` 的 `.route(...)` 与 `ADMIN_API.md` 的 `### METHOD` 标题，剥离 `//` 注释、不做全文 grep；变异自测：注入未文档化路由→红、文档写 ghost 端点→红、路由只在注释→绿。已接入 CI。
+
+**本机验证**
+- `cargo fmt --check` / `clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace` **326 passed / 7 ignored / 0 failed** 全绿；`cargo audit --no-fetch` 0 漏洞、`cargo deny check` 四段 ok。
+- 14 道可离线 Python 门全绿（含新门）；`check_supply_chain.py` 完整跑因本机拉不到 RustSec advisory DB 判红（环境限制，非代码），改由 `cargo audit --no-fetch` + `cargo deny` 取证。
+- 真实二进制 E2E（3 次启动）：POST 新节点 201（country 归一 `US`）→ 重复 409 → 非法 400 → DELETE seed 200 → 落盘文件 `version=1 nodes=3` → 重启后新节点仍在、被删 seed 不在 → DELETE 新节点 200 → 再重启仍不在 → 未知 DELETE 404；脚本 `E2E_PASS`、`SCRIPT_EXIT=0`。
+- `npm run build`（`tsc && vite build`）通过；`docker compose config --quiet` exit 0。
+- **未验证边界**：Docker Desktop 未运行，compose 容器运行时（命名卷跨 recreate 持久化）未实跑；Alertmanager receiver 仍为 `empty`（不在本步范围）。
+
+**CI 收敛**
+- 首轮 run `40327705808`：gates/static-checks/windows-powershell 绿，supply-chain 红——`cargo deny` 对 tokio 1.53.1 的 RUSTSEC-2026-0386（`AsyncFd` I/O safety，`unsound`）判红；同时 RustSec 新通告命中 rustls-webpki 0.103.15 / webpki-roots 1.0.9。
+- 修复：`rustls-webpki 0.103.15→0.103.16`、`webpki-roots 1.0.9→1.0.10`、`tokio 1.53.1→1.53.3`（仅 `Cargo.lock`）；本机 audit/deny 复绿。
+- 次轮 run `40329286597`（`8de0f5e`）四 job 全绿：gates / supply-chain / static-checks / windows-powershell，`conclusion=success`。
+
+**提交**：`4efe6c0` 计划 · `6974a9a` 后端 · `cfcf080` UI · `f043333` 部署 · `9d8bcc0` 文档 · `234b223` 新门 · `2043a52` 证书依赖 · `8de0f5e` tokio。远端 master=`8de0f5e`，工作树干净。
