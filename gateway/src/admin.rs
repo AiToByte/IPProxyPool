@@ -264,11 +264,18 @@ const ADMIN_TIMEOUT_SECS: u64 = 30;
 ///
 /// ```text
 /// request
-///   └─▶ [TraceLayer]   ← 必须最外层：否则超时/认证拒绝的请求不会留下记录
-///        └─▶ [TimeoutLayer] ← 必须在认证内层：让未认证的挂起请求也能被超时掐断
+///   └─▶ [audit_logging]  ← 必须最外层：认证 401、超时 408 也必须留记录
+///        └─▶ [TimeoutLayer] ← 在认证内层：未认证的挂起请求同样受超时约束
 ///             └─▶ [auth_middleware] ← 认证拒绝是 401，不消耗 body
 ///                  └─▶ handler
 /// ```
+///
+/// # 为什么**不**用 `tower-http` 的 `TraceLayer`
+///
+/// `TraceLayer` 发的是 `tracing` 事件，而本项目装的是 `env_logger`（`log`
+/// facade），**没有 `tracing` subscriber** —— 加了也一条都不打印，正是本仓
+/// 最忌讳的静默失效。故审计层是手写的 `audit_logging`（只记是否带 Key，
+/// 绝不记 Key 值）。本注释此前误写为 `[TraceLayer]`，与代码不符，已纠正。
 ///
 /// # 为什么**不**加 CORS（OPT-R17 复核结论）
 ///
