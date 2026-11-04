@@ -58,6 +58,10 @@
 | `CLICKHOUSE_URL/_USER/_PASSWORD/_DB` | `http://127.0.0.1:8123/proxy/123456/proxy` | 缺失即 hold 权重 |
 | `REQUIRE_API_KEY` | `1`（D3 起默认开门；`0` 显式关闭） | 无头 403（开发带 `default_key` 头） |
 | `PROBE/PREWARM/SWEEP/ARBITRAGE_INTERVAL_SECS` | `60/30/60/60` | 后台节拍（三 ticker 启动错峰 0~5s） |
+| `PROBE_ACTIVE_HEALTH_ENABLED` | `1` | 主动健康结果是否回灌选路（`0` 时探测与指标照跑，仅不摘除） |
+| `PROBE_FAILURE_THRESHOLD` | `3` | 连续 `Dead` 达该值才摘除；钳制 `1..=10` |
+| `PROBE_UNHEALTHY_COOLDOWN_SECS` | `300` | 摘除冷却；钳制 `1..=86400` |
+| `PROBE_FREE_SAMPLE_PERCENT` | `25` | 免费池探测抽样比例（付费节点恒 100%）；钳制 `1..=100`，`100` 等价全量 |
 | `SOCKS_BRIDGE_TIMEOUT_SECS`／`SOCKS_MAX_BODY_BYTES` | `20`／`10485760` | 翻译桥 |
 | `GEOIP_MMDB_PATH`／`GEOIP_ENFORCE_MISMATCH` | 空／`0` | 无库 Disabled；执法默认关 |
 | `FREE_ENABLED` | `0` | 第二线总开关 |
@@ -69,10 +73,13 @@
 | `FREE_FULL_CHECK_URL` | `https://httpbin.org` | 必须 https |
 | `FREE_REQUIRE_ELITE` | `0` | `1` 时仅 Elite |
 | `FREE_SOURCE_MAX_ZERO_CYCLES`／`FREE_SUSPEND_RETRY_EVERY` | `3/3` | 源站熔断 |
+| `TENANT_STORE` | `memory` | 租户状态后端。`memory`＝重启即丢（余额归零）；`redis`＝写穿，余额／启停／累计流量跨重启保留。显式开关：**缺省不改变存量行为** |
+| `TENANT_FLUSH_SECS` | `5` | `redis` 模式下的**最大**持久化延迟；进程被强杀最多丢这么多秒的计量（优雅停机另有一次补 flush） |
+| `TENANT_REDIS_PREFIX` | `ipp:tenant` | Redis 键前缀：`{prefix}:{api_key}` 与索引集合 `{prefix}:index` |
 
 ### 7. 门禁定义（见 `CONTRIBUTING.md`）
 
-`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 156/4 ignored＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
+`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 360 单测（8 ignored）＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
 
 ## English
 
@@ -139,7 +146,10 @@
 | `FREE_FULL_CHECK_URL` | `https://httpbin.org` | must be https |
 | `FREE_REQUIRE_ELITE` | `0` | `1` → Elite only |
 | `FREE_SOURCE_MAX_ZERO_CYCLES` / `FREE_SUSPEND_RETRY_EVERY` | `3/3` | source breaker |
+| `TENANT_STORE` | `memory` | tenant-state backend. `memory` = lost on restart (balance resets); `redis` = write-through, keeps balance / active flag / cumulative bytes across restarts. Explicit switch: **defaults preserve existing behaviour** |
+| `TENANT_FLUSH_SECS` | `5` | `redis` only: **maximum** persistence lag; a hard kill loses at most this many seconds of metering (graceful shutdown adds one final flush) |
+| `TENANT_REDIS_PREFIX` | `ipp:tenant` | Redis key prefix: `{prefix}:{api_key}` plus index set `{prefix}:index` |
 
 ### 7. Gates (see `CONTRIBUTING.md`)
 
-`fmt --check` clean + `clippy -D warnings` zero + `test` 156/4 ignored + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.
+`fmt --check` clean + `clippy -D warnings` zero + `test` 360 unit tests (8 ignored) + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.

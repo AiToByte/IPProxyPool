@@ -106,6 +106,72 @@ groups:
           summary: "免费源 {{ $labels.source }} 持续熔断"
           describe: "源站连续多轮零产出被 SourceGuard 熔断（15 分钟未恢复）；查源站是否下线/改版，或临时降低该源权重。"
 
+      # ---- 免费供给 SLO（OPT-R18 P2-3）----
+      #
+      # 上面两条回答的是"池子空了吗 / 源站活着吗"。它们漏掉的，正是免费池
+      # 最常见的两种真实失效：
+      #
+      #   A. **池里有节点，但出口身份只有一两个。** 几十个节点共用同一个出口
+      #      IP 时，`free_pool_nodes_total` 看起来健康，而 WAF 侧看到的只有一个
+      #      身份——限流/封禁会瞬间打满全部流量。这就是 `distinct_exit_ips`
+      #      与 `nodes_total` 的差值，也是这条指标唯一能回答的问题。
+      #   B. **池里有节点，但都是刚进池的。** 中位年龄贴近 0 意味着节点正在
+      #      高频死亡+补位（"漏斗"而非"池"），有效吞吐远低于节点数暗示的量。
+      #
+      # 两条都用 `free_pool_source_fetch_ms_count` 作**启用态门槛**（与
+      # FreePoolDry30m 同一手法）：`FREE_ENABLED=0`（缺省）时免费线不跑，
+      # 这些 gauge 恒为初始值，没有门槛就会在缺省配置下永久 firing。
+
+      # 出口多样性枯竭：有节点，但不同出口身份 < 3。
+      # 阈值取 3 而不是"节点数的一半"：3 是"能扛住单个出口被封"的最低要求，
+      # 而比例阈值会随池子大小漂移，读不出绝对含义。
+      - alert: FreePoolExitDiversityLow
+        expr: |
+          free_pool_distinct_exit_ips < 3
+          and on() (free_pool_nodes_total > 0)
+          and on() (increase(free_pool_source_fetch_ms_count[30m]) > 0)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "免费池出口多样性枯竭（distinct_exit_ips={{ $value }}）"
+          describe: "池内节点共用出口 IP：节点数看似健康，但出口身份不足 3 个。一旦该出口被 WAF 封禁，全部免费流量同时失效。查抓取源是否集中在同一网段/机房。"
+
+      # 年龄中位数塌到接近 0：节点在"高频死亡+补位"，池子是漏斗不是池子。
+      # 300s 是经验下限（抓取间隔 + 质检耗时量级），低于它意味着节点活不过
+      # 一轮复检。
+      #
+      # 空池时该 gauge 渲染 **NaN**，而 NaN 参与任何比较都是 false ⇒ 这条
+      # 规则在空池下天然不触发（空池由 FreePoolDry30m 负责，两者不重叠）。
+      # 这里不写 `>= 0` 之类的护栏：NaN 语义已经覆盖，多写一层反而会让读者
+      # 以为负数可能发生。
+      - alert: FreePoolAgeCollapse
+        expr: |
+          free_pool_median_age_seconds < 300
+          and on() (free_pool_nodes_total > 0)
+          and on() (increase(free_pool_source_fetch_ms_count[1h]) > 0)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "免费池节点年龄中位数 {{ $value | humanizeDuration }}（疑似漏斗式换血）"
+          describe: "节点活不过一轮复检，池子在高频死亡+补位；有效吞吐远低于节点数暗示的量。查质检是否过严（free_pool_verify_total）或抓取源质量下降。"
+
+      # 质检转化率坍塌：抓来的原始代理几乎没有能过质检的。
+      # 需样本量门槛（1h 内至少 100 次质检），否则启动初期 1/1=0% 会立刻误报。
+      # `free_pool_yield_ratio` 无样本时渲染 NaN ⇒ 比较恒 false ⇒ 天然不误报。
+      - alert: FreePoolYieldCollapse
+        expr: |
+          free_pool_yield_ratio < 0.02
+          and on() (increase(free_pool_verify_total[1h]) >= 100)
+          and on() (increase(free_pool_source_fetch_ms_count[1h]) > 0)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "免费代理质检转化率 {{ $value | humanizePercentage }}（低于 2%）"
+          describe: "抓取源产出的原始代理几乎全部质检失败；查源站是否已失效（返回模板页/占位 IP），或出口网络是否整体劣化。"
+
       # ---- 后台 worker 健康（OPT-R7 B1 修：加 sum by(worker)）----
       # 后台 worker 重启（supervisor 捕获 panic/意外返回后自愈）。
       # Windows 本机调试偶发 tokio 退出抖动（见 EXEC），单次重启是自愈证据；

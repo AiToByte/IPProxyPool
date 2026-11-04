@@ -46,8 +46,27 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# FreePool 的源码位置。OPT-R18 P2-1 把 3727 行的 `free_pool.rs` 拆成了
+# 目录模块 `free_pool/`（`mod.rs` + 5 个子模块），故本门必须**读整个目录**，
+# 不能只读一个文件——否则拆完立刻报"缺文件"（实测如此）。
+# 两种布局都支持：`free_pool.rs` 单文件，或 `free_pool/*.rs` 目录模块。
+FREE_POOL_DIR = REPO / "gateway" / "src" / "free_pool"
 FREE_POOL_RS = REPO / "gateway" / "src" / "free_pool.rs"
-METRICS_RS = REPO / "gateway" / "src" / "metrics.rs"
+
+
+def free_pool_source() -> str:
+    """FreePool 全部源码的拼接（单文件或目录模块两种布局都支持）。"""
+    if FREE_POOL_RS.is_file():
+        return FREE_POOL_RS.read_text(encoding="utf-8")
+    if FREE_POOL_DIR.is_dir():
+        return "\n".join(
+            f.read_text(encoding="utf-8") for f in sorted(FREE_POOL_DIR.glob("*.rs"))
+        )
+    return ""
+SRC_DIR = REPO / "gateway" / "src"
+# 路径解析交给共享助手（`metrics` / `free_pool` 都已是目录模块）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _rustsrc import module_source  # noqa: E402
 OPERATION = REPO / "docs" / "OPERATION.md"
 
 EXPECTED_VERIFY_RESULTS = {"pass", "tcp_fail", "full_fail", "geo_fail"}
@@ -58,6 +77,12 @@ REQUIRED_METRICS = [
     "free_pool_verify_total",
     "free_pool_source_suspended",
     "free_pool_intake_capped_total",
+    # OPT-R18 P2-3：供给 SLO 三元组。它们回答的是"节点数"回答不了的问题——
+    # 出口身份够不够（多样性）、节点是不是活不过一轮复检（年龄）、抓来的
+    # 原始代理有多少能过质检（转化率）。免费池的真实失效方式就是这三种。
+    "free_pool_distinct_exit_ips",
+    "free_pool_median_age_seconds",
+    "free_pool_yield_ratio",
 ]
 
 # 文档必须命中的口径（正则）。两条都要，因为本轮正是被这两条坑到。
@@ -78,6 +103,15 @@ REQUIRED_DOC_CLAIMS = [
         "（本机 CH 不可用 ⇒ 遥测降级 ⇒ 无法按出口节点归因）",
     ),
     (
+        "供给 SLO 的三个问题",
+        # 三选一命中即可（OPERATION 的表述可以变，但必须提到"出口多样性/年龄/
+        # 转化率"这三类里至少两类，否则读者不知道新指标是干什么的）。
+        r"(出口(多样性|身份)|distinct_exit_ips)[\s\S]{0,400}?(年龄|median_age)"
+        r"|(年龄|median_age)[\s\S]{0,400}?(转化率|yield_ratio)",
+        "必须写明供给 SLO 至少两类口径（出口多样性 / 年龄 / 转化率），"
+        "否则新增的三个指标在运维手册里没有解释，等于只有作者知道怎么读",
+    ),
+    (
         "供给侧可重复探针的入口",
         r"probe_free_pool",
         "必须给出可重复验证的命令入口（tools/probe_free_pool.py）",
@@ -88,13 +122,25 @@ REQUIRED_DOC_CLAIMS = [
 def main() -> int:
     failures: list[str] = []
 
-    for p in (FREE_POOL_RS, METRICS_RS, OPERATION):
+    if not free_pool_source():
+        print(
+            f"[check-free-pool-contract] ERROR: 找不到 FreePool 源码"
+            f"（既无 {FREE_POOL_RS.name} 也无 {FREE_POOL_DIR.name}/ 目录）",
+            file=sys.stderr,
+        )
+        return 1
+    for p in (OPERATION,):
         if not p.is_file():
             print(f"[check-free-pool-contract] ERROR: 缺文件 {p}", file=sys.stderr)
             return 1
 
-    fp = FREE_POOL_RS.read_text(encoding="utf-8")
-    mx = METRICS_RS.read_text(encoding="utf-8")
+    fp = free_pool_source()
+    mx = module_source(SRC_DIR, "metrics")
+    if not mx:
+        print(
+            "[check-free-pool-contract] ERROR: 找不到 metrics 模块源码", file=sys.stderr
+        )
+        return 1
     doc = OPERATION.read_text(encoding="utf-8")
 
     # 1) verify 分类集合（取 note_free_verify 的字符串实参）
@@ -117,7 +163,7 @@ def main() -> int:
 
     # 3) intake 上限算式须保留 max_nodes × factor 且下限 100
     if "fn intake_cap_limit" not in fp:
-        failures.append("  free_pool.rs 缺 intake_cap_limit（intake 上限算式被移走）")
+        failures.append("  free_pool 源码缺 intake_cap_limit（intake 上限算式被移走）")
     else:
         body = fp[fp.index("fn intake_cap_limit"):][:400]
         if "saturating_mul" not in body:
@@ -146,7 +192,10 @@ def main() -> int:
 
     print(
         f"[check-free-pool-contract] OK: verify 分类 {sorted(EXPECTED_VERIFY_RESULTS)} 一致、"
-        f"{len(REQUIRED_METRICS)} 个指标名在位、intake 下限 100 保留、3 条文档口径齐全"
+        f"{len(REQUIRED_METRICS)} 个指标名在位、intake 下限 100 保留、"
+        # 口径条数**不要写死**：本轮加了第 4 条，写死的 "3 条" 立刻变成谎报
+        # （门全绿但输出说错数）。与 `check_doc_consistency.py` 同一条教训。
+        f"{len(REQUIRED_DOC_CLAIMS)} 条文档口径齐全"
     )
     return 0
 

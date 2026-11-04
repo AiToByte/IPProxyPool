@@ -14,7 +14,7 @@
                     └──────────────┬──────────────────┘
                                    ▼ :8916
 ┌──────────────────────────────────────────────────────────────┐
-│ 数据面 Data plane (`gateway.rs` Pingora ProxyHttp)            │
+│ 数据面 Data plane (`gateway/` Pingora ProxyHttp)            │
 │  request_filter → upstream_peer → response_filter →           │
 │  response_body_filter → logging                               │
 └──────┬───────────────┬───────────────┬───────────────┬───────┘
@@ -71,7 +71,7 @@ Redis 中断：数据面 200 不降级（内存隔离独立），恢复后行数
                     └──────────────┬──────────────────────┘
                                    ▼ :8916
 ┌──────────────────────────────────────────────────────────────┐
-│ Data plane (`gateway.rs` Pingora ProxyHttp)                   │
+│ Data plane (`gateway/` Pingora ProxyHttp)                   │
 │  request_filter → upstream_peer → response_filter →           │
 │  response_body_filter → logging                               │
 └──────┬───────────────┬───────────────┬───────────────┬───────┘

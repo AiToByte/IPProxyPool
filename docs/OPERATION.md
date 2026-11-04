@@ -119,6 +119,57 @@ curl.exe -s -X DELETE http://127.0.0.1:9092/api/v1/nodes/203.0.113.10:8080 `
 
 ---
 
+### 2.2 租户状态持久化：余额会不会跨重启（OPT-R18 P2-2）
+
+**先说结论：缺省不保。** 不设 `TENANT_STORE` 时租户表在进程内存里，重启后
+余额、启停状态、累计流量全部回到初始值（余额回到 `100.0`）。
+
+这不是猜测，是实测留痕（TASK_PLAN 步骤 60）：同一份二进制、同一个端口，
+
+```
+run1: GET /api/v1/tenants        → balance_usd: 100.0
+      PATCH balance = 42.5
+      GET /api/v1/tenants        → balance_usd: 42.5     ← 生效
+      杀掉进程，重新启动
+run2: GET /api/v1/tenants        → balance_usd: 100.0    ← 归零
+```
+
+要保住，显式打开写穿：
+
+```powershell
+$env:TENANT_STORE = "redis"          # 缺省 memory；只认 memory|redis
+$env:TENANT_FLUSH_SECS = "5"         # 最大持久化延迟（秒），缺省 5
+$env:TENANT_REDIS_PREFIX = "ipp:tenant"   # 键前缀，缺省 ipp:tenant
+$env:REDIS_URL = "redis://127.0.0.1:6379/"
+```
+
+运维要点：
+
+- **语义边界**：**配置决定「有哪些租户」，Redis 只决定「它们现在什么状态」。**
+  `register_tenant`（当前来自 `API_KEY`）是租户存在性的唯一来源；Redis 里的
+  记录**不会**复活一个已从配置里删掉的租户。反过来 `is_active` /
+  `balance_usd` / `total_bytes` 会从 Redis 恢复。因此"删租户"仍然是改配置，
+  不是删 Redis 键（删了也只会让它回到初始余额）。
+- **最大丢失窗口 = `TENANT_FLUSH_SECS`**（缺省 5s）。进程被强杀（含 Windows
+  上 Pingora 不等待信号的场景）时，最多丢这么多秒的计量。优雅停机
+  （Unix SIGTERM / Ctrl-C）会额外补一次 flush，把窗口压到 0——但**别依赖它**，
+  周期 flush 才是兜底。
+- **`TENANT_STORE=redis` 但 Redis 不可达** ⇒ 启动日志里一条显式 `warn`，然后
+  **降级为 memory 继续跑**。看到这条告警就别以为余额被保住了。
+- **启动顺序**：先加载 Redis，再起 flush 循环。反过来会让首轮 flush 把刚注册
+  的初始余额（100）写回 Redis，把上次的余额覆盖掉——一个只在重启后才暴露的
+  静默清零。`p2_2_load_must_precede_flush` 这条测试就是为了钉住它。
+- **凭据**：Redis 的键名是 `{prefix}:{api_key}`，**明文含 API Key**。Redis
+  实例要按凭据对待（ACL/密码/网络隔离），别用共享实例。
+- **验证**（两条命令就够）：`PATCH /api/v1/tenants/{key}/balance` 改一个值 →
+  重启 → `GET /api/v1/tenants` 看是否还是那个值。若不是，先看启动日志里有没有
+  那条降级 `warn`。
+- **回滚**：把 `TENANT_STORE` 去掉即可回到内存模式；Redis 里的残留记录不会被
+  读取，也不影响启动（下次打开时会以 Redis 里的旧值为准，如需干净起步先删
+  `{prefix}:*` 与 `{prefix}:index`）。
+
+---
+
 ## 3. 三家真 Key 灰度（GW-R2，用户给 Key 后执行）
 
 1. Key 入库：走 secret 管理（禁进仓库），staging 先配 1 家 1 国；
@@ -241,7 +292,7 @@ Prometheus ──alerting.alertmanagers──▶ Alertmanager ──route.receiv
 | Alertmanager 服务 | ✅ **默认起** | OPT-R17 起从 `--profile observability` 移出，`docker compose up -d` 即启动 |
 | Alertmanager → 人 | ❌ **不外发** | `deploy/alertmanager.yml` 的 `route.receiver: "empty"`，收到即丢弃 |
 
-**结论**：15 条告警规则**会触发**，也会**到达 Alertmanager**（可在其 UI
+**结论**：18 条告警规则**会触发**，也会**到达 Alertmanager**（可在其 UI
 分组、静默、确认），但**不会外发**给任何人。这是**刻意的**——
 开发/本地环境误报到真实渠道会造成告警疲劳。
 
@@ -274,6 +325,118 @@ Prometheus ──alerting.alertmanagers──▶ Alertmanager ──route.receiv
 | "要在 prometheus 容器里挂 `alertmanager.yml`" | ❌ 那是 **alertmanager 容器**读的路径，挂进 prometheus 不会被读取 |
 | "改完配置要 `restart prometheus`" | ❌ 改的是 alertmanager 侧配置，重启 **alertmanager** 即可 |
 | "告警规则没写对，所以没告警" | 规则在 Prometheus `/alerts` 页面可见；`empty` 只影响**外发**，不影响规则求值 |
+
+## 4.2 免费供给 SLO（OPT-R18 P2-3）
+
+> **本节回答一个问题：`free_pool_nodes_total` 看起来健康，但免费线其实已经废了吗？**
+
+免费池有三种"节点数正常、实际已经不可用"的失效方式，节点数一个都抓不到：
+
+| 指标 | 它回答的问题 | 为什么节点数抓不到 |
+|---|---|---|
+| `free_pool_distinct_exit_ips` | 池里有几个**不同出口身份**？ | 几十个节点共用同一个出口 IP 时，节点数很漂亮，而 WAF 侧只看到一个身份——封禁一次就全灭 |
+| `free_pool_median_age_seconds` | 节点**已经活了多久**（中位数）？ | 年龄贴近 0 说明池子是"漏斗"而非"池子"：节点高频死亡 + 补位，有效吞吐远低于节点数暗示的量 |
+| `free_pool_yield_ratio` | 抓来的原始代理**多少能过质检**？ | 转化率坍塌时节点数会**滞后**才掉（旧节点还在 TTL 内），此时已经该查源站了 |
+
+三条口径各自的读法：
+
+- **出口多样性**：`distinct_exit_ips < 3` 且 `nodes_total > 0` 持续 30 分钟 ⇒
+  `FreePoolExitDiversityLow`。查抓取源是否集中在同一网段/机房（免费源常常
+  来自同一批云主机，看似几十个节点实为一个出口）。
+- **年龄中位数**：`< 300s` 持续 1 小时 ⇒ `FreePoolAgeCollapse`。300s 是
+  "抓取间隔 + 质检耗时"的量级，低于它意味着节点活不过一轮复检。此时应查
+  `free_pool_verify_total` 的 fail 分布，判断是质检过严还是源站质量下降。
+- **质检转化率**：`< 2%` 且 1 小时内质检样本 ≥100 ⇒ `FreePoolYieldCollapse`。
+  样本量门槛是必需的，否则启动初期 `1/1 = 0%` 会立刻误报。
+
+两条**空值语义**（有意为之，别当 bug）：
+
+1. `free_pool_yield_ratio` 无样本时渲染 `NaN`（不是 `0`）。`0` 会被读成
+   "转化率极差"，真相是"还没有样本"。
+2. `free_pool_median_age_seconds` 空池时渲染 `NaN`（不是 `0`）。`0` 会被读成
+   "刚进池"，真相是"池是空的"。
+
+Prometheus 里 `NaN` 参与任何比较都是 `false`，故基于这两个指标的告警在无样本/
+空池时**不会**误报——空池由既有的 `FreePoolDry30m` 负责，两者职责不重叠。
+
+三条告警都以 `free_pool_source_fetch_ms_count` 作**启用态门槛**：`FREE_ENABLED=0`
+（缺省）时免费线不跑，这些 gauge 停在初值，没有门槛就会在缺省配置下永久 firing
+（`FreePoolDry30m` 踩过这个坑，见其规则注释）。
+
+## 4.3 按 trace_id 互查日志与仓库（OPT-R18 P1-1）
+
+> **本节回答一个问题：用户报了一条 502，我怎么在日志和 ClickHouse 之间对上同一条请求？**
+
+每个请求在 `request_filter` 阶段拿一个 `trace_id`（`{unix_ms}-{pid}-{seq}`，
+下游带 `X-Trace-Id` 则沿用），它同时出现在**两处**：
+
+| 落点 | 形态 | 留存 |
+|---|---|---|
+| 网关日志 | `[Telemetry] trace_id=... status=502 ...` | 受日志轮转/容器日志保留期限制 |
+| ClickHouse `proxy.proxy_telemetry_log.trace_id` | 字符串列 | 90 天（表 TTL） |
+
+仓库是**长期留存**的那一半，所以互查要以仓库为起点：
+
+```bash
+# ① 从仓库捞这条请求的完整上下文（provider / 出口 IP / 重试次数 / 错误）
+clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
+  --query "SELECT event_time, client_ip, tenant_id, target_domain, out_ip,
+                  provider, tier, country, status_code, latency_ms, retry_count, error_message
+           FROM proxy.proxy_telemetry_log
+           WHERE trace_id = '1790781750123-4242-7'
+           LIMIT 1"
+```
+
+```bash
+# ② 用同一个 ID 捞网关侧日志（docker 部署）
+docker logs ipproxy-gateway 2>&1 | grep 'trace_id=1790781750123-4242-7'
+```
+
+```powershell
+# ② 用同一个 ID 捞网关侧日志（Windows 宿主直跑）
+Select-String -Path .\log\*.out, .\log\*.err -Pattern 'trace_id=1790781750123-4242-7'
+```
+
+反向（先有日志、要查仓库）把同一个 ID 填进 ① 即可，两个方向等价。
+
+### 4.3.1 三个必须知道的边界
+
+1. **空串 `trace_id` = 「该行产生于落地之前」，不是「trace 丢了」**。
+   `manual/003_trace_id.sql` 之前写入的老行，`trace_id` 一律是 `''`
+   （`ALTER TABLE ADD COLUMN` 的语义：元数据操作、不重写存量分区）。
+   这类行只能靠 `event_time` + `client_ip` + `target_domain` 近似定位。
+2. **日志侧会丢，仓库侧不会**。`R2-8` 有采样：5xx 全量 `info`，其余 1/1000
+   全量（采样掉的走 `debug`，默认级别看不到）。故「仓库有、日志没有」是
+   **正常现象**，反过来（日志有、仓库没有）才需要查泵链路
+   （`telemetry_sink_up{backend="clickhouse"}`，见 §4.1）。
+3. **`trace_id` 不是安全边界**。它由客户端可控的 `X-Trace-Id` 沿用，
+   故**不得**用它做鉴权、去重计费或审计定责——它只用于排障串联。
+   计费与幂等仍以 `event_id`（服务端发号）为准。
+
+### 4.3.2 存量部署升级（必须做一次）
+
+`001_schema.sql` 用的是 `CREATE TABLE IF NOT EXISTS`——表已存在时它**不会**
+补列。故存量部署必须手动执行一次：
+
+```bash
+clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
+  --multiquery < deploy/clickhouse/manual/003_trace_id.sql
+```
+
+`ADD COLUMN IF NOT EXISTS` / `ADD INDEX IF NOT EXISTS` 幂等，重复执行无副作用。
+**不执行会怎样**（CH 24 实测）：代码侧 `INSERT` 显式列出 `trace_id` 列，而表里
+没有该列 ⇒ CH 报 **`NO_SUCH_COLUMN_IN_TABLE`（Code 16）**，`ChSink` 会**保留 ack
+并在下一轮重试**（数据不丢，但仓库停更，`telemetry_sink_up{backend="clickhouse"}=0`
+会告警）。这是**响亮的失败**，不是静默丢数据——但仍应在升级二进制**之前**先跑迁移。
+
+> 反向的不一致才是静默的：**表里有列、代码不写它** ⇒ CH 补默认值（`String`→`''`）、
+> 插入不报错、该列永远查不到。这正是 `trace_id` 当初缺失时的形态。
+> 两个方向由 `analytics::tests::row_columns_match_ddl_columns` 双向拦住。
+
+> 目录纪律：`deploy/clickhouse/` 顶层**只有** `001_schema.sql` 会被
+> `docker-entrypoint-initdb.d` 自动执行（CH 官方 entrypoint 遍历顶层所有
+> `.sql`）。一次性迁移脚本一律放 `manual/`，详见 `001_schema.sql` 末尾的
+> 「目录约定」段。
 
 ## 5. Spike 结论（本轮不落地，详见 `docs/SPIKE_R2.md`）
 

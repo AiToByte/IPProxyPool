@@ -25,7 +25,7 @@ curl(带X-Api-Key) ── origin-form GET /path＋Host:上游 ─▶ :8916
    上游 ◀── egress（付费直连／免费节点／socks 桥）── 响应原样回下游
 ```
 
-关键代码：`gateway/src/gateway.rs`（filter/peer/logging）、`router.rs`（select_node_excluding）、`bandit.rs`（extract_context/select）、`tenant.rs`（authenticate_and_throttle/release_and_meter）、`metrics.rs`（observe）。
+关键代码：`gateway/src/gateway/mod.rs`（filter/peer/logging）、`router.rs`（select_node_excluding）、`bandit.rs`（extract_context/select）、`tenant.rs`（authenticate_and_throttle/release_and_meter）、`metrics/record.rs`（observe）。
 
 ### 2. 遥测落库流（每请求 1 事件）
 
@@ -56,16 +56,21 @@ fetch_all（api/html/github 并发＋15s 单源超时＋etag/304＋熔断守卫�
 ```
 
 熔断语义：传输失败/超时视同零产出计轮次（SourceGuard），连续 `FREE_SOURCE_MAX_ZERO_CYCLES` 轮暂停，每 `FREE_SUSPEND_RETRY_EVERY` tick 试探；304 不计。
-关键代码：`free_pool.rs`（fetch_all/cap_intake/Registry/run_once/merge_once）。
+关键代码：`free_pool/mod.rs`（fetch_all/cap_intake/Registry/run_once/merge_once）。
 
 ### 4. 隔离 PubSub 流（GW-2 双轨自愈一半）
 
 ```
-某实例探针判节点死 → set_quarantine（内存，<50ms 生效）
+熔断器判定（遥测：同域同出口连续失败）→ set_quarantine（内存，<50ms 生效）
         ├─▶ SETEX quarantine:{domain}:{ip}（持久化，失败记数＋warn＋单次重试）
         └─▶ PUBLISH delta（扇出 QUARANTINE|domain|ip|ttl，其他实例 apply_delta 落内存）
 订阅断线 → supervise backoff 重连（pubsub_delta，可观测）；重连后全量对账靠 TTL 自然过期。
 ```
+
+> **两条机制不要混淆**：上图的 `quarantine` 是**域级**隔离（`domain × ip`），由真实流量
+> 遥测驱动，跨实例经 Redis 同步。另有一条**主动健康**表（`router.rs::active_health`）：
+> 按 `ip` 粒度、由本地探针连续失败驱动、**只在本实例内存中生效、不写 Redis、不跨实例**。
+> 二者在选路时是「且」关系。
 
 验证：`quarantine:{domain}:{ip}` Redis 键；`supervisor_restarts_total{worker="pubsub_delta"}`。
 关键代码：`circuit_breaker.rs`（quarantine_redis_key/delta_message/RemoteSyncStats）。
@@ -88,7 +93,7 @@ fetch_all（api/html/github 并发＋15s 单源超时＋etag/304＋熔断守卫�
 → 成功率<99／干旱30m／重启>3／失联／Stream 积压 五告警
 ```
 
-关键代码：`metrics.rs`（render＋note_*）；`deploy/prometheus/rules.yml`；`deploy/grafana/` 面板 5→7（E5 加延迟直方图＋exit TopK）。
+关键代码：`metrics/render.rs`（render）＋`metrics/record.rs`（note_*）；`deploy/prometheus/rules.yml`；`deploy/grafana/` 面板 5→7（E5 加延迟直方图＋exit TopK）。
 ### 相关文档 / Related docs
 
 - 架构全景见 [SYSTEM-ARCHITECTURE.md](SYSTEM-ARCHITECTURE.md)；功能细节见 [FEATURES.md](FEATURES.md)；上手操作见 [USER-GUIDE.md](USER-GUIDE.md)；开源与依赖见 [OPEN-SOURCE.md](OPEN-SOURCE.md)。
@@ -117,7 +122,7 @@ curl (with X-Api-Key) ── origin-form GET /path + Host: upstream ─▶ :8916
    upstream ◀── egress (paid direct / free node / socks bridge) ── response passes through
 ```
 
-Key code: `gateway/src/gateway.rs` (filter/peer/logging), `router.rs` (select_node_excluding), `bandit.rs`, `tenant.rs`, `metrics.rs` (observe).
+Key code: `gateway/src/gateway/mod.rs` (filter/peer/logging), `router.rs` (select_node_excluding), `bandit.rs`, `tenant.rs`, `metrics/record.rs` (observe).
 
 ### 2. Telemetry Warehouse Flow (one event per request)
 
@@ -148,16 +153,22 @@ fetch_all (api/html/github concurrent + 15s per-source timeout + etag/304 + fuse
 ```
 
 Fuse semantics: transport failure/timeout counts as zero-yield round; suspend after `FREE_SOURCE_MAX_ZERO_CYCLES` consecutive, probe every `FREE_SUSPEND_RETRY_EVERY` ticks; 304 exempt.
-Key code: `free_pool.rs`.
+Key code: `free_pool/mod.rs`.
 
 ### 4. Quarantine PubSub Flow (half of GW-2 dual-track healing)
 
 ```
-instance prober condemns node → set_quarantine (in-memory, <50ms live)
+circuit breaker (telemetry: repeated failures for same domain × egress) → set_quarantine (in-memory, <50ms live)
         ├─▶ SETEX quarantine:{domain}:{ip} (persisted; failures counted＋warned＋retried once)
         └─▶ PUBLISH delta (QUARANTINE|domain|ip|ttl; peers apply_delta to memory)
 Reconnects via supervise backoff (pubsub_delta, observable); TTL expiry reconciles.
 ```
+
+> **Two distinct mechanisms — do not conflate.** The `quarantine` above is *domain-scoped*
+> (`domain × ip`), driven by live-traffic telemetry and shared across instances via Redis.
+> Separately, an *active-health* table (`router.rs::active_health`) is *ip-scoped*, driven by
+> the local prober's consecutive failures, **local to this instance only** (no Redis, no
+> cross-instance fan-out). Routing requires both checks to pass.
 
 Verify: `quarantine:{domain}:{ip}` keys; `supervisor_restarts_total{worker="pubsub_delta"}`.
 Key code: `circuit_breaker.rs`.
@@ -180,4 +191,4 @@ per-module AtomicU64/DashMap writers (single-atom/saturating) → serve_metrics(
 → success<99 / dry-30m / restarts>3 / down / stream-lag five alerts
 ```
 
-Key code: `metrics.rs`; `deploy/prometheus/rules.yml`; `deploy/grafana/` (E5 added latency histogram＋exit TopK).
+Key code: `metrics/render.rs`; `deploy/prometheus/rules.yml`; `deploy/grafana/` (E5 added latency histogram＋exit TopK).

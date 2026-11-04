@@ -1,0 +1,132 @@
+{
+  "alpha": 0.4,
+  "cases": [
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "fresh_dc",
+      "rewards": [],
+      "score": 0.386212087578638,
+      "t": 1,
+      "tier": "dc"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "fresh_residential",
+      "rewards": [],
+      "score": 0.341212087578638,
+      "t": 1,
+      "tier": "residential"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "fresh_free",
+      "rewards": [],
+      "score": 0.24121208757863802,
+      "t": 1,
+      "tier": "free"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "trained_dc_t100",
+      "rewards": [
+        1.0,
+        0.9,
+        0.8,
+        1.0,
+        0.95
+      ],
+      "score": 0.9539014086668745,
+      "t": 100,
+      "tier": "dc"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "clamped_theta",
+      "rewards": {
+        "times": 20,
+        "value": 1.0
+      },
+      "score": 0.9407002874740094,
+      "t": 5,
+      "tier": "residential"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "free_forgetting_at_1k",
+      "rewards": {
+        "times": 1000,
+        "value": 0.9
+      },
+      "score": 0.862742867716218,
+      "t": 1500,
+      "tier": "free"
+    },
+    {
+      "context": [
+        0.9,
+        1.0,
+        0.0,
+        0.2
+      ],
+      "name": "high_risk_ctx",
+      "rewards": [
+        1.0,
+        0.0,
+        0.2,
+        1.0,
+        0.5,
+        1.0
+      ],
+      "score": 0.7080968257035284,
+      "t": 500,
+      "tier": "datacenter"
+    },
+    {
+      "context": [
+        0.3,
+        1.0,
+        0.5,
+        0.2
+      ],
+      "name": "large_t",
+      "rewards": [
+        0.7,
+        0.7
+      ],
+      "score": 1.028859872970224,
+      "t": 1000000,
+      "tier": "dc"
+    }
+  ],
+  "note": "由 gateway/src/bandit.rs::print_replay_parity_vectors 生成；改公式必须重新生成"
+}

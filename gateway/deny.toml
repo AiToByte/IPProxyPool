@@ -51,10 +51,50 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 #   四者均 "No safe upgrade is available"，本仓 Cargo.toml 无升级路径；pingora 升级
 #   已清掉 atty/daemonize/proc-macro-error/yaml-rust 等 6 个，剩余属上游债。
 unmaintained = "workspace"
-# NOTE: ignore 只能加"已确认不可达/已确认不可修"的 advisory，每条必须写理由，例如：
-# { id = "RUSTSEC-20XX-XXXX", reason = "仅影响 wasm32 目标，本仓只构建 x86_64-windows/linux" }
+# NOTE: ignore 只能加"已确认不可达/已确认不可修"的 advisory，每条必须写理由。
 # 每条 ignore 都是一次显式风险接受，review 时重点看这里。
-ignore = []
+#
+# ============================================================================
+# 2026-11-01：zstd 生态 4 条公告（OPT-R18 供应链处置）
+# ============================================================================
+# 共同背景（**"不可修"**）：zstd 的两个版本都在树里，且都由 pingora 0.9.0 拉入——
+#   zstd 0.13.3 ← pingora-header-serde 0.9.0（要求 `zstd ^0.13.1` + `zstd-safe ^7.1.0`）
+#   zstd 0.14.0 ← pingora-core 0.9.0
+# 而两条线**都没有补丁版本**：公告的 patched 只有 `zstd >= 0.14.3`、
+# `zstd-safe >= 8.2.0`、`zstd-sys >= 2.1.2`，0.13.x / 7.x 线上不存在修复。
+# `cargo search pingora` 实测：`pingora` 最新就是 **0.9.0**（即当前版本），
+# 故本仓**无升级路径**——这不是"懒得升"，是上游还没有含修复的版本。
+#
+# 逐条**可达性**（源码级调用图，2026-11-01 实测；`grep` 于
+# `~/.cargo/registry/src/*/pingora-*/src/` 全树，命中数均为 0）：
+#   * 0391 受影响符号 = `zstd::stream::raw::{Encoder,Decoder}::with_context`
+#     ⇒ pingora 全树**无 `with_context` 调用**；pingora-header-serde 只用
+#        `zstd::dict` + `zstd_safe::{CCtx,DCtx}::create` + `decompress_to_buffer`。
+#   * 0398 受影响符号 = `zstd_safe::Seekable::decompress`
+#     ⇒ pingora 全树**无 `Seekable`**（zstd 0.13.3 源码里也没有该 API）。
+#   * 0403 受影响符号 = `zstd_safe::DCtx::decompress_stream`
+#     ⇒ pingora 全树**无 `decompress_stream`**（走的是 `decompress_to_buffer`，
+#        公告原文明确 `read::Decoder`/`decode_all`/bulk API 不受影响）。
+#   * 0410 仅 wasm32（zstd-sys 给 C 库的 malloc/free shim）⇒ 本仓只构建
+#     x86_64-windows / x86_64-linux，**平台不可达**。
+# 本仓自身代码对 zstd **零引用**（`grep -rn zstd src/` 无命中），不存在第二条路径。
+#
+# ⚠️ 一处**失败的方法论记录**：本想把"符号不在二进制里"作为硬证据，用
+# `llvm-nm` 查 PE 符号 → 全为 0，但**对照组（确定被调用的 `decompress_to_buffer`）
+# 也是 0**，说明该方法对 PE 无效；改用 PDB 字符串搜索后，对照组成立（8），
+# 但 `with_context`(8)/`Seekable`(1) 的命中来自**通用名污染**——`with_context`
+# 实际来自 anyhow（完全无关的 crate）。故最终证据是**源码级调用图**，
+# 不是符号级；只有 `decompress_stream` 的符号级读数（0）是干净的、与源码结论一致。
+#
+# 退出条件：`unused-ignored-advisory = "deny"` 会在 pingora 升级到含修复的版本
+# （届时这些 advisory 不再命中）时**自动报错**，强制我们删掉这几条 ignore。
+# 故这批豁免不会变成僵尸。
+ignore = [
+    { id = "RUSTSEC-2026-0391", reason = "zstd with_context 数据跨流泄漏：pingora 全树无 with_context 调用；zstd 0.13.3/0.14.0 均无补丁版本，pingora 最新 0.9.0 即当前版本，无升级路径" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd_safe Seekable::decompress 越界设 Vec 长度：pingora 全树无 Seekable 调用；补丁仅 >=8.2.0，当前 7.x/0.13 线无修复" },
+    { id = "RUSTSEC-2026-0403", reason = "DCtx::decompress_stream 未初始化内存：pingora 全树无 decompress_stream 调用（走 decompress_to_buffer，公告明示不受影响）；补丁仅 >=8.2.0" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys wasm32 分配器 shim：本仓只构建 x86_64-windows/x86_64-linux，平台不可达" },
+]
 # 门禁健忘防护：ignore 一旦失效（上游修复/依赖消失）立即报错，防止默默积累僵尸豁免。
 unused-ignored-advisory = "deny"
 

@@ -165,7 +165,7 @@ use free_pool::{
 };
 use gateway::{is_loopback_addr, SmartProxyGateway};
 use metrics::{serve_metrics, MetricsRegistry, METRICS_ADDR};
-use model::{ProxyNode, RoutingSpec};
+use model::ProxyNode;
 use node_registry::NodeRegistry;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -173,7 +173,7 @@ use pool::ConnectionPrewarmer;
 use prober::CanaryProber;
 use rand::Rng;
 use redis::aio::ConnectionManager;
-use router::RouterEngine;
+use router::{ProbeFailureOutcome, RouterEngine};
 use socks_bridge::SocksBridge;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -218,6 +218,40 @@ fn env_secs(key: &str, default_secs: u64) -> Duration {
         .filter(|v| *v > 0)
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(default_secs))
+}
+
+/// 步骤 54：布尔 env 读值。
+///
+/// 接受 `1/true/yes/on` 与 `0/false/no/off`（大小写不敏感）；其他值回落默认，
+/// 不 panic、不把拼写错误静默解释成 true/false。`PROBE_ACTIVE_HEALTH_ENABLED`
+/// 是主动健康摘除的总开关。
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+/// 步骤 54：u32 env 读值 + 上下限钳制；缺失/非法回落默认。
+fn env_u32_clamped(key: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+/// 步骤 54：u64 env 读值 + 上下限钳制；缺失/非法回落默认。
+fn env_u64_clamped(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 /// OPT-R14 B1：`GATEWAY_GRACE_SECS` 的**平台感知默认值**。
@@ -293,14 +327,6 @@ fn split_env_list(key: &str, default: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
         .collect()
-}
-
-/// A3：主探针信号量关闭时的跳过结果（对齐 pool.rs:92 口径：`acquire_owned`
-/// 失败按失败计，不执行探测；调用方记 `Dead` 走既有 warn 日志，不裸奔全并发）。
-fn skipped_probe_result() -> prober::ProbeResult {
-    prober::ProbeResult::Dead {
-        error: "probe semaphore closed, skipped".to_string(),
-    }
 }
 
 // OPT-R4 S5 stop-aware supervisor: stop broadcast aborts current run without respawn.
@@ -533,7 +559,27 @@ async fn setup_gateway() -> Server {
     }
     let mut live_nodes = node_registry.snapshot();
     live_nodes.extend(test_nodes);
-    let router = Arc::new(RouterEngine::new(live_nodes));
+
+    // 步骤 54：主动健康策略。阈值/冷却均钳制，非法 env 不会造成永久摘除。
+    let probe_failure_threshold = env_u32_clamped(
+        "PROBE_FAILURE_THRESHOLD",
+        router::DEFAULT_PROBE_FAILURE_THRESHOLD,
+        1,
+        router::PROBE_FAILURE_THRESHOLD_MAX,
+    );
+    let probe_cooldown_secs = env_u64_clamped(
+        "PROBE_UNHEALTHY_COOLDOWN_SECS",
+        router::DEFAULT_PROBE_UNHEALTHY_COOLDOWN_SECS,
+        1,
+        router::PROBE_UNHEALTHY_COOLDOWN_MAX_SECS,
+    );
+    // 总开关：探针目标本身异常时，运维可关闭“结果回灌选路”，探测/指标仍保留。
+    let probe_health_enabled = env_bool("PROBE_ACTIVE_HEALTH_ENABLED", true);
+    let router = Arc::new(RouterEngine::new_with_probe_policy(
+        live_nodes,
+        probe_failure_threshold,
+        probe_cooldown_secs,
+    ));
 
     // 2b. GW-4 tenants: default key with wide limits keeps GW-1~3 curls green.
     // R2-3 burst=qps/10（单源口径，见 `TenantManager::default_burst_for_qps`）。
@@ -542,7 +588,37 @@ async fn setup_gateway() -> Server {
     // GATEWAY_ADDR=0.0.0.0:8916，见 OPERATION D2 节）。
     let gateway_addr = env_str("GATEWAY_ADDR", "127.0.0.1:8916");
 
-    let tenant_mgr = Arc::new(TenantManager::new());
+    // OPT-R18 P2-2：租户状态持久化后端（`TENANT_STORE=memory|redis`，缺省 memory）。
+    //
+    // 缺省保持 memory 的理由：写穿会在计量热路径上多一次 `String` 克隆，且依赖
+    // Redis 可用。做成**显式开关**，避免升级后行为悄悄变化——但也正因如此，
+    // 缺省值必须被文档写清楚（OPERATION §2.2），否则"以为余额会保住"。
+    let tenant_store_mode = env_str("TENANT_STORE", "memory").to_ascii_lowercase();
+    let tenant_store = match (tenant_store_mode.as_str(), redis_conn.as_ref()) {
+        ("redis", Some(conn)) => {
+            let prefix = env_str("TENANT_REDIS_PREFIX", "ipp:tenant");
+            log::info!("[Tenant] persistence=redis prefix={prefix}");
+            tenant::Store::Redis {
+                conn: conn.clone(),
+                prefix,
+            }
+        }
+        ("redis", None) => {
+            // 明确要求持久化但没有 Redis ⇒ **响亮降级**，不静默。
+            // 静默降级的后果是运维以为余额被保住了，重启后才发现没有。
+            log::warn!(
+                "[Tenant] TENANT_STORE=redis 但 Redis 不可达，降级为 MEMORY —— \
+                 余额/启停状态不会跨重启保留"
+            );
+            tenant::Store::Memory
+        }
+        ("memory", _) => tenant::Store::Memory,
+        (other, _) => {
+            log::warn!("[Tenant] 未知 TENANT_STORE={other:?}（只认 memory|redis），按 memory 处理");
+            tenant::Store::Memory
+        }
+    };
+    let tenant_mgr = Arc::new(TenantManager::with_store(tenant_store));
 
     // OPT-R12 B1：`API_KEY` env 覆盖。**设了它 `default_key` 就立即失效**
     // （不再注册默认 key ⇒ 旧客户端拿 `default_key` 会 403）——本轮选定的最强档。
@@ -593,6 +669,24 @@ async fn setup_gateway() -> Server {
         ) {
             log::warn!("[OPT-R12] {w}");
         }
+    }
+
+    // OPT-R18 P2-2：**先加载，再启动 flush 循环**，顺序不可颠倒。
+    //
+    // 反过来的话，`register_tenant` 刚标脏的初始状态（余额 100）会被首轮 flush
+    // 立刻写回 Redis，把上次运行时的真实余额覆盖掉——一个只在"重启后"才暴露的
+    // 静默清零。实测证据见 TASK_PLAN 步骤 60。
+    match tenant_mgr.load_persisted().await {
+        Ok(0) => {}
+        Ok(n) => log::info!("[Tenant] restored {n} tenant record(s) from Redis"),
+        Err(e) => log::warn!("[Tenant] load failed, starting from config defaults: {e}"),
+    }
+    let tenant_flush_secs = env_secs("TENANT_FLUSH_SECS", 5);
+    if tenant_mgr.spawn_flusher(tenant_flush_secs).is_some() {
+        log::info!(
+            "[Tenant] write-through flusher online (max lag {}s)",
+            tenant_flush_secs.as_secs()
+        );
     }
 
     // 2c. GW-4 Prometheus registry + exposition endpoint.
@@ -851,12 +945,35 @@ async fn setup_gateway() -> Server {
         drop(rx_opt);
     }
 
-    // 4. Periodic canary prober over the current healthy pool.
+    // 4. Periodic canary prober over **all weighted nodes** (step 54).
     // R2-7：JoinSet + 信号量 20 并发探测（百节点串行堵死 ticker 已成历史；
     // 单节点 2.5s 超时 × 串行曾可达数分钟）+ 每轮淘汰闲置 Client + 启动错峰。
     // R2-8：探测间隔 env 化（`PROBE_INTERVAL_SECS`，默认 60s）。
+    // 步骤 54：候选从 `get_healthy_candidates` 改为 `probe_candidates`（全池
+    // weight>0，含已被主动健康摘除的节点），否则摘除即“永不探测、永不恢复”。
     let probe_router = router.clone();
     let probe_interval = env_secs("PROBE_INTERVAL_SECS", 60);
+    // 步骤 54 / OPT-R18：免费池探测抽样比例。付费节点**永远 100%** 覆盖，
+    // 只有免费池按轮转游标抽样（游标保证 ceil(100/pct) 轮内全覆盖）。
+    // 1 为下限：比例算出来可能是 0，那等于免费池永不探测、永不恢复。
+    let probe_free_sample_percent = env_u32_clamped(
+        "PROBE_FREE_SAMPLE_PERCENT",
+        router::DEFAULT_PROBE_FREE_SAMPLE_PERCENT,
+        1,
+        100,
+    );
+    log::info!(
+        "[Prober] active_health={} threshold={} cooldown={}s interval={}s free_sample={}%",
+        if probe_health_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        router.probe_failure_threshold(),
+        router.probe_unhealthy_cooldown_secs(),
+        probe_interval.as_secs(),
+        probe_free_sample_percent
+    );
     // OPT-R6 V1：prober 此前是裸 spawn——panic（如节点字段意外导致 unwrap）会让
     // 整个探测循环静默死亡且零指标，池健康度从此不可知。包进 supervise 后
     // panic 退避重启并记 `supervisor_restarts_total{worker="prober"}`。
@@ -873,9 +990,10 @@ async fn setup_gateway() -> Server {
         log::info!("[Prober] staggered start (R2-7 jitter)");
         supervise_until(
             "prober",
-            probe_metrics,
+            probe_metrics.clone(),
             move || {
                 let probe_router = probe_router.clone();
+                let probe_metrics = probe_metrics.clone();
                 async move {
                     let prober = Arc::new(CanaryProber::new());
                     let semaphore = Arc::new(Semaphore::new(prober::PROBE_MAX_CONCURRENT));
@@ -887,33 +1005,36 @@ async fn setup_gateway() -> Server {
                         if evicted > 0 {
                             log::info!("[Prober] evicted {evicted} idle clients");
                         }
-                        // NEXT-A3：三路并取（默认 http＋显式 socks5/socks4，沿 pool.rs 预热口径；
-                        // 默认隔离下 socks 对 default-spec 不可见，不并取即漏探 socks 节点存活）。
-                        let mut candidates =
-                            probe_router.get_healthy_candidates(&RoutingSpec::default());
-                        for proto in [
-                            crate::model::EgressProto::Socks5,
-                            crate::model::EgressProto::Socks4,
-                        ] {
-                            let spec = RoutingSpec {
-                                proto: Some(proto),
-                                ..Default::default()
-                            };
-                            candidates.extend(probe_router.get_healthy_candidates(&spec));
-                        }
+                        // 步骤 54：先清到期/僵尸健康状态，再取**全池**候选。
+                        // 这里刻意不再按 default-spec/健康候选过滤：被摘除节点
+                        // 必须继续被探测，否则永远没有恢复机会；socks 节点也
+                        // 因 weight>0 自然包含，不再需要三路并取。
+                        probe_router.sweep_active_health();
+                        let candidates = probe_router.probe_candidates(probe_free_sample_percent);
                         // OPT-5：复用 Client 池大小随滴答打 debug（稳定即无建链抖动）。
                         log::debug!(
                             "[Prober] tick start nodes={} clients={}",
                             candidates.len(),
                             prober.client_count()
                         );
+                        // OPT-R18 日志策略：状态**迁移**（摘除/恢复）逐条 warn/info，
+                        // 常规结果只计数、由 tick 末尾一行汇总输出。理由：免费池
+                        // 常态是大量 Dead，逐条 warn 会把真正的付费节点故障淹掉，
+                        // 也会让 log/gw.err 每轮膨胀上百行。
+                        let mut healthy = 0usize;
+                        let mut degraded = 0usize;
+                        let mut dead = 0usize;
+                        let mut paid_dead = 0usize;
+                        let mut skipped = 0usize;
                         let mut set = JoinSet::new();
                         for node in candidates {
                             let prober = prober.clone();
                             let sem = semaphore.clone();
                             set.spawn(async move {
-                                // A3：对齐 pool.rs:92 ——信号量关闭（acquire Err）直接跳过本次探测，
-                                // 记 Dead（既有 warn 口径），不执行 probe_node（关闭后不再全并发裸奔）。
+                                // 步骤 54：信号量关闭（acquire Err）表示**探针自身**
+                                // 无法执行，不是节点死亡——返回 None，调用方既不更新
+                                // 主动健康、也不记探测结果指标（旧实现记 Dead 会把
+                                // 关机/过载误判成节点故障）。
                                 let _permit = match sem.acquire_owned().await {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -922,42 +1043,166 @@ async fn setup_gateway() -> Server {
                                             node.ip,
                                             node.port
                                         );
-                                        return (node, skipped_probe_result());
+                                        return (node, None);
                                     }
                                 };
                                 let result = prober.probe_node(&node).await;
-                                (node, result)
+                                (node, Some(result))
                             });
                         }
                         while let Some(joined) = set.join_next().await {
                             match joined {
                                 Ok((
                                     node,
-                                    prober::ProbeResult::Healthy {
+                                    Some(prober::ProbeResult::Healthy {
                                         latency_ms,
                                         exit_ip,
-                                    },
+                                    }),
                                 )) => {
-                                    log::info!(
+                                    healthy += 1;
+                                    probe_metrics.note_active_probe_result("healthy");
+                                    // 恢复是状态迁移，值得一条 info（低频、可追溯）；
+                                    // 常规成功只打 debug，避免每轮数百行。
+                                    if probe_health_enabled
+                                        && probe_router.record_probe_success(&node.addr)
+                                    {
+                                        log::info!(
+                                            "[Prober] {}:{} recovered -> active-healthy",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    }
+                                    log::debug!(
                                         "[Prober] {}:{} healthy via {exit_ip} ({latency_ms}ms)",
                                         node.ip,
                                         node.port
                                     );
                                 }
-                                Ok((node, prober::ProbeResult::Degraded { reason })) => {
-                                    log::warn!(
-                                        "[Prober] {}:{} degraded: {reason}",
-                                        node.ip,
-                                        node.port
-                                    );
+                                Ok((node, Some(prober::ProbeResult::Degraded { reason }))) => {
+                                    degraded += 1;
+                                    probe_metrics.note_active_probe_result("degraded");
+                                    // 可达但状态异常：按成功清连续失败。Cloudflare/
+                                    // 备源对代理出口返回 403/5xx 不代表节点传输层已死；
+                                    // 把它当失败会制造大面积误摘。
+                                    if probe_health_enabled
+                                        && probe_router.record_probe_success(&node.addr)
+                                    {
+                                        log::info!(
+                                            "[Prober] {}:{} recovered -> active-healthy (degraded)",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    }
+                                    // 付费节点降级要人看；免费节点降级是常态，只留 debug。
+                                    if node_registry::is_free_provider(&node.provider) {
+                                        log::debug!(
+                                            "[Prober] {}:{} degraded: {reason}",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "[Prober] {}:{} degraded: {reason}",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    }
                                 }
-                                Ok((node, prober::ProbeResult::Dead { error })) => {
-                                    log::warn!("[Prober] {}:{} dead: {error}", node.ip, node.port);
+                                Ok((node, Some(prober::ProbeResult::Dead { error }))) => {
+                                    dead += 1;
+                                    let free = node_registry::is_free_provider(&node.provider);
+                                    if !free {
+                                        paid_dead += 1;
+                                    }
+                                    probe_metrics.note_active_probe_result("dead");
+                                    if probe_health_enabled {
+                                        match probe_router.record_probe_failure(&node.addr) {
+                                            // 摘除/刷新/安全阀抑制都是**状态迁移**，
+                                            // 低频且必须可追溯——不论付费/免费都 warn。
+                                            ProbeFailureOutcome::MarkedUnhealthy => log::warn!(
+                                                "[Prober] {}:{} dead -> active-unhealthy for {}s: {error}",
+                                                node.ip,
+                                                node.port,
+                                                probe_cooldown_secs
+                                            ),
+                                            ProbeFailureOutcome::RefreshedUnhealthy => log::warn!(
+                                                "[Prober] {}:{} dead -> active-unhealthy refreshed for {}s: {error}",
+                                                node.ip,
+                                                node.port,
+                                                probe_cooldown_secs
+                                            ),
+                                            ProbeFailureOutcome::SuppressedLastNode => log::warn!(
+                                                "[Prober] {}:{} dead but active-health suppressed \
+                                                 (last eligible node): {error}",
+                                                node.ip,
+                                                node.port
+                                            ),
+                                            // 未达阈值属常态噪声：付费节点 warn，免费节点 debug。
+                                            ProbeFailureOutcome::BelowThreshold => {
+                                                let failures = probe_router
+                                                    .probe_consecutive_failures(&node.addr);
+                                                if free {
+                                                    log::debug!(
+                                                        "[Prober] {}:{} dead ({failures}/{probe_failure_threshold}): {error}",
+                                                        node.ip,
+                                                        node.port
+                                                    );
+                                                } else {
+                                                    log::warn!(
+                                                        "[Prober] {}:{} dead ({failures}/{probe_failure_threshold}): {error}",
+                                                        node.ip,
+                                                        node.port
+                                                    );
+                                                }
+                                            }
+                                            ProbeFailureOutcome::NodeGone => log::debug!(
+                                                "[Prober] {}:{} removed/derated during probe: {error}",
+                                                node.ip,
+                                                node.port
+                                            ),
+                                        }
+                                    } else if free {
+                                        log::debug!(
+                                            "[Prober] {}:{} dead (active health disabled): {error}",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "[Prober] {}:{} dead (active health disabled): {error}",
+                                            node.ip,
+                                            node.port
+                                        );
+                                    }
+                                }
+                                Ok((_node, None)) => {
+                                    // 探针自身跳过（信号量关闭）：不更新健康、
+                                    // 不记探测结果指标。
+                                    skipped += 1;
                                 }
                                 Err(e) => {
                                     log::warn!("[Prober] probe task join failed: {e:?}");
                                 }
                             }
+                        }
+                        // tick 结束再 sweep 一次（探测期间可能有冷却到期），并同步 gauge。
+                        // `active_unhealthy_len()` 是全表精确扫描，只在此处每 tick 调一次。
+                        probe_router.sweep_active_health();
+                        let unhealthy = probe_router.active_unhealthy_len() as u64;
+                        probe_metrics.set_active_probe_unhealthy(unhealthy);
+                        // 汇总一行：付费节点故障单独计数并升到 warn，免费池噪声不进 warn。
+                        if paid_dead > 0 {
+                            log::warn!(
+                                "[Prober] tick done probes={} healthy={healthy} degraded={degraded} \
+                                 dead={dead} paid_dead={paid_dead} skipped={skipped} unhealthy={unhealthy}",
+                                healthy + degraded + dead + skipped
+                            );
+                        } else {
+                            log::info!(
+                                "[Prober] tick done probes={} healthy={healthy} degraded={degraded} \
+                                 dead={dead} skipped={skipped} unhealthy={unhealthy}",
+                                healthy + degraded + dead + skipped
+                            );
                         }
                     }
                 }
@@ -1122,6 +1367,7 @@ async fn setup_gateway() -> Server {
     // ctrl_c everywhere; SIGTERM additionally on unix. Firing stops
     // background respawns (data-plane drain stays governed by pingora grace).
     let signal_tx = shutdown_tx;
+    let flush_on_shutdown = tenant_mgr.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -1138,6 +1384,13 @@ async fn setup_gateway() -> Server {
             let _ = tokio::signal::ctrl_c().await;
         }
         log::warn!("[Shutdown] signal received, stopping background respawns");
+        // OPT-R18 P2-2：停机前补一次 flush（best-effort）。
+        //
+        // 为什么不是"保证"：Windows 上 Pingora 不等待信号（OPT-R14），进程可能
+        // 直接消失，这条路径根本跑不到。真正的兜底是 5s 的周期 flush，把可能
+        // 丢失的窗口压到 ≤`TENANT_FLUSH_SECS` 秒。这里只是把优雅停机（Unix
+        // SIGTERM / Ctrl-C）的那部分窗口也消掉。
+        let _ = flush_on_shutdown.flush_dirty().await;
         let _ = signal_tx.send(true);
     });
     // 5. Pingora data plane.
@@ -1298,17 +1551,70 @@ mod tests {
     }
 
     #[test]
-    fn probe_skipped_result_is_dead_without_probing() {
-        // A3：信号量关闭时的跳过结果必须为 Dead（含可辨文案），构造过程不触网络。
-        match skipped_probe_result() {
-            prober::ProbeResult::Dead { error } => {
-                assert!(
-                    error.contains("semaphore closed"),
-                    "unexpected error: {error}"
-                );
-            }
-            other => panic!("skipped probe must be Dead, got {other:?}"),
-        }
+    fn probe_active_health_env_parsing_is_bounded() {
+        // 步骤 54：阈值/开关 env 解析必须钳制/回落，不允许 0 或超大值造成
+        // “一次抖动即永久摘除”。测试用唯一键名，避免与其它并行测试互踩。
+        std::env::set_var("R2T_PROBE_THRESHOLD", "0");
+        assert_eq!(
+            env_u32_clamped(
+                "R2T_PROBE_THRESHOLD",
+                router::DEFAULT_PROBE_FAILURE_THRESHOLD,
+                1,
+                router::PROBE_FAILURE_THRESHOLD_MAX
+            ),
+            1
+        );
+        std::env::set_var("R2T_PROBE_THRESHOLD", "999");
+        assert_eq!(
+            env_u32_clamped(
+                "R2T_PROBE_THRESHOLD",
+                router::DEFAULT_PROBE_FAILURE_THRESHOLD,
+                1,
+                router::PROBE_FAILURE_THRESHOLD_MAX
+            ),
+            router::PROBE_FAILURE_THRESHOLD_MAX
+        );
+        std::env::set_var("R2T_PROBE_THRESHOLD", "not-a-number");
+        assert_eq!(
+            env_u32_clamped(
+                "R2T_PROBE_THRESHOLD",
+                router::DEFAULT_PROBE_FAILURE_THRESHOLD,
+                1,
+                router::PROBE_FAILURE_THRESHOLD_MAX
+            ),
+            router::DEFAULT_PROBE_FAILURE_THRESHOLD
+        );
+        std::env::remove_var("R2T_PROBE_THRESHOLD");
+
+        std::env::set_var("R2T_PROBE_COOLDOWN", "0");
+        assert_eq!(
+            env_u64_clamped(
+                "R2T_PROBE_COOLDOWN",
+                router::DEFAULT_PROBE_UNHEALTHY_COOLDOWN_SECS,
+                1,
+                router::PROBE_UNHEALTHY_COOLDOWN_MAX_SECS
+            ),
+            1
+        );
+        std::env::set_var("R2T_PROBE_COOLDOWN", "999999999");
+        assert_eq!(
+            env_u64_clamped(
+                "R2T_PROBE_COOLDOWN",
+                router::DEFAULT_PROBE_UNHEALTHY_COOLDOWN_SECS,
+                1,
+                router::PROBE_UNHEALTHY_COOLDOWN_MAX_SECS
+            ),
+            router::PROBE_UNHEALTHY_COOLDOWN_MAX_SECS
+        );
+        std::env::remove_var("R2T_PROBE_COOLDOWN");
+
+        std::env::set_var("R2T_PROBE_ENABLED", "off");
+        assert!(!env_bool("R2T_PROBE_ENABLED", true));
+        std::env::set_var("R2T_PROBE_ENABLED", "YES");
+        assert!(env_bool("R2T_PROBE_ENABLED", false));
+        std::env::set_var("R2T_PROBE_ENABLED", "typo");
+        assert!(env_bool("R2T_PROBE_ENABLED", true));
+        std::env::remove_var("R2T_PROBE_ENABLED");
     }
 
     #[tokio::test]

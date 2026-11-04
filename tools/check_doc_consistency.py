@@ -55,6 +55,24 @@ ALLOWLIST = [
     # 故必须被门禁守住，否则该表会静默漂移。
     "docs/CAPABILITY-AUDIT.md",
     "docs/SUPPLY_CHAIN.md",
+    # 选路基线：它的**主要数字**（策略成功率等）不归本门管，由
+    # `tools/check_routing_baseline.py` 逐格比对回放台输出。登记到本门的
+    # 唯一目的是：若有人在这份文档里顺手写「338 单测」，那个数字也得准。
+    # 两份门各守一类数字，互不重叠（详见该文档 §1 与 §6）。
+    "docs/ROUTING_BASELINE.md",
+    # 组件表：模块集合与每行单测数由 `check_components_docs.py` 守。登记到本门
+    # 是为了守住"顺手写下的总数"——该文件此前写着「156 通过＋4 ignored」，
+    # 而基线早已是 338/8，且它不在任何门禁范围内，于是自由漂移了十几轮。
+    "docs/COMPONENTS.md",
+    # 技术说明：§7 门禁定义里写着单测总数。此前它**不在任何门禁范围内**，
+    # 于是中英两版分别漂到 338 与 156（差 182 条）而无人察觉——一份文档自己
+    # 跟自己矛盾了两百条测试。登记后两处口径都归本门守。
+    "docs/TECHNICAL.md",
+    # 覆盖率基线文档：它的**覆盖率数字**由 `tools/check_coverage_baseline.py`
+    # 逐字比对 `docs/coverage_baseline.json` 守着（文档↔JSON 双向）。
+    # 登记到本门的唯一目的与上面几个文件同类——守住"顺手写下的总数"
+    # （例如有人在 §4 里写「单测 355 个」，那个数字也得准）。
+    "docs/COVERAGE_BASELINE.md",
 ]
 
 # 历史文件：记录的是**某轮收官时的真实状态**。
@@ -86,6 +104,18 @@ EXPECTED_KEYS = {
     # 该数字若漂移，本文件自身就失去说服力。
     "docs/CAPABILITY-AUDIT.md": {"tests"},
     "docs/SUPPLY_CHAIN.md": {"tests"},
+    # 只声明 `tests`：本文件不声称 live 数。它的策略成功率/时延由
+    # `check_routing_baseline.py` 负责，本门不重复断言（也断言不了——
+    # 那需要跑回放）。
+    "docs/ROUTING_BASELINE.md": {"tests"},
+    # 组件表按模块列单测数（1~2 位），不声称总量与 live 数；只守 tests 口径。
+    "docs/COMPONENTS.md": {"tests"},
+    # 只声明 `tests`：§7 的中英两处都写单测总数，但不写「N 真 live」
+    # （那 4 条是 `--ignored` 手工跑的，本门不重复断言）。
+    "docs/TECHNICAL.md": {"tests"},
+    # 只声明 `tests`：本文件不声称 live 数，也不出现「N 单测」以外的
+    # 数字断言（覆盖率数字由 check_coverage_baseline.py 负责）。
+    "docs/COVERAGE_BASELINE.md": {"tests"},
 }
 
 
@@ -107,6 +137,10 @@ def parse_baseline() -> dict[str, int]:
     return {
         "tests": grab("单元测试通过数"),
         "live": grab("其中：真 live 测试"),
+        # 「忽略测试数」本门不比对（活文档不声称它），但
+        # `check_components_docs.py` 需要它来断言「按模块统计的单测之和 ==
+        # 通过数 + 忽略数」。放在这里是为了让**解析基线这件事只有一份实现**。
+        "ignored": grab("忽略测试数"),
     }
 
 

@@ -1,0 +1,256 @@
+{
+  "_comment": "OPT-R18 P2-5 覆盖率基线。由 tools/check_coverage_baseline.py --refresh 从 `cargo llvm-cov --json` 生成，勿手改。",
+  "_tolerance_pp": 1.0,
+  "_metric": "lines",
+  "_tool": "cargo-llvm-cov 0.9.1 + llvm-tools-preview（rustc 1.99.1 / MSVC x86_64-pc-windows-msvc）",
+  "_command": "cargo llvm-cov --locked --summary-only --json",
+  "_platform": "x86_64-pc-windows-msvc",
+  "_toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "_totals": {
+    "lines": 74.1481,
+    "regions": 75.294,
+    "functions": 76.9293
+  },
+  "_counts": {
+    "lines": {
+      "count": 10800,
+      "covered": 8008
+    },
+    "regions": {
+      "count": 17259,
+      "covered": 12995
+    },
+    "functions": {
+      "count": 1231,
+      "covered": 947
+    }
+  },
+  "_files_count": 45,
+  "files": {
+    "admin/dto.rs": {
+      "lines": 82.05128205128204,
+      "regions": 82.5,
+      "functions": 75.0
+    },
+    "admin/handlers_node.rs": {
+      "lines": 82.22222222222221,
+      "regions": 87.57062146892656,
+      "functions": 86.95652173913044
+    },
+    "admin/handlers_ops.rs": {
+      "lines": 10.144927536231885,
+      "regions": 9.230769230769232,
+      "functions": 14.285714285714285
+    },
+    "admin/handlers_tenant.rs": {
+      "lines": 49.333333333333336,
+      "regions": 52.307692307692314,
+      "functions": 70.0
+    },
+    "admin/mod.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "admin/mw.rs": {
+      "lines": 87.5,
+      "regions": 85.36585365853658,
+      "functions": 69.23076923076923
+    },
+    "analytics.rs": {
+      "lines": 58.26330532212886,
+      "regions": 59.09090909090909,
+      "functions": 50.0
+    },
+    "bandit.rs": {
+      "lines": 84.58333333333333,
+      "regions": 88.98216159496327,
+      "functions": 93.02325581395348
+    },
+    "ch_sink.rs": {
+      "lines": 49.195402298850574,
+      "regions": 53.881987577639755,
+      "functions": 50.0
+    },
+    "circuit_breaker.rs": {
+      "lines": 55.528255528255535,
+      "regions": 55.769230769230774,
+      "functions": 70.58823529411765
+    },
+    "fingerprint.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "free_pool/mod.rs": {
+      "lines": 92.3913043478261,
+      "regions": 88.18897637795276,
+      "functions": 76.92307692307693
+    },
+    "free_pool/registry.rs": {
+      "lines": 95.95588235294117,
+      "regions": 94.63806970509383,
+      "functions": 95.23809523809523
+    },
+    "free_pool/sources.rs": {
+      "lines": 90.0,
+      "regions": 91.34125636672326,
+      "functions": 88.37209302325581
+    },
+    "free_pool/verify.rs": {
+      "lines": 94.39252336448598,
+      "regions": 91.80790960451978,
+      "functions": 100.0
+    },
+    "free_pool/worker.rs": {
+      "lines": 13.59773371104816,
+      "regions": 14.209591474245114,
+      "functions": 9.090909090909092
+    },
+    "gateway/bandit.rs": {
+      "lines": 93.19727891156462,
+      "regions": 94.33198380566802,
+      "functions": 86.36363636363636
+    },
+    "gateway/hooks.rs": {
+      "lines": 0.0,
+      "regions": 0.0,
+      "functions": 0.0
+    },
+    "gateway/mod.rs": {
+      "lines": 88.31168831168831,
+      "regions": 88.28828828828829,
+      "functions": 87.5
+    },
+    "gateway/policy.rs": {
+      "lines": 75.0,
+      "regions": 82.75862068965517,
+      "functions": 71.42857142857143
+    },
+    "gateway/socks.rs": {
+      "lines": 5.847953216374268,
+      "regions": 3.5398230088495577,
+      "functions": 11.111111111111112
+    },
+    "gateway/upstream.rs": {
+      "lines": 97.72727272727273,
+      "regions": 98.55072463768117,
+      "functions": 100.0
+    },
+    "geo.rs": {
+      "lines": 82.89473684210526,
+      "regions": 79.74683544303798,
+      "functions": 83.33333333333334
+    },
+    "janitor.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "main.rs": {
+      "lines": 32.59615384615385,
+      "regions": 32.18192285549799,
+      "functions": 58.51063829787234
+    },
+    "metrics/mod.rs": {
+      "lines": 96.49122807017544,
+      "regions": 96.2406015037594,
+      "functions": 92.85714285714286
+    },
+    "metrics/record.rs": {
+      "lines": 62.724935732647815,
+      "regions": 65.96774193548387,
+      "functions": 75.36231884057972
+    },
+    "metrics/render.rs": {
+      "lines": 97.66187050359714,
+      "regions": 98.32775919732441,
+      "functions": 100.0
+    },
+    "model.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "net_connector.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "node_registry.rs": {
+      "lines": 87.92341678939617,
+      "regions": 90.09393680614859,
+      "functions": 86.58536585365853
+    },
+    "pool.rs": {
+      "lines": 94.27609427609428,
+      "regions": 95.17819706498952,
+      "functions": 88.57142857142857
+    },
+    "prober.rs": {
+      "lines": 89.80582524271847,
+      "regions": 91.21813031161473,
+      "functions": 92.3076923076923
+    },
+    "redis_shard.rs": {
+      "lines": 94.11764705882352,
+      "regions": 96.3855421686747,
+      "functions": 100.0
+    },
+    "router.rs": {
+      "lines": 96.29629629629629,
+      "regions": 92.37288135593221,
+      "functions": 100.0
+    },
+    "router/buckets.rs": {
+      "lines": 100.0,
+      "regions": 100.0,
+      "functions": 100.0
+    },
+    "router/health.rs": {
+      "lines": 94.11764705882352,
+      "regions": 94.5,
+      "functions": 90.9090909090909
+    },
+    "router/node_mgmt.rs": {
+      "lines": 82.35294117647058,
+      "regions": 81.70347003154575,
+      "functions": 70.0
+    },
+    "router/quarantine.rs": {
+      "lines": 95.50561797752808,
+      "regions": 95.07042253521126,
+      "functions": 93.75
+    },
+    "router/select.rs": {
+      "lines": 97.96954314720813,
+      "regions": 96.36963696369637,
+      "functions": 96.42857142857143
+    },
+    "socks_bridge.rs": {
+      "lines": 88.93709327548807,
+      "regions": 89.42786069651741,
+      "functions": 86.53846153846155
+    },
+    "socks_handshake.rs": {
+      "lines": 93.82183908045978,
+      "regions": 94.29695181907572,
+      "functions": 78.57142857142857
+    },
+    "telemetry.rs": {
+      "lines": 53.70370370370371,
+      "regions": 51.369863013698634,
+      "functions": 59.09090909090909
+    },
+    "tenant.rs": {
+      "lines": 91.78082191780823,
+      "regions": 91.93006052454606,
+      "functions": 90.52631578947368
+    },
+    "vendor_arbitrage.rs": {
+      "lines": 81.81818181818183,
+      "regions": 81.72588832487311,
+      "functions": 70.96774193548387
+    }
+  }
+}

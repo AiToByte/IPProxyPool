@@ -17,7 +17,7 @@
 
 | 类别 | 数量 | 处置 |
 | --- | --- | --- |
-| 漏洞（vulnerability） | **0** | 已清零：pingora 0.6→0.9.0 + rustls 0.23.46（§9；首次评估 4 个 + DB 刷新新增 rustls 4 个） |
+| 漏洞（vulnerability） | **4**（全部显式豁免） | 均为 **zstd 生态**（RUSTSEC-2026-0391/0398/0403/0410），**不可达 + 上游无补丁**，逐条论证见 §10。此前的 8 个已由 pingora 0.9.0 + rustls 0.23.46 清零（§9） |
 | 无维护（unmaintained） | 4（首次 7） | 全部传递依赖、上游无修复版；deny 策略 `unmaintained = "workspace"`（直依即红，见 §4/§9） |
 | Unsound（audit 补充） | 0（首次 3） | atty/lru 已随 pingora 升级退出依赖树 |
 | Yanked | 1（yoke-derive 0.8.3） | **已修**：`cargo update -p` 到 0.8.4 |
@@ -80,7 +80,7 @@ prometheus/protobuf 链）。但 0.x 的 minor 升级即 breaking change，
 
 ### 3.3 升级验收标准（届时执行）
 
-1. 编译通过 + 全量门禁绿（326 单测、clippy、15 门）。
+1. 编译通过 + 全量门禁绿（360 单测、clippy、21 门）。
 2. Windows 300s+ 存活实测（OPT-R14 方法复用）。
 3. 端到端压测复跑（`tools/bench_gateway.py`），QPS 不低于本次基线。
 4. `cargo deny check` + `cargo audit` 全绿（含 unmaintained 重 triage）。
@@ -197,7 +197,7 @@ Linux 分支（消 1 个 unmaintained）。
 - unmaintained 警告：10 → **4**（atty/daemonize/proc-macro-error/yaml-rust
   随升级退出树；atty unsound + lru×2 unsound 同步消失）
 - 重复版本：20 → **17** 个包；许可证 allowlist 覆盖 373 个 package（门未动即绿）
-- `cargo fmt`/`clippy -D warnings`/`test --locked`（**326 passed / 7 ignored**）/
+- `cargo fmt`/`clippy -D warnings`/`test --locked`（**338 passed / 8 ignored**）/
   `bench --no-run` 全绿
 
 **deny.toml 策略配套变更**（非放行，是策略落地）：
@@ -213,7 +213,7 @@ Linux 分支（消 1 个 unmaintained）。
 
 **§3.3 验收标准对照（当场执行）**：
 
-1. ✅ 编译 + 326 单测 + clippy + fmt（见上）。
+1. ✅ 编译 + 360 单测 + clippy + fmt（见上）。
 2. ✅ Windows 存活实测：dev 实例（debug build）live E2E 全程存活 **397s**
     （2026-10-17 11:25:28Z 起至 11:32:05Z taskkill），期间 admin API 批次
     正常响应；P0 kill 演练（C1 口径）已于 2026-10-17 下午复跑通过——
@@ -230,3 +230,90 @@ Linux 分支（消 1 个 unmaintained）。
     10,000 QPS 配额门整形为 ~10k，429 属预期门控行为；地板
     156,287 / 163,727 / 166,373 QPS 远高于 e2e，链路非瓶颈）。
 4. ✅ deny + audit 全绿（本节）。
+
+
+---
+
+## 10. 2026-11-01：zstd 生态 4 条公告的处置（**豁免**，不是修复）
+
+### 10.1 为什么本轮才发现
+
+`check_supply_chain.py` 此前每轮都因**拉不到 RustSec DB** 而跳过（离线），
+所以这 4 条公告一直没有被检查到——门禁"绿"是因为没跑，不是因为没问题。
+本轮 `cargo deny` 用**缓存**库跑通后才暴露。**这本身是一条教训**：
+"跳过"与"通过"在报告里必须能区分（已改进门禁，见 §10.5）。
+
+### 10.2 清单
+
+| Advisory | 受影响符号 | 本仓版本 | 补丁版本 | 标题 |
+| --- | --- | --- | --- | --- |
+| RUSTSEC-2026-0391 | `zstd::stream::raw::{Encoder,Decoder}::with_context` | zstd 0.13.3 / 0.14.0 | zstd ≥0.14.3 | 复用上下文时废弃流的数据泄漏到下一个流 |
+| RUSTSEC-2026-0398 | `zstd_safe::Seekable::decompress` | zstd-safe 7.x | zstd-safe ≥8.2.0 | 越界偏移时把 `Vec` 长度设到容量之外 |
+| RUSTSEC-2026-0403 | `zstd_safe::DCtx::decompress_stream` | zstd-safe 7.x | zstd-safe ≥8.2.0 | 旧式帧流式解压失败时暴露未初始化内存 |
+| RUSTSEC-2026-0410 | zstd-sys 的 wasm32 malloc/free shim | zstd-sys 2.x | zstd-sys ≥2.1.2 | 分配失败时破坏内存 |
+
+依赖链（`cargo tree -i` 实证，两个 zstd 版本都在树里）：
+- `zstd 0.13.3` ← `pingora-header-serde 0.9.0`（要求 `zstd ^0.13.1` + `zstd-safe ^7.1.0`）
+- `zstd 0.14.0` ← `pingora-core 0.9.0`
+
+### 10.3 为什么是「不可修」而不是「没升」
+
+- 公告的 `patched` 只有 `zstd >= 0.14.3` / `zstd-safe >= 8.2.0` / `zstd-sys >= 2.1.2`；
+  **0.13.x 与 zstd-safe 7.x 线上不存在修复版**，而 pingora-header-serde 锁死在这两条线。
+- `cargo search pingora` 实测：**`pingora` 最新就是 0.9.0**（即当前版本）。
+  ⇒ 没有任何含修复的 pingora 可升。
+
+### 10.4 为什么是「不可达」（源码级调用图，2026-11-01 实测）
+
+`grep` 于 `~/.cargo/registry/src/*/pingora-*/src/` 全树，三个受影响符号命中数**均为 0**：
+
+- pingora-header-serde 实际只用 `zstd::dict` + `zstd_safe::{CCtx,DCtx}::create`
+  + `decompress_to_buffer`（**不是** `decompress_stream`）；
+- 公告原文明确 `zstd::stream::read::Decoder` / `decode_all` / bulk API **不受 0403 影响**；
+- 0410 仅 wasm32，本仓只构建 x86_64-windows / x86_64-linux ⇒ **平台不可达**；
+- 本仓自身代码对 zstd **零引用**（`grep -rn zstd src/` 无命中），不存在第二条路径。
+
+### 10.5 ⚠️ 一次**失败的方法论**（留档，勿重犯）
+
+本想把"受影响符号不在二进制里"作为**硬证据**：
+
+1. `llvm-nm` 查 PE 符号 → `with_context`/`Seekable`/`decompress_stream` 全为 0，
+   看着很完美；**但对照组（确定被调用的 `decompress_to_buffer`）也是 0**
+   ⇒ 该方法对 Windows PE 无效，前面的"证据"一文不值。
+2. 改用 PDB 字符串搜索后对照组成立（8），但 `with_context`(8) / `Seekable`(1)
+   的命中来自**通用名污染**——`with_context` 实际来自 `anyhow`（完全无关的 crate）。
+
+⇒ 最终证据是**源码级调用图**，不是符号级。只有 `decompress_stream` 的符号级
+读数（0）是干净的、且与源码结论一致。**教训**：任何"未命中即安全"的检查，
+必须先跑一个**必然命中**的对照；没有对照的 0 命中等于没有检查。
+
+### 10.6 豁免的退出条件（不会变成僵尸）
+
+`deny.toml` 里 `unused-ignored-advisory = "deny"`：一旦 pingora 升级到含修复的
+版本（届时这些 advisory 不再命中），门禁**自动报错**，强制删掉对应 ignore。
+实测：注入一条不命中的 `RUSTSEC-2020-0001` ⇒ `error[advisory-not-detected]` 判红。
+
+### 10.7 门禁改进：把「不确定」变成「确定」（三次迭代，前两次都错了）
+
+**第一版（错）**：裸跑 `cargo audit`，非 0 即红。
+⇒ 离线机器上这道门**永远红**（audit 要 git fetch 公告库）。假红会被学会忽略，
+等于把安全门降级成噪声。
+
+**第二版（错）**：字符串匹配网络错误特征串，是则 SKIP。
+⇒ **不稳定**：同一台机器、同一份代码，实测**时绿时红**（网络重试行为不同，
+有时报错文案不含特征串）。靠解析 stderr 判断"失败的性质"本身就是脆弱的。
+
+**第三版（现行）**：把不确定性从根上消掉——**全程离线 + 两个工具同源 + 豁免单一真源**：
+
+| 措施 | 解决的问题 |
+| --- | --- |
+| `cargo audit --no-fetch --stale` | 彻底不联网 ⇒ 结果确定，不再有网络抖动 |
+| `-d ~/.cargo/advisory-dbs/advisory-db-*` | **两个工具的默认库不是同一个**：cargo-deny 用 `~/.cargo/advisory-dbs/advisory-db-<hash>`，cargo-audit 默认 `~/.cargo/advisory-db`。本机实测后者是**旧快照**（连 RUSTSEC-2026-0391 都没有）⇒ 不指定的话 audit 会在旧库上得出"0 漏洞"的**假绿**，比不跑更危险 |
+| `--ignore` 列表从 `deny.toml` 读 | audit 不读 `deny.toml`。两套豁免清单必然漂移（"deny 说豁免了、audit 说没豁免"，一个绿一个红，谁对说不清）⇒ 把 deny.toml 当唯一真源 |
+
+离线后失败原因只剩"真的发现漏洞"，故非 0 即判红，**不需要再猜字符串**；
+库不存在（首次运行/未同步）则显式 SKIP 并说明"本次没有做 audit 侧校验，
+advisories 仍由 cargo deny 覆盖"。
+
+**验证**：连续 3 次 exit 0（稳定）；删掉 0410 的 ignore ⇒ 判红并指名
+`RUSTSEC-2026-0410`（判别力）；`unused-ignored-advisory = "deny"` 保证豁免不会变僵尸。

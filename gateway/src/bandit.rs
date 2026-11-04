@@ -753,4 +753,155 @@ mod tests {
             assert!(s.is_finite(), "t={t} 的打分必须有限，实测 {s}");
         }
     }
+
+    // ---- OPT-R18 P1-5：回放台跨语言一致性 ----
+
+    /// 打印回放台所需的黄金向量（**仅生成用**，由 `--ignored` 触发）。
+    ///
+    /// 为什么由 Rust 生成而不是 Python 生成：Python 侧的 LinUCB 是**镜像实现**，
+    /// 若两边都手写期望值，同一个理解错误会同时通过两份断言。让被测系统的
+    /// 真实实现产出基准值，镜像侧只能去对齐它——这才是真的跨语言校验。
+    #[test]
+    #[ignore = "生成工具：cargo test -- --ignored --nocapture print_replay_parity_vectors"]
+    fn print_replay_parity_vectors() {
+        use serde_json::json;
+        let cases = parity_cases();
+        let mut out = Vec::new();
+        for (name, ctx, tier, t, rewards) in cases {
+            let arm = BanditArm::new("10.0.0.1:8080".to_string(), tier.to_string());
+            for r in &rewards {
+                arm.update(&ctx, *r);
+            }
+            let score = arm.compute_ucb_score(&ctx, DEFAULT_ALPHA, t);
+            // 紧凑表示：1000 次同值奖励若逐项展开，fixture 会膨胀到 1000+ 行，
+            // diff 里全是噪声。`{"value","times"}` 两种形态两侧解析器都支持。
+            let rewards_json = if rewards.len() > 8 && rewards.windows(2).all(|w| w[0] == w[1]) {
+                json!({ "value": rewards[0], "times": rewards.len() })
+            } else {
+                json!(rewards)
+            };
+            out.push(json!({
+                "name": name,
+                "context": [ctx[0], ctx[1], ctx[2], ctx[3]],
+                "tier": tier,
+                "t": t,
+                "rewards": rewards_json,
+                "score": score,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "alpha": DEFAULT_ALPHA,
+                "note": "由 gateway/src/bandit.rs::print_replay_parity_vectors 生成；改公式必须重新生成",
+                "cases": out,
+            }))
+            .expect("serialize")
+        );
+    }
+
+    /// 黄金向量必须与 `tools/replay/linucb_parity.json` 逐位一致。
+    ///
+    /// 这是**双保险的一半**：本测试锁 Rust 侧，`tools/check_replay_parity.py`
+    /// 锁 Python 侧。任何一侧改了公式而没同步，对应一侧立即判红——而不是
+    /// 等到某天有人拿回放报告做决策时才发现两边算的不是同一件事。
+    #[test]
+    fn opt_r18_replay_parity_vectors_match_fixture() {
+        let raw = include_str!("../../tools/replay/linucb_parity.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).expect("parity json must parse");
+        let alpha = doc["alpha"].as_f64().expect("alpha");
+        assert!(
+            (alpha - DEFAULT_ALPHA).abs() < 1e-12,
+            "fixture alpha {alpha} != DEFAULT_ALPHA {DEFAULT_ALPHA}"
+        );
+        let cases = doc["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 6, "黄金向量至少覆盖 6 类场景");
+        for c in cases {
+            let name = c["name"].as_str().expect("name");
+            let arr = c["context"].as_array().expect("context");
+            let ctx = VectorD::new(
+                arr[0].as_f64().unwrap(),
+                arr[1].as_f64().unwrap(),
+                arr[2].as_f64().unwrap(),
+                arr[3].as_f64().unwrap(),
+            );
+            let tier = c["tier"].as_str().expect("tier");
+            let t = c["t"].as_u64().expect("t");
+            let want = c["score"].as_f64().expect("score");
+            let arm = BanditArm::new("10.0.0.1:8080".to_string(), tier.to_string());
+            for r in expand_rewards(&c["rewards"]) {
+                arm.update(&ctx, r);
+            }
+            let got = arm.compute_ucb_score(&ctx, alpha, t);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "case `{name}`: rust={got:.17} fixture={want:.17}"
+            );
+        }
+    }
+
+    /// 展开 fixture 里的 `rewards`：既接受 `[0.9, 0.9]`，也接受
+    /// `{"value": 0.9, "times": 1000}`（长序列的紧凑写法）。
+    ///
+    /// 只支持这两种形态、不做猜测：形态不认识就 panic，避免"静默当成空数组"
+    /// 让断言变成永远成立的假绿。
+    fn expand_rewards(v: &serde_json::Value) -> Vec<f64> {
+        match v {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|x| x.as_f64().expect("reward must be f64"))
+                .collect(),
+            serde_json::Value::Object(map) => {
+                let value = map
+                    .get("value")
+                    .and_then(|x| x.as_f64())
+                    .expect("rewards.value");
+                let times = map
+                    .get("times")
+                    .and_then(|x| x.as_u64())
+                    .expect("rewards.times");
+                vec![value; times as usize]
+            }
+            other => panic!("unsupported rewards form: {other:?}"),
+        }
+    }
+
+    /// 黄金向量的场景清单（生成与断言共用，避免两处漂移）。
+    #[allow(clippy::type_complexity)]
+    fn parity_cases() -> Vec<(&'static str, VectorD, &'static str, u64, Vec<f64>)> {
+        let ctx = VectorD::new(0.3, 1.0, 0.5, 0.2);
+        let high_risk = VectorD::new(0.9, 1.0, 0.0, 0.2);
+        vec![
+            ("fresh_dc", ctx, "dc", 1, vec![]),
+            ("fresh_residential", ctx, "residential", 1, vec![]),
+            // free 档：cost 0 + FREE_RISK_PREMIUM，是唯一会走额外减项的分支。
+            ("fresh_free", ctx, "free", 1, vec![]),
+            (
+                "trained_dc_t100",
+                ctx,
+                "dc",
+                100,
+                vec![1.0, 0.9, 0.8, 1.0, 0.95],
+            ),
+            // 20 次满分 ⇒ theta 可能越过 MAX_MEAN_REWARD，锁裁剪分支。
+            ("clamped_theta", ctx, "residential", 5, vec![1.0; 20]),
+            // 1000 次 ⇒ free 档恰好在第 1000 次触发一次遗忘（blend 0.9）。
+            (
+                "free_forgetting_at_1k",
+                ctx,
+                "free",
+                1_500,
+                vec![0.9; 1_000],
+            ),
+            (
+                "high_risk_ctx",
+                high_risk,
+                "datacenter",
+                500,
+                vec![1.0, 0.0, 0.2, 1.0, 0.5, 1.0],
+            ),
+            // 大 t：探索项 ln(t) 的量级分支。
+            ("large_t", ctx, "dc", 1_000_000, vec![0.7, 0.7]),
+        ]
+    }
 }

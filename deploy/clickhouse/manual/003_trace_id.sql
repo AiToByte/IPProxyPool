@@ -1,0 +1,80 @@
+-- ============================================================================
+-- OPT-R18 P1-1 修正：补 `trace_id` 列（GW-6 链路追踪 ID 落地）
+-- ============================================================================
+--
+-- 【问题：声明即失实】
+-- `plan/2026年10月27日-OPT-R18高质量迭代方向评估.md` §2 P1-1 与
+-- `docs/CAPABILITY-AUDIT.md` §4 都声称「trace_id 补进数据面日志，**与 CH 遥测
+-- 同键互查**」。实测（2026-10-28）发现该能力**只落地了一半**：
+--
+--   * `TelemetryEvent.trace_id` **存在**（Redis Stream 的 JSON payload 里带着）；
+--   * `TelemetryRow` **没有** `trace_id` 字段 ⇒ `From<&TelemetryEvent>`
+--     转换时该字段被**完整丢弃**；
+--   * CH 表 `proxy_telemetry_log` **没有** `trace_id` 列。
+--
+-- ⇒ 排障时「CH 里有这条 502、日志里对不上是哪行」这一**最初要解决的问题
+-- 依然存在**：日志侧有 trace_id，仓库侧无 trace_id，两边**对不上**。
+-- 「同键互查」在落地仓库这一半是失实的。
+--
+-- 【为什么列必须补在仓库侧】
+-- 排障的入口是「拿到一个 trace_id → 去仓库捞这条请求的完整上下文」。
+-- 只在日志侧有 trace_id，等于「有 ID 但没有 ID 可查的地方」——
+-- 而日志会滚动、会丢（`log/*.log` 不入库、容器日志有保留期）。
+-- 仓库是**长期留存**的那一半（同表 90 天 TTL），互查必须以仓库为终点。
+--
+-- 【列类型选择】
+-- 用普通 `String`，**不用** `LowCardinality(String)`：
+--   * `tenant_id`/`provider`/`country`/`tier` 是低基数字典（数十~数百取值），
+--     LowCardinality 用字典编码省空间且比较快；
+--   * `trace_id` 是 `{unix_ms}-{pid}-{seq}`，**每请求一个取值**——基数与行数
+--     同阶。低基数优化在这里不但无益，还会因为「几乎全是新值」而退化成
+--     「字典里没有 → 退化为普通 String 存储」，白白多一层开销。
+--
+-- 【排序键：故意不进】
+-- `ORDER BY (provider, country, event_time)` 与唯一查询模式
+-- （`analytics.rs` 的 `sla_sql`）对齐。trace_id 是**点查键**而非过滤前缀，
+-- 放进排序键会让 SLA 查询的主键剪枝彻底失效（provider/country 不再是前缀）
+-- ——为排障便利牺牲主查询性能不划算。点查靠下面的 bloom_filter 跳过索引。
+--
+-- 【跳过索引：bloom_filter 而非 set()】
+-- trace_id 基数极高，**不能用** `set(N)`（`001_schema.sql` 里 provider/country
+-- 用的就是 `set()`）——set 存的是「取值集合」，高基数下每个 granule 的集合
+-- 会膨胀到与数据同阶，索引体积失控。`bloom_filter` 正是为「高基数 + 等值
+-- 点查」设计的：误判率可调、体积固定。GRANULARITY 1 让每个 granule 一条
+-- 索引条目——点查场景下索引越细剪枝越准（代价是索引条目变多）。
+--
+-- 【幂等性 / 执行方式】
+-- 用 `ADD COLUMN IF NOT EXISTS` / `ADD INDEX IF NOT EXISTS`：重复执行无副作用。
+--
+-- **本文件必须手动执行，且只在「存量部署」上执行**：
+--   * 全新部署无需跑本文件——`001_schema.sql` 已含 `trace_id` 列与索引；
+--   * 存量部署需跑一次（`001` 用的是 `CREATE TABLE IF NOT EXISTS`，表已存在
+--     时它不会补列）。
+--
+-- 为什么放在 `manual/` 而不是顶层：本目录顶层**所有** `.sql` 都会被
+-- `docker-entrypoint-initdb.d` 自动执行（详见 `001_schema.sql` 末尾的
+-- 「目录约定」段与 `manual/002_reorder.sql` 头部的实测证据）。
+-- 本文件虽然是幂等的、自动跑也无害，但**放在顶层会掩盖一个真问题**——
+-- 让人误以为「只要在顶层加脚本，存量部署就会自动升级」。事实相反：
+-- initdb 只在**数据目录为空**时执行，存量部署永远跑不到。
+-- 把它放 `manual/` 是让「需要人执行」这件事在目录结构上就看得见。
+-- ============================================================================
+
+ALTER TABLE proxy.proxy_telemetry_log
+    ADD COLUMN IF NOT EXISTS trace_id String AFTER event_time;
+
+-- 点查索引：按 trace_id 捞行时跳过不含该 ID 的 granule。
+-- 不加索引的话，按 trace_id 查会退化为**分区全扫描**（90 天 TTL 的表），
+-- 而排障恰恰是最需要「秒级返回」的时候——一个查 30 秒的排障接口等于没有。
+ALTER TABLE proxy.proxy_telemetry_log
+    ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1;
+
+-- ----------------------------------------------------------------------------
+-- 【验证】执行后应能查到列与索引：
+--   DESCRIBE TABLE proxy.proxy_telemetry_log;
+--   SHOW CREATE TABLE proxy.proxy_telemetry_log;
+--
+-- 【存量数据】新增列对老行取值为空串 `''`——这是 ALTER ADD COLUMN 的语义
+-- （元数据操作，不重写存量分区，瞬间完成）。老行本来就没有 trace_id，
+-- 空串是**如实**表达「该行产生于 trace_id 落地之前」，不是数据损坏。
+-- ----------------------------------------------------------------------------

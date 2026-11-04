@@ -53,7 +53,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 RULES = REPO / "deploy" / "prometheus" / "rules.yml"
-METRICS_RS = REPO / "gateway" / "src" / "metrics.rs"
+SRC_DIR = REPO / "gateway" / "src"
+# `metrics` 已拆成目录模块（`metrics/`：mod/record/render/tests）。路径解析交给
+# 共享助手 `_rustsrc.module_source`——本门原先写死 `metrics.rs`，拆完立刻报
+# "expected files not found"。见 tools/_rustsrc.py 的说明（同一根因已犯三次）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _rustsrc import module_source  # noqa: E402
 
 # Prometheus 内置序列（由 Prometheus 自身产生，网关不渲染）。
 BUILTIN_SERIES = {"up", "scrape_duration_seconds", "scrape_samples_scraped"}
@@ -113,7 +118,7 @@ def load_metric_labels() -> tuple[set[str], dict[str, set[str]]]:
     另有 `# HELP foo_bar ...` 里**不带标签**的裸序列（如 `quarantine_nodes`），
     它们在 labels 里没有条目，聚合校验时按「无标签」处理。
     """
-    text = METRICS_RS.read_text(encoding="utf-8")
+    text = module_source(SRC_DIR, "metrics")
 
     names: set[str] = set(re.findall(r"#\s+HELP\s+([a-zA-Z_0-9]+)", text))
 
@@ -194,7 +199,7 @@ def metrics_in(expr: str, label_names: set[str]) -> set[str]:
 
 
 def main() -> int:
-    if not METRICS_RS.is_file() or not RULES.is_file():
+    if not module_source(SRC_DIR, "metrics") or not RULES.is_file():
         print("[check-promql] ERROR: expected files not found", file=sys.stderr)
         return 2
 

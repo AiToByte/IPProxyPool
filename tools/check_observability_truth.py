@@ -48,13 +48,52 @@ Alertmanager 容器也在（OPT-R17 起）默认启动，但
 
 本门锁：`OPERATION.md` 必须写明三段链路各自的真实状态。
 
+────────────────────────────────────────────────────────────────────────
+失实 C：CH initdb 目录里放了"声称手动、实际自动"的迁移脚本（2026-10-28）
+────────────────────────────────────────────────────────────────────────
+
+实测：`deploy/clickhouse/002_reorder.sql` 的文件头写着
+
+    **执行方式：手动、一次性。** 本文件不会被 `docker-entrypoint-initdb.d`
+    自动执行（它只跑 `001_schema.sql`）。
+
+**这是错的。** CH 官方 `/entrypoint.sh` 的实现是：
+
+    for f in /docker-entrypoint-initdb.d/*; do
+        case "$f" in *.sql) clickhouse-client --multiquery < "$f" ;; esac
+    done
+
+即顶层**所有** `.sql` 按文件名顺序全部自动执行（子目录不递归）。
+而 `docker-compose.yml` 把**整个** `deploy/clickhouse/` 挂到该目录。
+
+危害比"多跑一次"严重得多——`002` 是破坏性的（`CREATE _v2` → `INSERT SELECT`
+全表复制 → `RENAME` 换名），且 `_v2` 的列清单是**写死的快照**：
+此后 `001_schema.sql` 新增的列（如 `trace_id`）会在 `RENAME` 后**被覆盖丢失**，
+得到一个缺列的仓库表，而代码侧照常写入 ⇒ 插入失败或字段静默丢弃。
+`003_trace_id.sql` 虽在 `002` 之后执行，但顺序依赖本身就不该存在。
+
+本门锁：`deploy/clickhouse/` 顶层**只允许** `001_schema.sql`（幂等的权威
+schema）。一次性迁移脚本必须放 `manual/`。用**白名单**而非黑名单——
+黑名单只能拦住已知的那一个，将来新增迁移脚本照样会被自动执行。
+
+────────────────────────────────────────────────────────────────────────
+失实 D：迁移脚本与权威 schema 对同一列给出不同类型
+────────────────────────────────────────────────────────────────────────
+
+全新部署走 `001_schema.sql`，存量部署走 `manual/*.sql` 的就地 `ALTER`。
+两条路径若对同一列给出不同类型，会得到**两种不同的 schema**，而代码只有一份。
+两者都能建表成功、都不报错，只在「新环境正常、老环境异常」时暴露——
+而那时排查方向通常被误导到代码而不是 schema。
+
+本门锁：`MIGRATION_TYPE_CONSISTENCY` 登记的列，两处类型必须逐字一致。
+
 # 用法
 
     python tools/check_observability_truth.py
 
 # 退出码
 
-- 0：两项契约均在位
+- 0：四项契约均在位
 - 1：失实（打印具体项）
 
 # 双向验证记录（OPT-R17）
@@ -62,6 +101,14 @@ Alertmanager 容器也在（OPT-R17 起）默认启动，但
 - 向 Cargo.toml 加回 `features = ["cors"]` → 门红（cors 在 src/ 无引用）
 - 从 OPERATION.md 删掉「告警投递」小节 → 门红
 - 还原后 → 门绿
+
+# 双向验证记录（失实 C / D，2026-10-28）
+
+- 把 `manual/003_trace_id.sql` 拷回 `deploy/clickhouse/` 顶层 → 门红（指出
+  「顶层只允许 001_schema.sql」并给出正确位置）
+- 把 `003` 的 `ADD COLUMN ... String` 改成 `LowCardinality(String)` → 门红
+  （指出两处类型不一致）
+- 各自还原 → 门绿
 """
 
 import re
@@ -72,6 +119,44 @@ REPO = Path(__file__).resolve().parent.parent
 CARGO_TOML = REPO / "gateway" / "Cargo.toml"
 SRC_DIR = REPO / "gateway" / "src"
 OPERATION = REPO / "docs" / "OPERATION.md"
+CH_INITDB = REPO / "deploy" / "clickhouse"
+
+# `docker-entrypoint-initdb.d` 顶层**只允许**存在的 SQL 文件。
+#
+# 为什么要有这条：CH 官方 `/entrypoint.sh` 的实现是
+#     for f in /docker-entrypoint-initdb.d/*; do
+#         case "$f" in *.sql) clickhouse-client --multiquery < "$f" ;; esac
+#     done
+# 即**顶层所有 `.sql` 按文件名顺序全部自动执行**（子目录不递归）。
+#
+# 实测事故（2026-10-28 发现）：`002_reorder.sql` 曾放在这个目录顶层，其文件头
+# 声称「不会被 initdb 自动执行（它只跑 001_schema.sql）」——**那是错的**。
+# 而它是**破坏性**脚本（`CREATE _v2` → `INSERT SELECT` 全表复制 → `RENAME`），
+# 自动执行的后果是：
+#   ① 全新部署多做一次全表复制，留下一张 `_old` 垃圾表；
+#   ② 更严重：`_v2` 的列清单是**写死的快照**，会把此后 `001_schema.sql` 新增的
+#      列（如 `trace_id`）在 `RENAME` 后**覆盖丢失**，得到一个缺列的仓库表，
+#      而代码侧照常写入 ⇒ 插入失败或字段静默丢弃。
+# 这与 OPT-R17 的原始病灶同类：**声明（"手动"）与实际（"自动"）不一致**。
+#
+# 断言方式：白名单而非黑名单——将来新增一次性迁移脚本时，人**必须**把它放进
+# `manual/`，否则本门判红。黑名单只能拦住「已知的那一个」。
+ALLOWED_INITDB_SQL = {"001_schema.sql"}
+
+# `manual/` 下的迁移脚本若重复声明了 `001_schema.sql` 里已有的列，两处的**类型**
+# 必须逐字一致。
+#
+# 为什么需要这条：全新部署走 `001`（权威 schema），存量部署走 `manual/*.sql`
+# （就地 ALTER）。两条路径若对同一列给出不同类型，会得到**两种不同的 schema**——
+# 而代码只有一份。例如 `001` 写 `trace_id String`、迁移写
+# `trace_id LowCardinality(String)`：两者都能建表成功，但 LowCardinality 的
+# 字典编码与 `String` 的写入路径不同，某些情况下会静默截断/降级。
+# 这类分歧不会让任何测试变红，只会在"新环境正常、老环境异常"时暴露，
+# 而那时排查方向通常被误导到代码而不是 schema。
+MIGRATION_TYPE_CONSISTENCY = [
+    ("manual/003_trace_id.sql", "trace_id"),
+]
+
 
 # Cargo.toml feature -> src/ 中必须出现的标识符。
 #
@@ -173,6 +258,36 @@ def strip_comments(src: str) -> str:
     return "\n".join(out)
 
 
+def column_type(sql: str, column: str) -> str | None:
+    """从 SQL 文本里取 `column` 的**类型声明**（到行尾或逗号为止）。
+
+    只做本仓需要的最小解析：找形如 `column Type...` 的行，取 `column` 之后的
+    部分、去掉行尾逗号与注释。用于比对「权威 schema」与「迁移脚本」对同一列
+    是否给出同一类型。
+    """
+    for raw in sql.splitlines():
+        line = raw.split("--", 1)[0].strip()
+        if not line:
+            continue
+        # 迁移脚本里可能带 `ADD COLUMN IF NOT EXISTS` / `AFTER x` 前缀。
+        for marker in ("ADD COLUMN IF NOT EXISTS ", "ADD COLUMN "):
+            if line.upper().startswith(marker):
+                line = line[len(marker) :].strip()
+                break
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        name, rest = parts[0].strip("`,"), parts[1]
+        if name != column:
+            continue
+        # 截到行内第一个逗号（列定义结束）；`AFTER xxx` 是迁移语法，不是类型。
+        rest = rest.split(",")[0]
+        if " AFTER " in f" {rest.upper()} ":
+            rest = re.split(r"\s+AFTER\s+", rest, flags=re.IGNORECASE)[0]
+        return " ".join(rest.split())
+    return None
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -185,7 +300,14 @@ def main() -> int:
     toml_text = CARGO_TOML.read_text(encoding="utf-8")
     # 只在**去注释后的代码**里找符号——否则本门会被自己的说明注释满足。
     src_text = strip_comments(
-        "\n".join(f.read_text(encoding="utf-8") for f in sorted(SRC_DIR.glob("*.rs")))
+        # **必须 rglob**：目录模块（`router/`、`free_pool/`、`gateway/`、`metrics/`、
+        # `admin/`）里的符号用顶层 glob 是看不见的。本门曾用 `SRC_DIR.glob("*.rs")`，
+        # 于是 admin 拆成目录后立刻误报「`tower-http/timeout` 声明了但 src 里找不到
+        # `TimeoutLayer`」——而它明明就在 `admin/mod.rs` 的 `build_router_with` 里。
+        # 这类**假红**比漏检更糟（会被学会忽略），而同样的 glob 缺陷如果反向作用
+        # （符号只在子模块里用到、门以为没用到），就会变成**假绿**——那才是真正的
+        # 静默失效。故一律递归。
+        "\n".join(f.read_text(encoding="utf-8") for f in sorted(SRC_DIR.rglob("*.rs")))
     )
 
     checked = 0
@@ -221,6 +343,48 @@ def main() -> int:
                 f"否则会以为有告警、实际故障时收不到。"
             )
 
+    # ---------- 失实 C：initdb 目录里不得有破坏性脚本 ----------
+    if CH_INITDB.is_dir():
+        for f in sorted(CH_INITDB.glob("*.sql")):
+            if f.name not in ALLOWED_INITDB_SQL:
+                failures.append(
+                    f"部署失实：`deploy/clickhouse/{f.name}` 位于 "
+                    f"`docker-entrypoint-initdb.d` 挂载的**顶层**，会被 CH 官方 "
+                    f"entrypoint 在**每次全新部署时自动执行**。"
+                    f"顶层只允许 {sorted(ALLOWED_INITDB_SQL)}（幂等的权威 schema）。"
+                    f"一次性迁移脚本请放进 `deploy/clickhouse/manual/`"
+                    f"（子目录不递归执行），并在其文件头写明执行方式。"
+                )
+
+    # ---------- 失实 D：迁移脚本与权威 schema 的列类型必须一致 ----------
+    schema_file = CH_INITDB / "001_schema.sql"
+    if schema_file.is_file():
+        schema_sql = schema_file.read_text(encoding="utf-8")
+        for rel, column in MIGRATION_TYPE_CONSISTENCY:
+            mig = REPO / "deploy" / "clickhouse" / rel
+            if not mig.is_file():
+                continue
+            want = column_type(schema_sql, column)
+            got = column_type(mig.read_text(encoding="utf-8"), column)
+            if want is None:
+                failures.append(
+                    f"schema 失实：`001_schema.sql` 里找不到列 `{column}`，"
+                    f"而 `{rel}` 声称迁移它。两者必须同时存在或同时不存在。"
+                )
+            elif got is None:
+                failures.append(
+                    f"schema 失实：`{rel}` 里找不到列 `{column}` 的 ADD COLUMN，"
+                    f"但 `001_schema.sql` 已声明它。迁移脚本漏了这一步，"
+                    f"存量部署会缺列。"
+                )
+            elif want != got:
+                failures.append(
+                    f"schema 失实：列 `{column}` 类型不一致——"
+                    f"`001_schema.sql` 是 `{want}`，`{rel}` 是 `{got}`。"
+                    f"全新部署与存量升级会得到**两种不同的 schema**，"
+                    f"而代码只有一份。"
+                )
+
     # ---------- 汇报 ----------
     if failures:
         print("[check-observability-truth] FAIL:", file=sys.stderr)
@@ -230,7 +394,9 @@ def main() -> int:
 
     print(
         f"[check-observability-truth] OK: {checked} 个显式 feature 均真被引用；"
-        f"告警投递三要素在 docs/OPERATION.md 齐备"
+        f"告警投递三要素在 docs/OPERATION.md 齐备；"
+        f"CH initdb 顶层只有 {sorted(ALLOWED_INITDB_SQL)}；"
+        f"{len(MIGRATION_TYPE_CONSISTENCY)} 个迁移列类型与权威 schema 一致"
     )
     return 0
 

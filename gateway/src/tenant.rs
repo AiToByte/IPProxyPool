@@ -5,7 +5,7 @@
 //! Mobile $15/GB.
 
 use atomic_float::AtomicF64;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -49,6 +49,263 @@ pub struct TenantAccount {
 
 pub struct TenantManager {
     tenants: DashMap<String, Arc<TenantAccount>>,
+    /// 待落盘的租户键集合（只存 key，值在 flush 时从 `tenants` 现读）。
+    ///
+    /// 为什么存 key 而不是存"变更事件/完整快照"：快照要在热路径上克隆
+    /// `tenant_id`（一次堆分配/请求），而 key 只需要一次 `to_string`；
+    /// 事件流则要处理乱序与重放。存 key 的语义最省心——flush 时读到的一定是
+    /// **最新**状态，天然幂等，重复写同一个 key 不产生副作用。
+    dirty: DashSet<String>,
+    store: Store,
+}
+
+/// 租户状态的持久化后端。
+///
+/// # 语义边界（重要）
+///
+/// **配置决定「有哪些租户」，持久化只决定「它们现在什么状态」。**
+///
+/// 具体说：`register_tenant`（来自 `API_KEY` / 未来的多租户配置）是租户
+/// **存在性**的唯一来源；Redis 里的记录**不会**复活一个已经从配置里删掉的
+/// 租户。反过来，`is_active` / `balance_usd` / `total_bytes` 这三个**运行期
+/// 可变状态**才由 Redis 恢复。
+///
+/// 为什么不做成"Redis 即真相"：那样运维把某个 key 从配置里去掉后，它会因为
+/// Redis 里还有记录而继续生效——一个"删不掉的租户"比丢余额更难排查。
+// 体积由 `ConnectionManager`（224B）决定，而它在本进程里**只有一个实例**
+// （`TenantManager` 是单例），多出来的字节毫无意义；反过来按 clippy 的建议
+// 给 `conn` 加一层 `Box`，会让每次 `is_persistent()` 多一次指针跳转——
+// 那是每请求都走的热路径。默认建议针对"大量实例"的枚举，与本用法不符。
+#[allow(clippy::large_enum_variant)]
+pub enum Store {
+    /// 进程内（缺省）。重启即丢，与 OPT-R18 之前的行为一致。
+    Memory,
+    /// Redis 写穿：`TENANT_STORE=redis`。
+    Redis {
+        conn: redis::aio::ConnectionManager,
+        /// key 前缀，实际键为 `{prefix}:{api_key}` 与索引集合 `{prefix}:index`。
+        prefix: String,
+    },
+    /// **测试专用**：进程内记录器，语义等价于 Redis 后端。
+    ///
+    /// 存在的理由不是"图省事"，而是 CI 与本机都没有 Redis（`ci.yml` 未声明
+    /// redis service），而 `flush_dirty` 里真正容易错的是**逐条删脏 / 失败
+    /// 保留 / 索引维护**这套算法，不是 `HSET` 的调用语法。没有这个变体，
+    /// 算法只能靠肉眼审阅——那正是"看起来对"的代码出事的方式。
+    ///
+    /// `#[cfg(test)]` 保证它进不了发布产物；同时 `is_persistent` 用穷尽
+    /// `match` 而非 `matches!`，将来再加后端时编译器会强制你在这里做决定。
+    #[cfg(test)]
+    Recording(std::sync::Arc<RecordingBackend>),
+}
+
+/// 持久化后端的**动作**抽象。
+///
+/// 把"怎么存"（Redis 命令 / 测试记录器）与"存什么、何时删脏"分开：后者只写
+/// 一遍（`flush_via` / `load_via`），两个后端共用，于是测试覆盖的算法就是
+/// 生产跑的算法。
+trait PersistBackend {
+    /// 写入一条记录，并把它登记进索引（保证 `read_all` 下次能枚举到）。
+    async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String>;
+
+    /// 枚举索引里的全部记录。**无法解析的记录在这里被丢弃并告警**（不是
+    /// 错误）——一条坏记录不该让整个启动加载失败。
+    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String>;
+}
+
+/// `Store::Redis` 对应的真实后端。
+struct RedisBackend {
+    conn: redis::aio::ConnectionManager,
+    prefix: String,
+}
+
+impl PersistBackend for RedisBackend {
+    async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String> {
+        // `ConnectionManager` 是 Arc 复用连接的多路复用器，clone 很便宜；
+        // 之所以 clone 而不是 `&mut self.conn`：`write` 拿的是 `&self`
+        // （多个 key 顺序写时不必持有可变借用）。
+        let mut conn = self.conn.clone();
+        let hash_key = format!("{}:{key}", self.prefix);
+        // 一个 pipeline 同时写数据与索引：两者必须**同生同死**，否则会出现
+        // "数据在、索引没有"（永远加载不到）或"索引在、数据没有"（加载时
+        // 空记录）两种半状态。用 pipeline 换取原子性，比事后补偿简单。
+        let mut pipe = redis::pipe();
+        pipe.hset_multiple(&hash_key, &rec.to_hash()).ignore();
+        pipe.sadd(format!("{}:index", self.prefix), key).ignore();
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| format!("write {hash_key}: {e}"))
+    }
+
+    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+        let mut conn = self.conn.clone();
+        let index_key = format!("{}:index", self.prefix);
+        let keys: Vec<String> = redis::AsyncCommands::smembers(&mut conn, &index_key)
+            .await
+            .map_err(|e| format!("SMEMBERS {index_key}: {e}"))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let hash_key = format!("{}:{key}", self.prefix);
+            let hash: std::collections::HashMap<String, String> =
+                redis::AsyncCommands::hgetall(&mut conn, &hash_key)
+                    .await
+                    .map_err(|e| format!("HGETALL {hash_key}: {e}"))?;
+            match PersistedTenant::from_hash(&hash) {
+                Some(rec) => out.push((key, rec)),
+                None => {
+                    log::warn!("[Tenant] {hash_key} 无法解析（余额字段缺失或非有限值），保留内存值")
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 测试用后端：与 `RedisBackend` 同一套语义，落在进程内。
+///
+/// `pub` 是 `Store` 是 `pub` 的连带结果（`E0446`：公开枚举的字段类型不能更
+/// 私密）。它被 `#[cfg(test)]` 挡在发布产物之外，因此不构成真实 API 面。
+#[cfg(test)]
+#[derive(Default)]
+pub struct RecordingBackend {
+    /// `api_key -> hash field -> value`，形态与 Redis hash 完全一致，因此
+    /// `from_hash` / `to_hash` 的真实解析路径都会被走到。
+    hashes: parking_lot::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    >,
+    /// 模拟写失败（Redis 抖动 / 网络断）。
+    fail_keys: parking_lot::Mutex<std::collections::BTreeSet<String>>,
+    /// 成功写入次数（用于断言"重复 flush 不会重复写"）。
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl RecordingBackend {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// 预置一条**原始** hash（可以是坏的），用于验证加载路径对脏数据的容忍。
+    fn put_raw(&self, key: &str, hash: &[(&str, &str)]) {
+        let mut g = self.hashes.lock();
+        g.insert(
+            key.to_string(),
+            hash.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+    }
+
+    fn fail_on(&self, key: &str) {
+        self.fail_keys.lock().insert(key.to_string());
+    }
+
+    fn stored(&self, key: &str) -> Option<std::collections::HashMap<String, String>> {
+        self.hashes.lock().get(key).cloned()
+    }
+
+    fn writes(&self) -> usize {
+        self.writes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl PersistBackend for RecordingBackend {
+    async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String> {
+        if self.fail_keys.lock().contains(key) {
+            return Err(format!("write {key}: injected failure"));
+        }
+        // 守卫在 return 前自然释放，不跨 await（本函数体内无 await）。
+        self.hashes
+            .lock()
+            .insert(key.to_string(), rec.to_hash().into_iter().collect());
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+        let snapshot: Vec<(String, std::collections::HashMap<String, String>)> = self
+            .hashes
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Ok(snapshot
+            .into_iter()
+            .filter_map(|(k, h)| PersistedTenant::from_hash(&h).map(|r| (k, r)))
+            .collect())
+    }
+}
+
+/// Redis hash 里的一条租户记录。
+///
+/// 字段名即 hash field 名。**新增字段必须给默认值**（`from_hash` 里 `?` 缺失
+/// 字段时回落），否则升级后读旧记录会整体丢弃——那等于静默清零余额。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedTenant {
+    /// 仅作记录，加载时**不**覆盖配置（`tenant_id` 由 `register_tenant` 决定）。
+    pub tenant_id: String,
+    /// 同上：qps 在注册时就编译进了 governor 的限流器，事后覆盖会让
+    /// "配额"与"限流器"不一致。
+    pub qps: u32,
+    pub max_concurrency: usize,
+    /// 运行期可变状态（会被恢复）。
+    pub is_active: bool,
+    pub balance_usd: f64,
+    pub total_bytes: u64,
+}
+
+impl PersistedTenant {
+    /// 从内存账户取快照（**必须在 await 之前调用**：`DashMap` 的读守卫不 Send）。
+    pub fn from_account(a: &TenantAccount) -> Self {
+        Self {
+            tenant_id: a.tenant_id.clone(),
+            qps: a.qps,
+            max_concurrency: a.max_concurrency,
+            is_active: a.is_active.load(Ordering::Relaxed),
+            balance_usd: a.balance_usd.load(Ordering::Relaxed),
+            total_bytes: a.total_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn to_hash(&self) -> Vec<(String, String)> {
+        vec![
+            ("tenant_id".into(), self.tenant_id.clone()),
+            ("qps".into(), self.qps.to_string()),
+            ("max_concurrency".into(), self.max_concurrency.to_string()),
+            ("is_active".into(), u8::from(self.is_active).to_string()),
+            ("balance_usd".into(), self.balance_usd.to_string()),
+            ("total_bytes".into(), self.total_bytes.to_string()),
+        ]
+    }
+
+    /// 解析 Redis hash。**缺字段用默认值，不整体丢弃**。
+    ///
+    /// 只有 `balance_usd` 解析失败时才返回 `None`：余额是这个记录里唯一
+    /// "错了就会算错钱"的字段，宁可当作没有记录（保持内存值）也不能猜。
+    /// 其余字段坏了就回落默认，让账户至少还能被识别出来。
+    fn from_hash(h: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let balance_usd: f64 = h.get("balance_usd")?.parse().ok()?;
+        if !balance_usd.is_finite() {
+            // NaN/±Inf 会绕过欠费门（`NaN <= 0.0` 为 false ⇒ 永不拒付），
+            // 与 `set_balance` 的文档注释同一条理由。
+            return None;
+        }
+        Some(Self {
+            tenant_id: h.get("tenant_id").cloned().unwrap_or_default(),
+            qps: h.get("qps").and_then(|v| v.parse().ok()).unwrap_or(0),
+            max_concurrency: h
+                .get("max_concurrency")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            is_active: h.get("is_active").map(|v| v == "1").unwrap_or(true),
+            balance_usd,
+            total_bytes: h
+                .get("total_bytes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        })
+    }
 }
 
 impl std::fmt::Debug for TenantAccount {
@@ -229,11 +486,183 @@ pub struct TenantDetail {
 }
 
 impl TenantManager {
+    /// 纯内存后端（OPT-R18 P2-2 之前的唯一形态）。
+    ///
+    /// 只在测试里用：生产路径一律走 [`with_store`](Self::with_store)，因为
+    /// 持久化后端必须**显式**由 `TENANT_STORE` 决定——留一个 `new()` 让
+    /// `main.rs` 顺手调用，正是"升级后行为悄悄变化"的入口。`#[cfg(test)]`
+    /// 把这条边界写进类型系统，而不是靠注释约束。
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_store(Store::Memory)
+    }
+
+    /// 指定持久化后端构造（`main.rs` 在 `TENANT_STORE=redis` 时用）。
+    pub fn with_store(store: Store) -> Self {
         Self {
             tenants: DashMap::new(),
+            dirty: DashSet::new(),
+            store,
         }
     }
+
+    /// 持久化是否启用。热路径上的开销闸门：关闭时 `mark_dirty` 是纯分支，
+    /// 零分配。
+    ///
+    /// 用穷尽 `match` 而非 `matches!`：新增后端时编译器会在这里拦一下，
+    /// 强迫作者显式回答"它要不要参与脏标记"。
+    #[inline]
+    fn is_persistent(&self) -> bool {
+        match &self.store {
+            Store::Memory => false,
+            Store::Redis { .. } => true,
+            #[cfg(test)]
+            Store::Recording(_) => true,
+        }
+    }
+
+    /// 标记某租户需要落盘（幂等；未启用持久化时是空操作）。
+    ///
+    /// 成本：启用持久化后每请求一次 `String` 克隆（约 20B）。这是有意的——
+    /// 关掉时零成本，开启时换来"重启不丢余额"。用 DashSet 而非队列：
+    /// 同一租户的高频计量会反复命中同一个 key，集合天然把它们合并成一条。
+    #[inline]
+    fn mark_dirty(&self, api_key: &str) {
+        if self.is_persistent() {
+            self.dirty.insert(api_key.to_string());
+        }
+    }
+
+    /// 从持久化后端加载并覆盖**运行期可变状态**（`is_active` /
+    /// `balance_usd` / `total_bytes`）。
+    ///
+    /// 返回应用的记录数。**必须在 `spawn_flusher` 之前调用**，否则首轮 flush
+    /// 会把刚注册的初始值（余额 100）写回后端，覆盖掉上次的余额。
+    ///
+    /// 未启用持久化时返回 `Ok(0)`（不是错误）。
+    pub async fn load_persisted(&self) -> Result<usize, String> {
+        match &self.store {
+            Store::Memory => Ok(0),
+            Store::Redis { conn, prefix } => {
+                let backend = RedisBackend {
+                    conn: conn.clone(),
+                    prefix: prefix.clone(),
+                };
+                self.load_via(&backend).await
+            }
+            #[cfg(test)]
+            Store::Recording(b) => self.load_via(b.as_ref()).await,
+        }
+    }
+
+    /// 加载算法本体（与后端无关，因此测试覆盖的就是生产代码）。
+    async fn load_via<B: PersistBackend>(&self, backend: &B) -> Result<usize, String> {
+        let records = backend.read_all().await?;
+        let mut applied = 0usize;
+        let mut orphan = 0usize;
+        for (key, rec) in records {
+            let Some(acct) = self.tenants.get(&key).map(|e| e.value().clone()) else {
+                // 配置里已没有这个租户 ⇒ 不复活（见 `Store` 的语义边界说明）。
+                orphan += 1;
+                continue;
+            };
+            acct.is_active.store(rec.is_active, Ordering::Relaxed);
+            acct.balance_usd.store(rec.balance_usd, Ordering::Relaxed);
+            acct.total_bytes.store(rec.total_bytes, Ordering::Relaxed);
+            applied += 1;
+        }
+        if orphan > 0 {
+            log::info!(
+                "[Tenant] {orphan} 条 Redis 记录对应的租户不在当前配置中，已忽略\
+                 （配置决定「有哪些租户」，Redis 只决定「它们的状态」）"
+            );
+        }
+        Ok(applied)
+    }
+
+    /// 把脏集写回后端。返回写入成功的条数。
+    ///
+    /// 失败语义：**逐条删脏**，失败的那条（及其后的）保留在脏集里，下一轮
+    /// 重试。不采用"先清空再写"——那样写失败就等于静默丢掉余额更新，而
+    /// 接口早已对运维报过成功。
+    pub async fn flush_dirty(&self) -> Result<usize, String> {
+        match &self.store {
+            Store::Memory => Ok(0),
+            Store::Redis { conn, prefix } => {
+                let backend = RedisBackend {
+                    conn: conn.clone(),
+                    prefix: prefix.clone(),
+                };
+                self.flush_via(&backend).await
+            }
+            #[cfg(test)]
+            Store::Recording(b) => self.flush_via(b.as_ref()).await,
+        }
+    }
+
+    /// flush 算法本体（与后端无关）。
+    async fn flush_via<B: PersistBackend>(&self, backend: &B) -> Result<usize, String> {
+        if self.dirty.is_empty() {
+            return Ok(0);
+        }
+        // 先把脏集快照成 Vec：flush 过程中 `mark_dirty` 可能并发插入新 key，
+        // 而 `DashSet` 的迭代守卫同样不可跨 await。
+        let keys: Vec<String> = self.dirty.iter().map(|e| e.key().clone()).collect();
+        let mut written = 0usize;
+        for key in keys {
+            // 先取快照再 await：DashMap 的读守卫不可跨 await。
+            let rec = match self.tenants.get(&key) {
+                Some(e) => PersistedTenant::from_account(e.value()),
+                None => {
+                    // 账户已不在（理论上不会发生：没有删除 API）⇒ 清脏避免空转。
+                    self.dirty.remove(&key);
+                    continue;
+                }
+            };
+            match backend.write(&key, &rec).await {
+                Ok(()) => {
+                    // 只有写成功才删脏：删早了等于丢更新（见方法文档）。
+                    self.dirty.remove(&key);
+                    written += 1;
+                }
+                Err(e) => {
+                    // 保留脏标记（不清），下一轮重试；立即返回让上层打 warn。
+                    return Err(format!("{e} (已写 {written} 条)"));
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// 启动后台 flush 循环。未启用持久化时返回 `None`（不起空转任务）。
+    ///
+    /// `interval` 是**最大**持久化延迟：进程被强杀时最多丢这么多秒的余额
+    /// 变动。默认 5s（`TENANT_FLUSH_SECS`）——免费/低价流量下这远小于一次
+    /// 结算周期，且比"重启全部归零"好得多。
+    pub fn spawn_flusher(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.is_persistent() {
+            return None;
+        }
+        let me = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // 慢机器上漏拍时按 Delay 补齐，不要 Burst 连发（连发会在
+            // 积压后瞬间打出几百次 Redis 往返）。
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match me.flush_dirty().await {
+                    Ok(0) => {}
+                    Ok(n) => log::debug!("[Tenant] flushed {n} record(s) to Redis"),
+                    Err(e) => log::warn!("[Tenant] flush failed, will retry: {e}"),
+                }
+            }
+        }))
+    }
+
     /// R2-3 默认 burst：`qps/10`（至少 1）。突发容忍与限流强度解耦，
     /// 老调用按此换算后行为不变（`qps=1 → burst=1`，存量单测语义冻结）。
     pub fn default_burst_for_qps(qps: u32) -> u32 {
@@ -262,6 +691,9 @@ impl TenantManager {
             balance_usd: AtomicF64::new(100.0),
         });
         self.tenants.insert(api_key.to_string(), account);
+        // 首次注册也要落盘：否则重启后 Redis 里没有这条记录，
+        // 而运维在重启前 PATCH 过的余额也就无处可恢复。
+        self.mark_dirty(api_key);
     }
 
     /// Deactivate without dropping live references (billing holds `Arc`s).
@@ -270,6 +702,7 @@ impl TenantManager {
         match self.tenants.get(api_key) {
             Some(entry) => {
                 entry.value().is_active.store(active, Ordering::Relaxed);
+                self.mark_dirty(api_key);
                 true
             }
             None => false,
@@ -291,6 +724,7 @@ impl TenantManager {
                     .value()
                     .balance_usd
                     .store(balance_usd, Ordering::Relaxed);
+                self.mark_dirty(api_key);
                 true
             }
             None => false,
@@ -394,6 +828,12 @@ impl TenantManager {
         tenant.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         let cost = (bytes as f64 / BYTES_PER_GB) * price_per_gb(tier);
         tenant.balance_usd.fetch_sub(cost, Ordering::Relaxed);
+        // 计量改变了余额 ⇒ 标脏。**这是热路径上唯一新增的开销**，且仅在
+        // 持久化开启时发生（`mark_dirty` 内部先判后端）。零字节请求直接跳过，
+        // 省掉一次 String 克隆。
+        if bytes > 0 {
+            self.mark_dirty(&tenant.api_key);
+        }
     }
 }
 
@@ -696,5 +1136,268 @@ mod tests {
         ] {
             assert!(!is_loopback_listen(no), "不应判为回环: {no:?}");
         }
+    }
+
+    // ── OPT-R18 P2-2：租户状态持久化 ──────────────────────────────────
+    //
+    // 背景（实测留痕，见 TASK_PLAN 步骤 60）：改之前租户表纯内存，
+    // `PATCH balance=42.5` → 重启 → 又变回 100.0。下面这组测试锁住修复。
+
+    /// 接在记录器上的 manager（与 `TENANT_STORE=redis` 走同一套算法）。
+    fn persistent_manager() -> (TenantManager, std::sync::Arc<RecordingBackend>) {
+        let backend = RecordingBackend::new();
+        let m = TenantManager::with_store(Store::Recording(std::sync::Arc::clone(&backend)));
+        (m, backend)
+    }
+
+    fn register_default(m: &TenantManager, key: &str) {
+        m.register_tenant(
+            "t-1",
+            key,
+            100,
+            100,
+            TenantManager::default_burst_for_qps(100),
+        );
+    }
+
+    /// 写出去 → 读回来，运行期可变状态一字不差。
+    #[tokio::test]
+    async fn p2_2_flush_then_load_roundtrips_runtime_state() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        // 先把"刚注册"这轮写掉，清空脏集，好让后面的断言各自独立。
+        assert_eq!(m.flush_dirty().await.expect("flush#0"), 1);
+
+        // 计量**必须自己标脏**：此时脏集是空的，若 `release_and_meter` 忘了
+        // 标脏，下面这次 flush 会返回 0——用掉的流量与余额就永久丢失，
+        // 而且是"重启后才暴露"的那种丢失。
+        let acct = m.authenticate_and_throttle("k1").expect("auth");
+        m.release_and_meter(&acct, 1_073_741_824, "datacenter"); // 1 GiB × $0.2
+        assert_eq!(
+            m.flush_dirty().await.expect("flush#1"),
+            1,
+            "计量后必须重新变脏，否则本次用量不会落盘"
+        );
+        // 落盘的内容必须是**扣费之后**的值：100 - 0.2。
+        let after_meter = backend.stored("k1").expect("hash");
+        let bal: f64 = after_meter["balance_usd"].parse().expect("balance");
+        assert!((bal - 99.8).abs() < 1e-9, "计量扣费必须落盘，实际 {bal}");
+        assert_eq!(after_meter["total_bytes"], "1073741824");
+
+        assert!(m.set_balance("k1", 42.5));
+        // 停用必须放在鉴权之后：停用后 `authenticate_and_throttle` 直接拒。
+        assert!(m.set_active("k1", false));
+
+        assert_eq!(m.flush_dirty().await.expect("flush#2"), 1);
+        let stored = backend.stored("k1").expect("hash 已写入");
+        assert_eq!(stored.get("is_active").map(String::as_str), Some("0"));
+        assert_eq!(stored.get("tenant_id").map(String::as_str), Some("t-1"));
+
+        // 模拟重启：同一份存储，全新的 manager（余额从 100 起）。
+        let m2 = TenantManager::with_store(Store::Recording(std::sync::Arc::clone(&backend)));
+        register_default(&m2, "k1");
+        assert_eq!(m2.tenant_detail("k1").unwrap().balance_usd, 100.0);
+        assert_eq!(m2.load_persisted().await.expect("load"), 1);
+
+        let d = m2.tenant_detail("k1").unwrap();
+        assert!(!d.is_active, "启停状态必须跨重启保留");
+        assert!(
+            (d.balance_usd - 42.5).abs() < 1e-9,
+            "余额必须跨重启保留（PATCH 覆盖了扣费后的值），实际 {}",
+            d.balance_usd
+        );
+        assert_eq!(d.total_bytes, 1_073_741_824, "累计流量必须跨重启保留");
+    }
+
+    /// 缺省（memory）后端**必须**是完全的空操作：这是"升级后行为零变化"的保证，
+    /// 也是"热路径零开销"的前提。
+    #[tokio::test]
+    async fn p2_2_memory_mode_is_a_pure_noop() {
+        // `spawn_flusher` 的接收者是 `&Arc<Self>`（与 `main.rs` 一致），故这里
+        // 一开始就用 Arc 包起来。
+        let m = std::sync::Arc::new(TenantManager::new());
+        register_default(&m, "k1");
+        m.set_balance("k1", 1.0);
+        m.set_active("k1", false);
+        assert!(
+            m.dirty.is_empty(),
+            "memory 后端不得产生脏标记（否则每请求白克隆一个 String）"
+        );
+        assert_eq!(m.flush_dirty().await.expect("flush"), 0);
+        assert_eq!(m.load_persisted().await.expect("load"), 0);
+        assert!(
+            m.spawn_flusher(std::time::Duration::from_secs(1)).is_none(),
+            "memory 后端不应起一个永远返回 0 的空转任务"
+        );
+    }
+
+    /// 写失败时**不得**删脏。删早了就是静默丢余额：接口早已对运维报过成功，
+    /// 而这条更新再也不会被重试。
+    #[tokio::test]
+    async fn p2_2_failed_flush_keeps_the_key_dirty() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        m.set_balance("k1", 7.0);
+        backend.fail_on("k1");
+
+        let err = m.flush_dirty().await.expect_err("注入失败必须冒泡给调用方");
+        assert!(err.contains("injected failure"), "{err}");
+        assert_eq!(backend.writes(), 0);
+        assert!(!m.dirty.is_empty(), "失败后脏标记必须保留");
+
+        // 恢复后下一轮必须重试到成功。
+        backend.fail_keys.lock().clear();
+        assert_eq!(m.flush_dirty().await.expect("retry"), 1);
+        assert_eq!(backend.writes(), 1);
+        assert!(
+            (backend
+                .stored("k1")
+                .and_then(|h| h.get("balance_usd").cloned())
+                .expect("balance 已写入")
+                .parse::<f64>()
+                .unwrap()
+                - 7.0)
+                .abs()
+                < 1e-12
+        );
+
+        // 成功后脏集为空 ⇒ 再 flush 不重复写。
+        assert_eq!(m.flush_dirty().await.expect("idle"), 0);
+        assert_eq!(backend.writes(), 1, "已成功的 key 不得重复写");
+    }
+
+    /// 多 key 场景下**一个都不能丢**：中途失败会让本轮提前返回，剩下的必须
+    /// 留在脏集里，由下一轮补齐。
+    #[tokio::test]
+    async fn p2_2_partial_failure_loses_no_key() {
+        let (m, backend) = persistent_manager();
+        for k in ["k1", "k2", "k3"] {
+            register_default(&m, k);
+        }
+        backend.fail_on("k2");
+        m.flush_dirty().await.expect_err("k2 必然失败");
+        let first_round = backend.writes();
+        assert!(
+            first_round < 3,
+            "k2 失败后本轮应提前返回，实际写了 {first_round} 条"
+        );
+
+        backend.fail_keys.lock().clear();
+        let second_round = m.flush_dirty().await.expect("retry");
+        assert_eq!(
+            first_round + second_round,
+            3,
+            "两轮合计必须覆盖全部 3 个 key（丢一个就等于丢一个租户的余额）"
+        );
+        assert_eq!(backend.writes(), 3, "成功过的 key 不得重写");
+    }
+
+    /// 配置里已删除的租户**不因 Redis 里有记录而复活**。
+    ///
+    /// 反例（Redis 即真相）会造出"删不掉的租户"：运维从配置里去掉 key，
+    /// 它却继续生效——比丢余额更难排查。
+    #[tokio::test]
+    async fn p2_2_load_does_not_resurrect_tenant_absent_from_config() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        backend.put_raw(
+            "ghost",
+            &[
+                ("tenant_id", "g"),
+                ("qps", "1"),
+                ("max_concurrency", "1"),
+                ("is_active", "1"),
+                ("balance_usd", "7.0"),
+                ("total_bytes", "0"),
+            ],
+        );
+        assert_eq!(m.load_persisted().await.expect("load"), 0);
+        assert!(
+            m.tenant_detail("ghost").is_none(),
+            "Redis 记录不得复活已从配置删除的租户"
+        );
+    }
+
+    /// 坏余额整条丢弃并保持内存值；其余字段坏了只回落，不连坐。
+    ///
+    /// `NaN`/`inf` 会绕过欠费门（`NaN <= 0.0` 为 false ⇒ 永不拒付），所以
+    /// 余额是这条记录里唯一"错了就会算错钱"的字段。
+    #[tokio::test]
+    async fn p2_2_load_rejects_non_finite_or_missing_balance() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        for bad in ["NaN", "inf", "-inf", "not-a-number", ""] {
+            backend.put_raw(
+                "k1",
+                &[
+                    ("balance_usd", bad),
+                    ("is_active", "0"),
+                    ("total_bytes", "999"),
+                ],
+            );
+            assert_eq!(
+                m.load_persisted().await.expect("load"),
+                0,
+                "坏余额必须整条丢弃: {bad:?}"
+            );
+            let d = m.tenant_detail("k1").unwrap();
+            assert_eq!(d.balance_usd, 100.0, "内存值必须保持不变: {bad:?}");
+            assert!(d.is_active, "坏记录不得改动 is_active: {bad:?}");
+            assert_eq!(d.total_bytes, 0, "坏记录不得改动 total_bytes: {bad:?}");
+        }
+        // 字段整个缺失同样视为坏记录（不猜）。
+        backend.put_raw("k1", &[("is_active", "0")]);
+        assert_eq!(m.load_persisted().await.expect("load"), 0);
+        assert_eq!(m.tenant_detail("k1").unwrap().balance_usd, 100.0);
+    }
+
+    /// 旧版本写下的记录缺新字段时仍可用（升级不能等于清零）。
+    #[tokio::test]
+    async fn p2_2_load_tolerates_missing_optional_fields() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        backend.put_raw("k1", &[("balance_usd", "12.5")]);
+        assert_eq!(m.load_persisted().await.expect("load"), 1);
+        let d = m.tenant_detail("k1").unwrap();
+        assert!((d.balance_usd - 12.5).abs() < 1e-12);
+        assert!(d.is_active, "缺 is_active 时回落 true（与注册默认一致）");
+        assert_eq!(d.total_bytes, 0);
+    }
+
+    /// **这条测试是 `main.rs` 里"先 load 再起 flusher"的证据。**
+    ///
+    /// 只把顺序写进注释是不够的：注释不会变红。这里把两种顺序都跑一遍，
+    /// 证明反序确实会把余额覆盖回 100——于是"顺序不可颠倒"不再是传说。
+    #[tokio::test]
+    async fn p2_2_load_must_precede_flush() {
+        let seeded = [
+            ("balance_usd", "42.5"),
+            ("is_active", "1"),
+            ("total_bytes", "0"),
+        ];
+
+        // 正确顺序：register（标脏）→ load → flush ⇒ 42.5 被保住。
+        let ok_backend = RecordingBackend::new();
+        ok_backend.put_raw("k1", &seeded);
+        let ok = TenantManager::with_store(Store::Recording(std::sync::Arc::clone(&ok_backend)));
+        register_default(&ok, "k1");
+        assert_eq!(ok.load_persisted().await.expect("load"), 1);
+        assert_eq!(ok.flush_dirty().await.expect("flush"), 1);
+        assert!(
+            (ok.tenant_detail("k1").unwrap().balance_usd - 42.5).abs() < 1e-12,
+            "先加载后 flush 必须保住上次余额"
+        );
+
+        // 反序：register → flush → load ⇒ 首轮 flush 已把 100 写回，load 读到 100。
+        let bad_backend = RecordingBackend::new();
+        bad_backend.put_raw("k1", &seeded);
+        let bad = TenantManager::with_store(Store::Recording(std::sync::Arc::clone(&bad_backend)));
+        register_default(&bad, "k1");
+        assert_eq!(bad.flush_dirty().await.expect("flush"), 1);
+        assert_eq!(bad.load_persisted().await.expect("load"), 1);
+        assert!(
+            (bad.tenant_detail("k1").unwrap().balance_usd - 100.0).abs() < 1e-12,
+            "反序会把余额覆盖回 100 —— 这正是 main.rs 里顺序不可颠倒的理由"
+        );
     }
 }

@@ -82,6 +82,11 @@ log/*.png
 log/**/*.png
 log/**/*.txt
 
+# --- 覆盖率报告（OPT-R18 P2-5：CI `coverage` job 的产物）---
+# `cargo llvm-cov --json` 输出的报告体积可观（数十 MB），且是**每次测量
+# 都会变**的构建产物。只限定 gateway/ 目录，不写全局规则。
+gateway/coverage.json
+
 # --- Docker 本地数据目录（防未来误加；当前均为具名卷，无宿主挂载） ---
 data/
 

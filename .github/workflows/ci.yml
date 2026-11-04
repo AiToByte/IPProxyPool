@@ -232,6 +232,43 @@ jobs:
       # 路由 → 红；文档写 ghost 端点 → 红；路由只出现在注释 → 绿。
       - name: Admin routes match documented endpoints (bidirectional)
         run: python3 tools/check_admin_routes_documented.py
+      # OPT-R18 P1-5：选路回放台的三道离线门（全部纯标准库，不需要 CH/Redis）。
+      #
+      # 为什么这三道必须一起进 CI：
+      #   * `routing_replay.py --self-test` —— 锁**工具自身**的不变量（确定性、
+      #     oracle>轮询、LinUCB>轮询）。它若坏了，后面两份报告全部失去意义。
+      #   * `check_replay_parity.py` —— 锁 Python 镜像 vs Rust 生产实现的公式
+      #     一致性。黄金向量由生产实现自己生成（不是手写期望值），否则同一个
+      #     理解错误会同时通过两份断言。
+      #   * `check_routing_baseline.py` —— 锁**文档发布的数字**。实测确认：
+      #     把 `docs/ROUTING_BASELINE.md` 的 linucb 成功率从 52.2% 改成 52.3%，
+      #     改样本条数、改 seed、删掉 oracle 行，四种漂移全部判红。
+      #
+      # 三者缺任何一道都会留一个"静默失真"窗口：工具坏了没人知道 / 镜像漂了
+      # 报告算的是另一个策略 / 文档过期但仍在对外声称收益。
+      - name: Routing replay invariants (determinism, oracle>RR, LinUCB>RR)
+        run: python3 tools/routing_replay.py --self-test
+      - name: Replay parity (Python mirror vs Rust golden vectors)
+        run: python3 tools/check_replay_parity.py --self-test
+      - name: Published routing baseline matches replay output
+        run: python3 tools/check_routing_baseline.py --self-test
+      # OPT-R18 P1-4：模块 ↔ docs/COMPONENTS.md 双向结构门。
+      #
+      # 落门时实测到四类失真**同时存在**（此前 CI 全绿）：
+      #   A. 文档声称「模块表（19 个）」，实际 24 个 `.rs`——漏掉的 5 个里
+      #      `admin.rs` 是 1788 行的 Admin REST 面，读者按文档建心智模型会
+      #      完全不知道它存在；
+      #   B. 同一份文件里 `vendor_arbitrage.rs` 中文行写 208 行、英文行写 218
+      #      行（描述同一个文件，必有一行是假的）；
+      #   C. `socks_handshake.rs` 那行的「关键 API」写作 `socks_handshake`，
+      #      而该字符串在文件里一次都没出现（真实 API 是 `establish`）；
+      #   D. 单测总数停在 156，而基线是 338——它此前不在任何门禁范围内。
+      #
+      # 断言全部**结构化**（解析表格后比对单元格），不做全文 grep：OPT-R17
+      # 实测过说明性注释恰好含目标 token 时门会对自己注入的回归报绿。
+      # 变异自测：漏登记模块 / 篡改单测数 / 编造 API 三处注入必须全部判红。
+      - name: Components doc matches source modules (bidirectional)
+        run: python3 tools/check_components_docs.py --self-test
       # OPT-R14 A2：free 池**契约**门（确定性，不依赖公网）。
       #
       # 刻意**不做**"healthy 节点数 ≥ N"的数量门：公网免费代理存活率天然 churn
@@ -461,6 +498,65 @@ jobs:
           if ($failed) { exit 1 }
           Write-Output "PowerShell 5.1 parse + BOM: clean ($($files.Count) file(s))"
 
+  # OPT-R18 P2-5：覆盖率基线门。
+  #
+  # 为何单独一个 job（而不塞进 static-checks）：static-checks 是**纯 Python**
+  # 门（不装 Rust 工具链），而本门要真跑 `cargo llvm-cov`——它需要
+  # `llvm-tools-preview` 组件 + `cargo-llvm-cov` 二进制，且要为覆盖率
+  # 重新编译一遍（instrumentation build，与普通 build 是两套产物）。
+  # 塞进 static-checks 会让那个 job 多出数分钟的 Rust 编译。
+  #
+  # 为何单独一个 job（而不塞进 gates）：gates 是**快速反馈**门（fmt/clippy/
+  # test），覆盖率要重编全树、慢一到两个数量级；且 gates 已有的 cargo 缓存
+  # 与覆盖率构建**不共享产物**（instrumentation 标志不同），合在一起只会
+  # 让 gates 的缓存命中率下降。
+  #
+  # **平台可比性**：本仓基线是在 Windows/MSVC（x86_64-pc-windows-msvc）
+  # 上测的，而 CI 跑 Ubuntu。两者 codegen 与 `cfg(unix)/cfg(windows)` 分支
+  # 不同，覆盖率**数值不可比**。故门禁按工具链+平台判定可比性：不可比时
+  # **只**校验文件集一致（[A]）与文档↔JSON 一致（[C]），**显式打印**跳过
+  # 数值判定的原因——绝不静默放行。
+  #
+  # 数值回退判定（[B]）的实际执行处在本地开发机（与基线同平台同工具链），
+  # 见 docs/COVERAGE_BASELINE.md §5。
+  coverage:
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview 提供 llvm-profdata/llvm-cov；缺它时
+          # `cargo llvm-cov` 会在收尾阶段报错"llvm-profdata not found"。
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+          shared-key: ipp-gateway-coverage
+      - name: Install cargo-llvm-cov
+        # 锁版本：`cargo-llvm-cov` 的 JSON 输出结构在不同版本间有过变化
+        # （早期直接是 dict，现在是 {"data": [ ... ]} 列表）。不锁版本时，
+        # 上游一次升级就能让门禁读不到字段而崩——门禁崩掉 ≠ 门禁守住。
+        run: cargo install --locked cargo-llvm-cov --version 0.9.1
+      - name: Measure coverage
+        # `--summary-only` 只出汇总；`--json` 出机器可读报告。
+        # `--locked` 与全仓一致：不许 CI 静默改写 Cargo.lock。
+        run: cargo llvm-cov --locked --summary-only --json --output-path coverage.json
+      - name: Coverage baseline gate
+        # 从仓库根目录跑：门禁脚本按仓库根解析 `docs/` 与 `tools/` 路径，
+        # 而 coverage.json 在 `gateway/` 下（job 默认 working-directory 是
+        # gateway）。故此处显式改回根目录，路径也相应写成 `gateway/...`。
+        working-directory: .
+        run: python3 tools/check_coverage_baseline.py --json gateway/coverage.json
+      - name: Coverage gate self-test (mutation)
+        # 证明门禁**有判别力**：四处注入（覆盖率回退 / 基线文件缺失 /
+        # markdown-JSON 不一致 / 不可比模式只跳过数值判定）必须全部判红。
+        # 一个从不判红的门禁比没有门更危险——它会给人虚假的安全感。
+        working-directory: .
+        run: python3 tools/check_coverage_baseline.py --self-test
+
   # OPT-R16 C: supply-chain gates (vulnerabilities + bans + licenses + sources).
   #
   # Runs cargo-deny (advisories/bans/licenses/sources per gateway/deny.toml)
@@ -486,3 +582,55 @@ jobs:
         run: cargo install --locked cargo-deny cargo-audit
       - name: Supply-chain gates
         run: python3 tools/check_supply_chain.py
+
+  # OPT-R18 P1-2：前端此前是**唯一不在门禁内的交付物**（1888 行 / 7 页，
+  # 无 test 脚本、CI 无 npm 步骤），后端契约一变前端可能静默崩而 CI 全绿。
+  #
+  # 本 job 只做「能编译 + 能构建」：`tsc --noEmit` 抓类型断链，`vite build`
+  # 抓入口/依赖/资源解析。**不引入 Playwright**——浏览器下载在受限网络下
+  # 不可靠，且它挡的失败类型（渲染回归）与本 job 挡的类型（编译回归）不重叠，
+  # 先把零成本的那一层补上。
+  web:
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: web/admin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          # Vite 5 要求 Node >= 18；锁 22 与本仓 Rust 侧无关，仅为可复现。
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+      # `npm ci` 要求 lockfile 与 package.json 严格一致：依赖被手改而未
+      # 更新 lockfile 时直接失败（对应 Rust 侧 `--locked` 的同一意图）。
+      - name: Install (lockfile-strict)
+        run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+
+  # OPT-R18 P1-3：Windows 是主开发平台（README 快速开始即 PowerShell），
+  # 但此前 windows job 只验 PowerShell 脚本、**不跑任何 Rust 测试**。
+  # `default_grace_secs(cfg!(windows))` 正是 OPT-R14「300 秒自杀」P0 的修复点，
+  # 而它此前只被静态门（断言"修复没被回退"）覆盖，不验证行为。
+  #
+  # 跑全量而非子集：Windows 上真正危险的是「Linux 能过、Windows 不能过」的
+  # 平台分支（路径/rename/fsync/信号/时钟粒度），子集很容易恰好漏掉它们。
+  # 冷启动约 6~8 分钟，rust-cache 后与 Linux gates 同量级。
+  windows-rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+          shared-key: ipp-gateway-windows
+      - name: Unit tests (Windows)
+        run: cargo test --locked --workspace

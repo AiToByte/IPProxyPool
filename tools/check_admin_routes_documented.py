@@ -26,13 +26,40 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ADMIN = ROOT / "gateway" / "src" / "admin.rs"
+# `admin` 已拆成目录模块（`admin/`：mod/dto/mw/handlers_*/tests）。
+# 默认指向**模块名**（不带 `.rs`），由 `read_admin_source` 兼容两种布局——
+# 本门原先写死 `admin.rs`，拆完立刻报「No such file or directory」。
+# 同一根因已在 check_components_docs / check_free_pool_contract / check_promql_metrics
+# 上各犯过一次（见 tools/_rustsrc.py 的说明）。
+DEFAULT_ADMIN = ROOT / "gateway" / "src" / "admin"
 DEFAULT_DOC = ROOT / "docs" / "ADMIN_API.md"
 API_PREFIX = "/api/v1"
 
 
 class GateError(Exception):
     pass
+
+
+def read_admin_source(path: Path) -> str:
+    """读 admin 模块源码：支持单文件（`admin.rs`）与目录模块（`admin/`）两种布局。
+
+    `--admin` 也接受临时文件（自测注入用），故不能假设一定是目录。
+    """
+    if path.is_dir():
+        return "\n".join(
+            f.read_text(encoding="utf-8") for f in sorted(path.glob("*.rs"))
+        )
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    # 兜底：给了 `admin.rs` 但只有 `admin/` 存在（或反之）。
+    for cand in (path.with_suffix(""), path.with_suffix(".rs")):
+        if cand.is_dir():
+            return "\n".join(
+                f.read_text(encoding="utf-8") for f in sorted(cand.glob("*.rs"))
+            )
+        if cand.is_file():
+            return cand.read_text(encoding="utf-8")
+    raise OSError(f"找不到 admin 模块源码：{path}")
 
 
 def strip_line_comments(text: str) -> str:
@@ -145,7 +172,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        code = code_routes(args.admin.read_text(encoding="utf-8"))
+        code = code_routes(read_admin_source(args.admin))
         docs, duplicates = doc_routes(args.doc.read_text(encoding="utf-8"))
     except (OSError, GateError) as exc:
         print(f"[check-admin-routes] FAIL: {exc}", file=sys.stderr)

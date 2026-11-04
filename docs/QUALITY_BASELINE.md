@@ -19,22 +19,29 @@
 
 | 指标 | 值 | 复现命令 |
 | ---- | -- | -------- |
-| 单元测试通过数 | **326** | `cd gateway && cargo test --locked --workspace` |
+| 单元测试通过数 | **360** | `cd gateway && cargo test --locked --workspace` |
 | 单元测试失败数 | **0** | 同上 |
-| 忽略测试数 | **7** | 同上 |
-| 其中：真 live 测试 | **4** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
+| 忽略测试数 | **9** | 同上 |
+| 其中：真 live 测试 | **5** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
 | 其中：串行分配契约测试 | 2 | 需 `--test-threads=1 --include-ignored --exact` |
 | release bandit 臂数 | 8 臂均 <200ns | `cargo test --locked --release bandit` |
-| Python 静态门 | 15 个 | `python tools/check_*.py` |
+| Python 静态门 | **21** 个 | `ls tools/check_*.py`（口径：`tools/` 下 `check_*.py` 且已接入 CI） |
 
-### 7 个忽略测试的构成
+### 9 个忽略测试的构成
 
-**4 个真 live 测试**（依赖外部服务，故默认忽略）：
+**5 个真 live 测试**（依赖外部服务，故默认忽略）：
 
 - `analytics::tests::live_insert_and_sla_roundtrip`（需 ClickHouse）
+- `analytics::tests::live_trace_id_roundtrip`（需 ClickHouse；OPT-R18 P1-1 的
+  「按 trace_id 点查」端到端验证，对应 `docs/OPERATION.md` §4.3）
 - `ch_sink::tests::live_pump_once_lands_rows`（需 ClickHouse）
 - `circuit_breaker::tests::live_quarantine_persists_and_broadcasts`（需 Redis）
 - `telemetry::tests::live_flush_writes_stream`（需 ClickHouse）
+
+**1 个黄金向量生成器**（不是测试，是工具；用 `#[ignore]` 保证常规跑不执行）：
+
+- `bandit::tests::print_replay_parity_vectors`（`cargo test -- --ignored --nocapture` 触发，
+  产出 `tools/replay/linucb_parity.json`，供 `tools/check_replay_parity.py` 做跨语言一致性校验）
 
 **3 个串行分配契约测试**（需进程级分配计数器无并行污染）：
 
@@ -58,7 +65,7 @@ cargo test --locked --workspace router::tests::opt_r11_b1_pick_weighted_streamin
 改动测试后：
 
 1. 跑全量：`cd gateway && cargo test --locked --workspace`，读 `test result:` 行。
-2. 若 `ignored` 数变了，同步更新上面「7 个忽略测试的构成」清单。
+2. 若 `ignored` 数变了，同步更新上面「8 个忽略测试的构成」清单。
 3. 更新本文件表格的三个数字。
 4. 跑 `python tools/check_doc_consistency.py`，它会把所有活文档的数字与本文件对齐。
 5. 在 `EXEC_LOG.md` 记录实测输出。
