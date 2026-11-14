@@ -18,6 +18,8 @@ use super::*;
 /// 未知路径统一占位，避免 404 或畸形路径成为凭据泄漏的旁路。
 pub(super) fn audit_path(path: &str) -> &'static str {
     match path {
+        "/livez" => "/livez",
+        "/readyz" => "/readyz",
         "/api/v1/health" => "/api/v1/health",
         "/api/v1/openapi.json" => "/api/v1/openapi.json",
         "/api/v1/nodes" => "/api/v1/nodes",

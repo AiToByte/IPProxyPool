@@ -1,10 +1,80 @@
-//! Runtime health state and readiness decision model.
+//! Runtime health facts and readiness decision model.
 //!
-//! This module intentionally contains only pure state/decision logic. Listener
-//! ownership, dependency probes, and HTTP routing are wired in a later slice so
-//! readiness cannot accidentally become a synonym for process startup.
+//! The evaluator is pure and has no dependency I/O. Runtime facts are updated by
+//! startup/shutdown wiring and bounded local health observers, then consumed by
+//! HTTP handlers to return stable, low-cardinality probe responses.
 
-#![cfg_attr(not(test), allow(dead_code))]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Shared runtime facts for health handlers and startup/shutdown wiring.
+///
+/// `config_valid` and `required_listener_ready` start false: process creation or
+/// listener registration alone must never imply readiness. Dependency policy is
+/// provided by `RuntimeFacts` snapshots so this state stays free of I/O.
+pub(crate) struct RuntimeHealthState {
+    config_valid: AtomicBool,
+    required_listener_ready: AtomicBool,
+    required_dependency_ready: AtomicBool,
+    optional_dependencies_ready: AtomicBool,
+    drain_requested: AtomicBool,
+    stopped: AtomicBool,
+}
+
+impl RuntimeHealthState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            config_valid: AtomicBool::new(false),
+            required_listener_ready: AtomicBool::new(false),
+            required_dependency_ready: AtomicBool::new(false),
+            optional_dependencies_ready: AtomicBool::new(true),
+            drain_requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn set_config_valid(&self, ready: bool) {
+        self.config_valid.store(ready, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_required_listener_ready(&self, ready: bool) {
+        self.required_listener_ready.store(ready, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_required_dependency_ready(&self, ready: bool) {
+        self.required_dependency_ready
+            .store(ready, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_optional_dependencies_ready(&self, ready: bool) {
+        self.optional_dependencies_ready
+            .store(ready, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn request_drain(&self) {
+        self.drain_requested.store(true, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn evaluate(&self) -> ReadinessDecision {
+        evaluate_readiness(RuntimeFacts {
+            config_valid: self.config_valid.load(Ordering::Acquire),
+            required_listener_ready: self.required_listener_ready.load(Ordering::Acquire),
+            required_dependency_ready: self.required_dependency_ready.load(Ordering::Acquire),
+            optional_dependencies_ready: self.optional_dependencies_ready.load(Ordering::Acquire),
+            drain_requested: self.drain_requested.load(Ordering::Acquire),
+            stopped: self.stopped.load(Ordering::Acquire),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimePhase {
@@ -24,6 +94,32 @@ pub(crate) enum ReadinessReason {
     ListenerUnavailable,
     Draining,
     Stopped,
+}
+
+impl RuntimePhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl ReadinessReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::OptionalDependencyDegraded => "optional_dependency_degraded",
+            Self::RequiredDependencyUnavailable => "required_dependency_unavailable",
+            Self::ListenerUnavailable => "listener_unavailable",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +302,26 @@ mod tests {
             ReadinessReason::RequiredDependencyUnavailable
         );
         assert!(!required_dependency_blocked.ready);
+    }
+
+    #[test]
+    fn shared_state_starts_unready_and_changes_with_lifecycle_facts() {
+        let state = RuntimeHealthState::new();
+        let starting = state.evaluate();
+        assert_eq!(starting.phase, RuntimePhase::Starting);
+        assert!(!starting.ready);
+
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+        let ready = state.evaluate();
+        assert_eq!(ready.phase, RuntimePhase::Ready);
+        assert!(ready.ready);
+
+        state.request_drain();
+        let draining = state.evaluate();
+        assert_eq!(draining.phase, RuntimePhase::Draining);
+        assert!(!draining.ready);
     }
 
     #[test]

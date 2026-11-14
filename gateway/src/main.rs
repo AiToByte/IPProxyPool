@@ -395,7 +395,29 @@ fn main() {
     server.run_forever();
 }
 
-/// 原 async main 本体：装配全部依赖＋后台 workers，返回配好的 Server。
+/// Poll the configured data-plane socket until Pingora has successfully bound it.
+///
+/// This is a bounded, local TCP connect probe rather than a request-path dependency
+/// check. It closes immediately after confirming the listener accepts connections.
+async fn monitor_required_listener(addr: String, health: Arc<health::RuntimeHealthState>) {
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                health.set_required_listener_ready(true);
+                return;
+            }
+            Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// Assemble the Gateway and its background workers from validated startup inputs.
 async fn setup_gateway() -> Server {
     // 先完成所有纯配置校验，再创建 listener 或发起任何外部依赖连接。
     let startup_input = startup_config::StartupConfigInput::from_environment();
@@ -417,6 +439,8 @@ async fn setup_gateway() -> Server {
             std::process::exit(1);
         }
     };
+    let runtime_health = health::RuntimeHealthState::new();
+    runtime_health.set_config_valid(true);
 
     // Redis stream shard count was validated in startup config before any I/O.
     // 显式开关在纯配置阶段已校验，不设置时不创建 listener。
@@ -452,6 +476,11 @@ async fn setup_gateway() -> Server {
             None
         }
     };
+
+    runtime_health.set_required_dependency_ready(
+        startup.tenant_store != startup_config::TenantStoreMode::Redis || redis_conn.is_some(),
+    );
+    runtime_health.set_optional_dependencies_ready(redis_conn.is_some());
 
     // 2a. OPT-2 API Key 环境门：D3 起默认开启（`REQUIRE_API_KEY=0` 显式关闭）。
     // 开启后，未带 `X-API-Key` 头的请求在网关入口直接 403（见 gateway.rs）；
@@ -1386,6 +1415,7 @@ async fn setup_gateway() -> Server {
     // OPT-R4 S5: signal watcher holds the only shutdown Sender alive.
     // ctrl_c everywhere; SIGTERM additionally on unix. Firing stops
     // background respawns (data-plane drain stays governed by pingora grace).
+    let runtime_health_for_signal = runtime_health.clone();
     let signal_tx = shutdown_tx;
     let flush_on_shutdown = tenant_mgr.clone();
     tokio::spawn(async move {
@@ -1403,6 +1433,7 @@ async fn setup_gateway() -> Server {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
+        runtime_health_for_signal.request_drain();
         log::warn!("[Shutdown] signal received, stopping background respawns");
         // OPT-R18 P2-2：停机前补一次 flush（best-effort）。
         //
@@ -1456,11 +1487,18 @@ async fn setup_gateway() -> Server {
     );
     proxy_service.add_tcp(&gateway_addr);
 
+    let listener_probe_health = runtime_health.clone();
+    let listener_probe_addr = gateway_addr.clone();
+    tokio::spawn(async move {
+        monitor_required_listener(listener_probe_addr, listener_probe_health).await;
+    });
+
     log::info!(
         "Pingora Smart Proxy Gateway (GW-4 tenants + arbitrage + metrics) on {gateway_addr}"
     );
     server.add_service(proxy_service);
 
+    // The local monitor flips readiness only after a real TCP accept path succeeds.
     // CONNECT 专项使用独立 Pingora ServerApp listener；环境变量缺省或空值时不注册，
     // 因而既有普通 ProxyHttp 端口及行为保持不变。
     if let Some(connect_addr) = connect_addr {
@@ -1495,6 +1533,7 @@ async fn setup_gateway() -> Server {
         metrics: metrics.clone(),
         admin_api_key,
         autotune: Arc::new(AutotuneConfig::new()),
+        health: runtime_health.clone(),
     };
     let admin_app = admin_router(admin_state);
     tokio::spawn(async move {

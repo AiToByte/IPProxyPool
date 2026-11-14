@@ -34,7 +34,7 @@
 | `analytics.rs` | 8 | 落库查询：SLA 窗口＋注入守卫 | `AnalyticsEngine/sla_sql/normalize_sla_rate` |
 | `tenant.rs` | 26 | 租户：鉴权/QPS/并发/计费（Free $0） | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
 | `vendor_arbitrage.rs` | 5 | 套利：付费 80/95＋免费 50/80 分档 | `arbitrage_action/free_pool_action/VendorArbitrageWorker` |
-| `startup_config.rs` | 6 | 启动配置：typed preflight、Admin/Gateway/Metrics/CONNECT/Redis/TenantStore 解析与非 Unicode 错误拒绝、脱敏诊断 | `StartupConfigInput/StartupConfig/parse_startup_config` |
+| `startup_config.rs` | 6 | 启动配置：typed preflight、Admin/Gateway/Metrics/CONNECT/Redis/TenantStore/API key 解析与非 Unicode 错误拒绝、脱敏诊断 | `StartupConfigInput/StartupConfig/parse_startup_config` |
 | `metrics/mod.rs` | 29 | 指标：:9091 exposition，新增 CONNECT admission、字节与隧道寿命指标 | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
 | `prober.rs` | 7 | 存活探针：双源降级＋Client 池＋闲置淘汰 | `CanaryProber/extract_exit_ip/ProbeResult` |
 | `pool.rs` | 10 | 预热：建链/握手探测＋信号量＋票据 | `ConnectionPrewarmer/WarmStats` |
@@ -42,14 +42,14 @@
 | `geo.rs` | 4 | 画像：GeoIP 查询＋mismatch 判定（无库 Disabled） | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS 翻译桥：显式 socks 请求出站＋hop 过滤＋body 上限 | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | 握手：RFC1928/1929＋SOCKS4/4a＋greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 20 | Admin REST 面：:9092 独立服务，`/api/v1/*` 统一 `X-Admin-Key`，fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
+| `admin/mod.rs` | 24 | Admin REST 面：:9092 独立服务；公开 `/livez`/`/readyz` 健康探针；`/api/v1/*` 统一 `X-Admin-Key`、fail-closed | `AdminState/router/RuntimeHealthState` |
 | `node_registry.rs` | 14 | 控制面节点注册表：运行时增删＋原子持久化（进程重启不丢） | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | 淘汰计数助手：四处 sweep 共用一份「淘汰并报数」逻辑 | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 6 | 纯 liveness/readiness 状态决策模型：starting/ready/degraded/draining/stopped | `RuntimePhase/evaluate_readiness/ReadinessDecision` |
+| `health.rs` | 7 | 纯 liveness/readiness 状态决策模型与共享运行时快照：starting/ready/degraded/draining/stopped | `RuntimeHealthState/RuntimePhase/evaluate_readiness` |
 
-**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 442（其中 432 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
+**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 447（其中 437 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
@@ -169,8 +169,7 @@ GeoIP / 免费线漏斗）。**段序即输出序**，调整会改变抓取端�
 
 `admin` 模块曾 1791 行，结构上是"**一个 800 行的 `build_router_with`**"——路由表、
 中间件、16 个 REST 处理器全挤在同一段区间，改一个端点要在 1200 行里定位。现按职责拆为
-父模块 `admin/mod.rs`（287：状态＋路由装配＋OpenAPI 聚合＋超时常量）＋ 6 个子模块。
-**子模块的测试数已并入上表的 `admin/mod.rs` 行**；组件职责表目前共 26 行，子模块仍折叠在父模块行中。
+父模块 `admin/mod.rs`（新增公开探针并保留 admin auth），其子模块测试数已并入表中该行。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -226,7 +225,7 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `connect.rs` | 23 | Optional standard HTTP/1.1 CONNECT: authority parsing, auth, standalone listener, bidirectional tunnel | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
 | `router.rs` | 73 | Routing: weighted/sticky/quarantine/atomic swap/arbitrage scaling/active-health gate | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | Models: node/spec/context + tier canonicalization | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
-| `startup_config.rs` | 6 | Startup configuration: typed preflight, Admin/Gateway/Metrics/CONNECT/Redis/TenantStore parsing, non-Unicode rejection, and sanitized diagnostics | `StartupConfigInput/StartupConfig/parse_startup_config` |
+| `startup_config.rs` | 6 | Startup configuration: typed preflight, Admin/Gateway/Metrics/CONNECT/Redis/TenantStore/API key parsing, non-Unicode rejection, and sanitized diagnostics | `StartupConfigInput/StartupConfig/parse_startup_config` |
 | `free_pool/mod.rs` | 59 | Free 2nd line: fetch/two-stage verify/registry/circuit-break/merge | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
 | `bandit.rs` | 18 | LinUCB d=4 routing + per-tier forgetting + free risk premium | `forget_every_for_tier/cost_weight_for_tier/FREE_RISK_PREMIUM` |
 | `telemetry.rs` | 7 | Telemetry: MPSC batched XADD + idempotency + dual drop counters | `TelemetryPublisher/TelemetryWorker/TelemetryEvent` |
@@ -242,12 +241,12 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `geo.rs` | 4 | Profiling: GeoIP lookup + mismatch verdict (Disabled w/o DB) | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS egress bridge: explicit-socks requests + hop filter + body cap | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | Handshake: RFC1928/1929 + SOCKS4/4a + greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 20 | Admin REST surface: standalone :9092, `/api/v1/*` behind `X-Admin-Key`, fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
+| `admin/mod.rs` | 24 | Admin REST surface: standalone :9092, public `/livez`/`/readyz` probes, `/api/v1/*` behind `X-Admin-Key` (fail-closed) | `AdminState/router/RuntimeHealthState` |
 | `node_registry.rs` | 14 | Control-plane node registry: runtime add/remove + atomic persistence (survives restart) | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | Eviction-count helper: one shared "evict and report" path for four sweeps | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | Transport connector abstraction: tokio today, io_uring hook on Linux | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 6 | Pure liveness/readiness decision model: starting/ready/degraded/draining/stopped | `RuntimePhase/evaluate_readiness/ReadinessDecision` |
+| `health.rs` | 7 | Pure liveness/readiness decision model and shared runtime snapshot: starting/ready/degraded/draining/stopped | `RuntimeHealthState/RuntimePhase/evaluate_readiness` |
 
 
 `startup_config.rs` is a pure startup parser helper, including environment collection and invalid-Unicode rejection. The responsibility table also includes `health.rs`, which owns only pure readiness decisions; HTTP wiring remains a separate approved slice.
@@ -388,12 +387,7 @@ lines). It immediately caught a real defect — see below.
 
 ### 1.5 `admin` internal submodules (OPT-R18 P2-1, fifth batch)
 
-The `admin` module used to be 1791 lines, structurally "**one 800-line
-`build_router_with`**" — route table, middleware and 16 REST handlers crammed into one
-range, so changing a single endpoint meant locating it inside 1200 lines. It is now the
-parent module `admin/mod.rs` (287: state + route assembly + OpenAPI aggregation + timeout
-constant) plus 6 submodules. **Submodule tests are folded into the `admin/mod.rs` row
-above**; the component table has 26 rows total and keeps submodules folded into their parent row.
+The Admin module used to be 1791 lines with route registration, middleware, and REST handlers in one file. It is now split by responsibility, with unauthenticated health probes mounted outside the protected API prefix. Submodule tests roll up into the `admin/mod.rs` row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|

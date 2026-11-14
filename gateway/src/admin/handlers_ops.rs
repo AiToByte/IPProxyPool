@@ -6,7 +6,42 @@
 
 use super::*;
 
-/// GET `/api/v1/health` —— 服务健康检查。
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProbeResponse {
+    pub status: &'static str,
+    pub phase: &'static str,
+    pub reason: &'static str,
+}
+
+/// `GET /livez` is intentionally unauthenticated and independent of dependencies.
+pub(super) async fn livez_handler() -> Json<ProbeResponse> {
+    Json(ProbeResponse {
+        status: "ok",
+        phase: "live",
+        reason: "event_loop_responding",
+    })
+}
+
+/// `GET /readyz` reports only fixed state labels and never probes dependencies inline.
+pub(super) async fn readyz_handler(
+    State(state): State<AdminState>,
+) -> (StatusCode, Json<ProbeResponse>) {
+    let decision = state.health.evaluate();
+    let status = if decision.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ProbeResponse {
+            status: if decision.ready { "ok" } else { "unready" },
+            phase: decision.phase.as_str(),
+            reason: decision.reason.as_str(),
+        }),
+    )
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/health",

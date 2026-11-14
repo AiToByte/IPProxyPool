@@ -242,6 +242,7 @@ fn auth_middleware_rejects_missing_key() {
         metrics: Arc::new(MetricsRegistry::new()),
         admin_api_key: "test-key".to_string(),
         autotune: Arc::new(AutotuneConfig::new()),
+        health: crate::health::RuntimeHealthState::new(),
     };
     assert!(!_state.admin_api_key.is_empty());
 }
@@ -255,7 +256,98 @@ fn error_response_carries_status_and_message() {
     assert_eq!(body.error, "boom");
 }
 
-// ---- 以下为 axum oneshot 全链路契约测试（本轮契约修复的锁定回归）----
+#[tokio::test]
+async fn public_livez_and_readyz_are_outside_admin_auth() {
+    let state = test_state(vec![], &[]);
+    state.health.set_config_valid(true);
+    state.health.set_required_listener_ready(true);
+    state.health.set_required_dependency_ready(true);
+    let app = super::router(state);
+    for (path, expected_status) in [("/livez", StatusCode::OK), ("/readyz", StatusCode::OK)] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), expected_status, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn readyz_degrades_but_remains_ready_when_optional_dependency_is_unavailable() {
+    let state = test_state(vec![], &[]);
+    state.health.set_config_valid(true);
+    state.health.set_required_listener_ready(true);
+    state.health.set_required_dependency_ready(true);
+    state.health.set_optional_dependencies_ready(false);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Body::empty())
+        .expect("request");
+    let response = super::router(state)
+        .oneshot(request)
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("readiness body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON readiness body");
+    assert_eq!(body["phase"], "degraded");
+    assert_eq!(body["reason"], "optional_dependency_degraded");
+}
+
+#[tokio::test]
+async fn readyz_fails_when_required_listener_is_unavailable() {
+    let state = test_state(vec![], &[]);
+    state.health.set_config_valid(true);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Body::empty())
+        .expect("request");
+    let response = super::router(state)
+        .oneshot(request)
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn legacy_health_remains_authenticated_and_unchanged() {
+    let app = super::router(test_state(vec![], &[]));
+
+    let unauthorized = Request::builder()
+        .method("GET")
+        .uri("/api/v1/health")
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(
+        app.clone()
+            .oneshot(unauthorized)
+            .await
+            .expect("oneshot")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let authorized = Request::builder()
+        .method("GET")
+        .uri("/api/v1/health")
+        .header("X-Admin-Key", KEY)
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(authorized).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("health body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON health body");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["service"], "ipproxy-pool-admin");
+}
 
 const KEY: &str = "test-key";
 
@@ -271,6 +363,7 @@ fn test_state(nodes: Vec<ProxyNode>, tenants: &[&str]) -> AdminState {
         metrics: Arc::new(MetricsRegistry::new()),
         admin_api_key: KEY.to_string(),
         autotune: Arc::new(AutotuneConfig::new()),
+        health: crate::health::RuntimeHealthState::new(),
     }
 }
 
@@ -764,6 +857,7 @@ async fn weight_patch_persists_for_managed_nodes() {
         metrics: Arc::new(MetricsRegistry::new()),
         admin_api_key: KEY.to_string(),
         autotune: Arc::new(AutotuneConfig::new()),
+        health: crate::health::RuntimeHealthState::new(),
     };
     let app = super::router(state);
     let (status, _) = send_json(

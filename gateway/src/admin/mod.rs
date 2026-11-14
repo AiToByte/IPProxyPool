@@ -50,6 +50,8 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// GW-6 自动调权配置（`Arc` 共享，可安全 Clone 传入 axum state 与中间件）。
     pub autotune: Arc<AutotuneConfig>,
+    /// Shared liveness/readiness facts updated by startup and shutdown wiring.
+    pub health: Arc<crate::health::RuntimeHealthState>,
 }
 
 impl Clone for AdminState {
@@ -61,6 +63,7 @@ impl Clone for AdminState {
             metrics: Arc::clone(&self.metrics),
             admin_api_key: self.admin_api_key.clone(),
             autotune: Arc::clone(&self.autotune),
+            health: Arc::clone(&self.health),
         }
     }
 }
@@ -283,6 +286,8 @@ fn build_router_with(
     let audit = middleware::from_fn(audit_logging);
 
     Router::new()
+        .route("/livez", get(livez_handler))
+        .route("/readyz", get(readyz_handler))
         .nest(
             "/api/v1",
             api.layer(middleware::from_fn_with_state(
