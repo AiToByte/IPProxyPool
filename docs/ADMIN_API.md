@@ -16,7 +16,8 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 | `Authorization: Admin <key>` | 等效替代方案，兼容 Bearer 风格 |
 
 **安全边界**：
-- `ADMIN_API_KEY` 未设置时，所有 Admin 请求返回 `401 Unauthorized`（fail-closed，不泄露任何节点/租户信息）。
+- `ADMIN_API_KEY` 未设置或为空时，所有 Admin 请求返回 `401 Unauthorized`（fail-closed，不泄露任何节点/租户信息）。
+- Admin 服务使用明文 HTTP。默认仅绑定 `127.0.0.1:9092`；不要将非回环监听直接暴露到不受信网络。容器或反代场景应限制在受信私有网络，或在 TLS 终止代理后使用，并确保代理到网关的链路也处于受信网络中。
 - Admin Key 与网关 `X-API-Key` 独立，不可互换。
 
 ---
@@ -446,8 +447,8 @@ curl -s http://127.0.0.1:9092/api/v1/health
 ## 6. 部署注意 / Deployment
 
 - Admin 服务缺省绑定 `127.0.0.1:9092`，可通过环境变量 `ADMIN_ADDR` 覆写。
-  容器内必须设为 `0.0.0.0:9092`，否则宿主端口映射无法访问。
-- 生产环境 **必须** 设置 `ADMIN_API_KEY` 为强随机值，否则 Admin 接口全部返回 401。
+  容器内必须设为 `0.0.0.0:9092`，否则宿主端口映射无法访问。Admin API 当前是明文 HTTP；非回环绑定只适用于受信私有网络，或由 TLS 终止代理保护且代理到网关的链路也受信的部署。
+- 生产环境 **必须** 设置 `ADMIN_API_KEY` 为强随机非空值；未设置或为空时 Admin 请求全部返回 401。
 - Admin 服务由网关进程内托管（`tokio::spawn`），随网关一起启停，无需额外进程。
 
 ### 节点持久化 / Node Persistence

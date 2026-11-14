@@ -3,7 +3,8 @@
 > 双语：中文在前，English after. Bilingual: Chinese first, English second.
 > 数据来源：`gateway/src/`。模块集合、每行「单测」数、标题里的模块计数，以及
 > 每个「关键 API」标识符是否真实存在，全部由
-> `tools/check_components_docs.py` 在 CI 断言——**这些列不需要手抄，也不能手改**。
+> `tools/check_components_docs.py` 在 CI 断言——**模块集合与 API 列不需要手抄，也不能手改**。
+> 单测列需随源码测试变更同步；本表合计含当前测试属性口径，权威通过/忽略测试数见 `QUALITY_BASELINE.md`。
 > Data source: `gateway/src/`. Module set, per-row test counts, heading counts,
 > and the existence of every "Key APIs" identifier are asserted in CI by
 > `tools/check_components_docs.py`.
@@ -11,44 +12,50 @@
 > 为何没有「行数」列：任何一行代码改动都会让它过期。设精确门禁则每个 PR 假红，
 > 不设则它长期是假的——保留一个无法维护的数字等于保留一句对外失实。
 > 体量信号改由「单测」承担（它被门禁守住，且合计与 `QUALITY_BASELINE.md` 自洽）。
+>
+> `startup_config.rs` 是新增加的纯启动配置辅助模块；为保持组件职责表的稳定结构，其 3 个解析测试计入 `main.rs`（启动装配），源文件本身不单独占职责行。
 
 ## 中文
 
-### 1. 模块表（24 个）
+### 1. 模块表（26 个）
 
 | 模块 | 单测 | 职责 | 关键 API |
 |------|------|------|----------|
-| `main.rs` | 16 | 装配：env 接线/supervisor/后台 ticker/Pingora 启动/平台感知优雅期 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 40 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
-| `router.rs` | 62 | 选路：加权/粘滞/隔离/原子替换/套利缩放/主动健康探测闸门 | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
+| `main.rs` | 22 | 装配：env 接线/supervisor/后台 ticker/Pingora 启动/平台感知优雅期 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 43 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `connect.rs` | 23 | 可选标准 HTTP/1.1 CONNECT：authority 解析、鉴权、独立 listener、双向隧道 | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
+| `router.rs` | 73 | 选路：加权/粘滞/隔离/原子替换/套利缩放/主动健康探测闸门 | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | 模型：节点/规格/上下文＋tier 归一 | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
 | `free_pool/mod.rs` | 59 | 免费第二线：抓取/两级质检/注册/熔断/合并 | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
 | `bandit.rs` | 18 | LinUCB d=4 选路＋分档遗忘＋免费风险溢价 | `forget_every_for_tier/cost_weight_for_tier/FREE_RISK_PREMIUM` |
 | `telemetry.rs` | 7 | 遥测：MPSC 批量 XADD＋幂等＋双丢弃计数 | `TelemetryPublisher/TelemetryWorker/TelemetryEvent` |
 | `circuit_breaker.rs` | 13 | 熔断：Stream 消费＋隔离＋目标合法性守卫 | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
-| `ch_sink.rs` | 7 | 数仓泵：认领/去重/批量落库/hold 重放 | `ChSinkWorker/parse_entry/SeenIds` |
+| `ch_sink.rs` | 11 | 数仓泵：游标分页认领/去重/批量落库/hold 重放 | `ChSinkWorker/parse_entry/SeenIds` |
 | `analytics.rs` | 8 | 落库查询：SLA 窗口＋注入守卫 | `AnalyticsEngine/sla_sql/normalize_sla_rate` |
-| `tenant.rs` | 23 | 租户：鉴权/QPS/并发/计费（Free $0） | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
+| `tenant.rs` | 26 | 租户：鉴权/QPS/并发/计费（Free $0） | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
 | `vendor_arbitrage.rs` | 5 | 套利：付费 80/95＋免费 50/80 分档 | `arbitrage_action/free_pool_action/VendorArbitrageWorker` |
-| `metrics/mod.rs` | 29 | 指标：:9091 exposition，16 组信号 | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
+| `startup_config.rs` | 3 | 启动配置：Admin bind 地址解析与 fail-fast 校验 | `parse_admin_addr/ADMIN_ADDR_ERROR` |
+| `metrics/mod.rs` | 29 | 指标：:9091 exposition，新增 CONNECT admission、字节与隧道寿命指标 | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
 | `prober.rs` | 7 | 存活探针：双源降级＋Client 池＋闲置淘汰 | `CanaryProber/extract_exit_ip/ProbeResult` |
 | `pool.rs` | 10 | 预热：建链/握手探测＋信号量＋票据 | `ConnectionPrewarmer/WarmStats` |
 | `fingerprint.rs` | 2 | 指纹：Chrome 8 头对齐＋传输选项 | `FingerprintHardener/TCP_WINDOW_BYTES` |
 | `geo.rs` | 4 | 画像：GeoIP 查询＋mismatch 判定（无库 Disabled） | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS 翻译桥：显式 socks 请求出站＋hop 过滤＋body 上限 | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | 握手：RFC1928/1929＋SOCKS4/4a＋greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 17 | Admin REST 面：:9092 独立服务，`/api/v1/*` 统一 `X-Admin-Key`，fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
+| `admin/mod.rs` | 20 | Admin REST 面：:9092 独立服务，`/api/v1/*` 统一 `X-Admin-Key`，fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
 | `node_registry.rs` | 14 | 控制面节点注册表：运行时增删＋原子持久化（进程重启不丢） | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | 淘汰计数助手：四处 sweep 共用一份「淘汰并报数」逻辑 | `removed_count` |
-| `redis_shard.rs` | 3 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
+| `redis_shard.rs` | 9 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
+
+**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 431（其中 421 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
 `router.rs` 曾是 3564 行的单文件巨型模块（选路＋粘滞＋隔离＋主动健康＋套利缩放
 ＋控制面增删混在一起）。P2-1 把它按职责拆为父模块 `router.rs`（结构定义＋构造器）
-＋ 5 个子模块文件。**子模块的测试数已并入上表的 `router.rs` 行**（62 = 52 + 10），
-故模块表仍是 24 行——读者按"职责"建心智模型，拆成 7 行反而会误导。
+＋ 5 个子模块文件。**子模块的测试数已并入上表的 `router.rs` 行**（69 = 59 + 10），
+故这张职责表目前有 26 行（含 `startup_config.rs` 独立模块），`router` 的 7 个子模块仍折叠在父模块行中。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -69,8 +76,7 @@ method）调用方直接 `engine.foo()` 即可，再导出会触发 `unused_impo
 
 `free_pool` 模块曾是 3727 行的单文件（抓取源＋两级质检＋注册表状态＋后台 worker
 混在一起）。现按职责拆为父模块 `free_pool/mod.rs`（类型定义＋`shared_client`＋
-再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，
-故模块表仍是 24 行。
+再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，职责表目前共 26 行，子模块仍不单独占行。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -95,7 +101,7 @@ method）调用方直接 `engine.foo()` 即可，再导出会触发 `unused_impo
 `gateway` 模块曾 2275 行的单文件，把**四类职责**混在一起：鉴权/分档的纯判定、
 LinUCB 选路上下文、上游 peer 装配、SOCKS 桥转发，外加 40 个单测。现按职责拆为
 父模块 `gateway/mod.rs`（结构体＋追踪 ID＋`parse_routing_spec`＋再导出）＋ 6 个子模块。
-**子模块的测试数已并入上表的 `gateway/mod.rs` 行**，故模块表仍是 24 行。
+**子模块的测试数已并入上表的 `gateway/mod.rs` 行**；组件职责表目前共 26 行，子模块仍折叠在父模块行中。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -163,7 +169,7 @@ GeoIP / 免费线漏斗）。**段序即输出序**，调整会改变抓取端�
 `admin` 模块曾 1791 行，结构上是"**一个 800 行的 `build_router_with`**"——路由表、
 中间件、16 个 REST 处理器全挤在同一段区间，改一个端点要在 1200 行里定位。现按职责拆为
 父模块 `admin/mod.rs`（287：状态＋路由装配＋OpenAPI 聚合＋超时常量）＋ 6 个子模块。
-**子模块的测试数已并入上表的 `admin/mod.rs` 行**，故模块表仍是 24 行。
+**子模块的测试数已并入上表的 `admin/mod.rs` 行**；组件职责表目前共 26 行，子模块仍折叠在父模块行中。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -210,34 +216,38 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 
 ## English
 
-### 1. Modules (24)
+### 1. Modules (26)
 
 | Module | Tests | Responsibility | Key APIs |
 |--------|-------|----------------|----------|
-| `main.rs` | 16 | Wiring: env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 40 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge short-circuit | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
-| `router.rs` | 62 | Routing: weighted/sticky/quarantine/atomic swap/arbitrage scaling/active-health gate | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
+| `main.rs` | 22 | Wiring: env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 43 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge short-circuit | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `connect.rs` | 23 | Optional standard HTTP/1.1 CONNECT: authority parsing, auth, standalone listener, bidirectional tunnel | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
+| `router.rs` | 73 | Routing: weighted/sticky/quarantine/atomic swap/arbitrage scaling/active-health gate | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | Models: node/spec/context + tier canonicalization | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
+| `startup_config.rs` | 3 | Startup configuration: Admin bind parsing and fail-fast validation | `parse_admin_addr/ADMIN_ADDR_ERROR` |
 | `free_pool/mod.rs` | 59 | Free 2nd line: fetch/two-stage verify/registry/circuit-break/merge | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
 | `bandit.rs` | 18 | LinUCB d=4 routing + per-tier forgetting + free risk premium | `forget_every_for_tier/cost_weight_for_tier/FREE_RISK_PREMIUM` |
 | `telemetry.rs` | 7 | Telemetry: MPSC batched XADD + idempotency + dual drop counters | `TelemetryPublisher/TelemetryWorker/TelemetryEvent` |
 | `circuit_breaker.rs` | 13 | Breaker: stream consume + quarantine + target-validity guard | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
-| `ch_sink.rs` | 7 | Warehouse pump: claim/dedup/batch land/hold replay | `ChSinkWorker/parse_entry/SeenIds` |
+| `ch_sink.rs` | 11 | Warehouse pump: cursor-paged claim/dedup/batch land/hold replay | `ChSinkWorker/parse_entry/SeenIds` |
 | `analytics.rs` | 8 | Warehouse queries: SLA window + injection guard | `AnalyticsEngine/sla_sql/normalize_sla_rate` |
-| `tenant.rs` | 23 | Tenants: auth/QPS/concurrency/billing (Free $0) | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
+| `tenant.rs` | 26 | Tenants: auth/QPS/concurrency/billing (Free $0) | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
 | `vendor_arbitrage.rs` | 5 | Arbitrage: paid 80/95 + free 50/80 bands | `arbitrage_action/free_pool_action/VendorArbitrageWorker` |
-| `metrics/mod.rs` | 29 | Metrics: :9091 exposition, 16 signal groups | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
+| `metrics/mod.rs` | 29 | Metrics: :9091 exposition, including CONNECT admission, bytes, and tunnel lifetime | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
 | `prober.rs` | 7 | Liveness probe: dual-source fallback + client pool + idle eviction | `CanaryProber/extract_exit_ip/ProbeResult` |
 | `pool.rs` | 10 | Prewarm: connect/handshake probe + semaphore + tickets | `ConnectionPrewarmer/WarmStats` |
 | `fingerprint.rs` | 2 | Fingerprint: Chrome 8-header alignment + transport opts | `FingerprintHardener/TCP_WINDOW_BYTES` |
 | `geo.rs` | 4 | Profiling: GeoIP lookup + mismatch verdict (Disabled w/o DB) | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS egress bridge: explicit-socks requests + hop filter + body cap | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | Handshake: RFC1928/1929 + SOCKS4/4a + greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 17 | Admin REST surface: standalone :9092, `/api/v1/*` behind `X-Admin-Key`, fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
+| `admin/mod.rs` | 20 | Admin REST surface: standalone :9092, `/api/v1/*` behind `X-Admin-Key`, fail-closed | `AdminState/error_response/AddNodeRequest/NodeView` |
 | `node_registry.rs` | 14 | Control-plane node registry: runtime add/remove + atomic persistence (survives restart) | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | Eviction-count helper: one shared "evict and report" path for four sweeps | `removed_count` |
-| `redis_shard.rs` | 3 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
+| `redis_shard.rs` | 9 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | Transport connector abstraction: tokio today, io_uring hook on Linux | `TcpConnector/TokioTcpConnector` |
+
+`startup_config.rs` is a new pure startup parser helper. To keep component ownership and the historical test baseline stable, its three parser tests are grouped under the `main.rs` startup-assembly row; the responsibility table excludes this helper and lists the other 25 top-level responsibility modules.
 
 ### 1.1 `router` internal submodules (OPT-R18 P2-1 split)
 
@@ -271,8 +281,8 @@ via `use super::*` does not count as a "use").
 The `free_pool` module used to be a 3727-line single file (fetch sources + two-stage
 verify + registry state + background worker all mixed together). It is now the
 parent module `free_pool/mod.rs` (types + `shared_client` + re-exports) plus 5
-submodules. **Submodule tests are folded into the `free_pool/mod.rs` row above**,
-so the module table stays at 24 rows.
+submodules. **Submodule tests are folded into the `free_pool/mod.rs` row above**;
+the component table has 26 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|
@@ -300,8 +310,7 @@ The `gateway` module used to be a 2275-line single file mixing **four concerns**
 pure auth/tier decisions, LinUCB routing context, upstream peer assembly, and SOCKS
 bridge forwarding — plus 40 unit tests. It is now the parent module `gateway/mod.rs`
 (struct + trace id + `parse_routing_spec` + re-exports) plus 6 submodules.
-**Submodule tests are folded into the `gateway/mod.rs` row above**, so the module
-table stays at 24 rows.
+**Submodule tests are folded into the `gateway/mod.rs` row above**; the component table has 26 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|
@@ -381,7 +390,7 @@ The `admin` module used to be 1791 lines, structurally "**one 800-line
 range, so changing a single endpoint meant locating it inside 1200 lines. It is now the
 parent module `admin/mod.rs` (287: state + route assembly + OpenAPI aggregation + timeout
 constant) plus 6 submodules. **Submodule tests are folded into the `admin/mod.rs` row
-above**, so the module table stays at 24 rows.
+above**; the component table has 26 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|

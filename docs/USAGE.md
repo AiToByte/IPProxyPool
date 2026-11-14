@@ -34,7 +34,7 @@ D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\M
 curl.exe -x http://127.0.0.1:18080 -H "X-Api-Key: default_key" http://127.0.0.1:8888/    # 200（直连网关同法是 400）
 ```
 
-Windows 系统代理（按需手动执行，脚本不自动改系统）：设置 → 网络和 Internet → 代理 → 手动设置 → 地址 `127.0.0.1` 端口 `18080`（仅 HTTP；HTTPS 走 CONNECT 会被 501 拒绝，见限制表）。PowerShell 写法（管理员，按需）：
+Windows 系统代理（按需手动执行，脚本不自动改系统）：设置 → 网络和 Internet → 代理 → 手动设置 → 地址 `127.0.0.1` 端口 `18080`（HTTP；适配器暂不转发 CONNECT。独立 CONNECT listener 需另行启用 `CONNECT_ADDR`，明文仅允许回环绑定）。PowerShell 写法（管理员，按需）：
 
 ```powershell
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" ProxyEnable 1
@@ -42,7 +42,7 @@ Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 # 还原：ProxyEnable 0
 ```
 
-PAC 自动分流（`tools/ipp.pac`）：浏览器代理自动配置 URL 用 `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`；HTTP 走适配器 `127.0.0.1:18080`，HTTPS（CONNECT）与内网/局域网直连 `DIRECT`（绕开适配器 501 限制，见限制表）。
+PAC 自动分流（`tools/ipp.pac`）：浏览器代理自动配置 URL 用 `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`；HTTP 走适配器 `127.0.0.1:18080`，HTTPS（CONNECT）与内网/局域网直连 `DIRECT`。适配器当前不转发 CONNECT。
 
 ### 方式四：一键启停与观测（`tools/ipp.ps1`）
 
@@ -67,7 +67,7 @@ Node 见 `tools/ipp_sdk_node.js`、Go 见 `tools/ipp_sdk_go.go`、.NET 见 `tool
 | **编程错误** | 调用方把 url 用错了 | Python `raise ValueError`／Java `IllegalArgumentException`／Node `throw Error`／**.NET `ArgumentException`**／**Go `return err`（第三个返回值，status 恒 0）** |
 | **网络/网关失败** | 连接失败、超时、503 重试耗尽 | **一律不抛**——返回 status=0＋body 为诊断信息 |
 
-当前只有一种编程错误：**scheme 非 http**。网关是反向式 egress 路由，**不做 CONNECT 隧道**（结论见 `docs/SPIKE_R2.md` 的 E7），所以传 `https://` 必然失败。
+当前只有一种编程错误：**scheme 非 http**。此 SDK 面向普通 HTTP origin-form 入口；`https://` 不能经该 SDK 调用。独立 CONNECT listener 是另一条可选 HTTP/1.1 隧道入口，需显式配置 `CONNECT_ADDR`，不由此 SDK 或前置适配器承载。
 
 正确用法（以 Go 为例，其余语言同理）：
 
@@ -99,7 +99,7 @@ if status != 200 {
 | 事项 | 行为 |
 |------|------|
 | absolute-URI 直连网关 | 400（须经适配器） |
-| CONNECT（HTTPS 隧道） | 适配器 501；请用程序级集成 |
+| CONNECT（HTTPS 隧道） | `ipp_forward.py` 适配器不转发；独立 HTTP/1.1 listener 通过 `CONNECT_ADDR` 显式启用，明文仅允许回环绑定 |
 | chunked 请求体／>10MB | 适配器 501／413 |
 | 免费池水位 | 常态 0（公网存活率极低）；`tier=free` 池空时正确 503 |
 | `tier=free`＋`Authorization`/`Cookie` | 403（D1：匿名共享出口拒收凭据，防泄露给陌生出口；网关自有 `X-API-Key` 不受影响） |
@@ -114,8 +114,8 @@ if status != 200 {
 
 ### FAQ
 
-- **Q: 浏览器能直接用网关吗？** A: 不能直连（absolute-URI 400），经适配器 `:18080` 可用 HTTP；HTTPS 受限见上表。
-- **Q: 程序零改码接入？** A: 设 `HTTP_PROXY=http://127.0.0.1:18080`（仅 HTTP 生效；库若发 CONNECT 则 501）。
+- **Q: 浏览器能直接用网关吗？** A: 普通代理 absolute-URI 不能直连；适配器 `:18080` 支持 HTTP。适配器不转发 CONNECT；独立 CONNECT listener 需显式启用，当前明文仅回环。
+- **Q: Zero-code app onboarding?** A: `HTTP_PROXY=http://127.0.0.1:18080` handles HTTP only; CONNECT clients must use the separate `CONNECT_ADDR` listener.
 - **Q: 如何固定出口？** A: `X-Proxy-Session` 粘滞（同值同节点）；`X-Proxy-Tier` 限定档；免费出口本就轮转，勿假设固定。
 - **Q: 自检/验证结果与预期不符（尤其 200/403 错位）？** A: 先查 shell 代理 env（`$env:http_proxy`）：若经 Clash 且 `no_proxy` 未豁免本机，实测其按 `Host` 头路由代理请求——你的请求可能根本没到网关（如直达 mock 拿到 `mock-a-us` 200，或经 VPN 拿到 VPN 出口）。修法：`no_proxy` 加 `localhost,127.0.0.1` 或清代理 env 后重跑；`curl -v` 首行会明示是否用了代理。
 
@@ -148,7 +148,7 @@ D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\M
 curl.exe -x http://127.0.0.1:18080 -H "X-Api-Key: default_key" http://127.0.0.1:8888/    # 200 (same call direct to gateway is 400)
 ```
 
-Windows system proxy (manual, scripts never touch it): Settings → Network & Internet → Proxy → Manual → `127.0.0.1:18080` (HTTP only; HTTPS CONNECT gets 501, see limits). PowerShell (admin, on demand):
+Windows system proxy (manual, scripts never touch it): Settings → Network & Internet → Proxy → Manual → `127.0.0.1:18080` (HTTP; the adaptor does not forward CONNECT. Enable the separate `CONNECT_ADDR` listener explicitly; plaintext binding is loopback-only). PowerShell (admin, on demand):
 
 ```powershell
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" ProxyEnable 1
@@ -156,7 +156,7 @@ Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 # revert: ProxyEnable 0
 ```
 
-PAC auto-split (`tools/ipp.pac`): browser proxy auto-config URL `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`; HTTP via adaptor `127.0.0.1:18080`, HTTPS (CONNECT) plus intranet/LAN `DIRECT` (bypasses adaptor 501 limits, see limits).
+PAC auto-split (`tools/ipp.pac`): browser proxy auto-config URL `file:///D:/_MyProject/SuperSoft/IPProxyPool/tools/ipp.pac`; HTTP via adaptor `127.0.0.1:18080`, HTTPS (CONNECT) plus intranet/LAN `DIRECT`. The adaptor does not forward CONNECT.
 
 ### Mode 4: One-click ops & observability (`tools/ipp.ps1`)
 
@@ -181,7 +181,7 @@ Node `tools/ipp_sdk_node.js`, Go `tools/ipp_sdk_go.go`, .NET `tools/ipp_sdk_dotn
 | **Programming error** | You passed a bad url | Python `raise ValueError` / Java `IllegalArgumentException` / Node `throw Error` / **.NET `ArgumentException`** / **Go `return err`** (third return value; status is always 0) |
 | **Network/gateway failure** | Connect failure, timeout, 503 retries exhausted | **Never throws** — returns status=0 with the diagnostic in `body` |
 
-There is currently exactly one programming error: **scheme is not http**. The gateway is a reverse-style egress router and does **not** do CONNECT tunnelling (see E7 in `docs/SPIKE_R2.md`), so an `https://` target can never succeed.
+There is currently exactly one programming error: **scheme is not http**. This SDK targets the ordinary HTTP origin-form entry; `https://` is not supported through this SDK. The optional standalone HTTP/1.1 CONNECT listener is a separate entry point, enabled with `CONNECT_ADDR`, and is not handled by this SDK or the forward adaptor.
 
 ```go
 status, body, err := c.Get("http://httpbin.org/ip", nil, 1)
@@ -212,7 +212,7 @@ Consistency is asserted in CI by `tools/check_sdk_contract.py`, which needs **no
 | Item | Behavior |
 |------|----------|
 | absolute-URI direct to gateway | 400 (use the adaptor) |
-| CONNECT (HTTPS tunneling) | adaptor 501; use app-level integration |
+| CONNECT (HTTPS tunneling) | `ipp_forward.py` does not forward CONNECT; enable the standalone HTTP/1.1 listener via `CONNECT_ADDR` (plaintext loopback only) |
 | chunked body / >10MB | adaptor 501 / 413 |
 | Free pool level | usually 0 (tiny public survival); `tier=free` correctly 503 when empty |
 | `tier=free` + `Authorization`/`Cookie` | 403 (D1: anonymous shared egress refuses credentials, blocks leaks to stranger exits; the gateway's own `X-API-Key` unaffected) |
@@ -227,7 +227,7 @@ Consistency is asserted in CI by `tools/check_sdk_contract.py`, which needs **no
 
 ### FAQ
 
-- **Q: Can browsers use the gateway directly?** A: No (absolute-URI 400); via adaptor `:18080` HTTP works; HTTPS limits above.
-- **Q: Zero-code app onboarding?** A: Set `HTTP_PROXY=http://127.0.0.1:18080` (HTTP only; CONNECT from libs gets 501).
+- **Q: Can browsers use the gateway directly?** A: The ordinary proxy entry rejects absolute-form requests; adaptor `:18080` supports HTTP but does not forward CONNECT. The standalone CONNECT listener is opt-in and plaintext loopback-only.
+- **Q: Zero-code app onboarding?** A: `HTTP_PROXY=http://127.0.0.1:18080` handles HTTP only; CONNECT clients must use the separate `CONNECT_ADDR` listener.
 - **Q: Pin the exit?** A: `X-Proxy-Session` sticky (same value, same node); `X-Proxy-Tier` constrains tier; free exits rotate by nature, never assume fixed.
 - **Q: Self-test/verification disagrees with expectations (esp. swapped 200/403)?** A: Check shell proxy env first (`$env:http_proxy`): via Clash without localhost exemption, measured behavior routes proxied requests by `Host` header — your request may never reach the gateway (e.g. hitting mocks directly for a `mock-a-us` 200, or exiting via VPN). Fix: add `localhost,127.0.0.1` to `no_proxy` or clear proxy env and re-run; `curl -v` states proxy use on its first lines.

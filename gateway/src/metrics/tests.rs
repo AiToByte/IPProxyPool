@@ -740,6 +740,26 @@ active_probe_results_total{result="dead"} 0
 # HELP active_probe_unhealthy_nodes Nodes currently removed by active health.
 # TYPE active_probe_unhealthy_nodes gauge
 active_probe_unhealthy_nodes 1
+# HELP connect_tunnels_established_total CONNECT tunnels established by upstream protocol.
+# TYPE connect_tunnels_established_total counter
+# HELP connect_tunnel_terminated_total CONNECT tunnel terminations by reason.
+# TYPE connect_tunnel_terminated_total counter
+# HELP connect_tunnel_active Current CONNECT connections.
+# TYPE connect_tunnel_active gauge
+connect_tunnel_active 0
+# HELP connect_admission_rejected_total CONNECT admission limit rejections.
+# TYPE connect_admission_rejected_total counter
+connect_admission_rejected_total 0
+# HELP connect_bytes_total CONNECT bytes by direction.
+# TYPE connect_bytes_total counter
+connect_bytes_total{direction="upstream"} 0
+connect_bytes_total{direction="downstream"} 0
+# HELP connect_tunnel_duration_ms_sum CONNECT tunnel duration sum in milliseconds.
+# TYPE connect_tunnel_duration_ms_sum counter
+connect_tunnel_duration_ms_sum 0
+# HELP connect_tunnel_closed_total CONNECT tunnels closed.
+# TYPE connect_tunnel_closed_total counter
+connect_tunnel_closed_total 0
 # HELP gateway_transferred_bytes_total Egress bytes metered.
 # TYPE gateway_transferred_bytes_total counter
 gateway_transferred_bytes_total 117

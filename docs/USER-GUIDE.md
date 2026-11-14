@@ -52,7 +52,7 @@ python tools/ipp_sdk.py --self-test   # 期待 self-test OK: plain=200 sticky=b'
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/ipp-forward.out log/ipp-forward.err tools/ipp_forward.py 18080 127.0.0.1 8916
 curl.exe -x http://127.0.0.1:18080 -H "X-Api-Key: default_key" http://127.0.0.1:8888/   # 期待 200 mock 体（直连网关同法是 400）
 ```
-注意：适配器只做形态翻译不代填身份，调用方须自带 `X-Api-Key` 头；CONNECT（HTTPS 隧道）诚实 501，请用程序级集成；浏览器 PAC 见 `tools/ipp.pac`（HTTP 走 18080，HTTPS/内网直连）。
+注意：适配器只做形态翻译不代填身份，调用方须自带 `X-Api-Key` 头；`ipp_forward.py` 当前不转发 CONNECT。HTTP/1.1 CONNECT 可通过独立 `CONNECT_ADDR` listener 启用，明文仅限回环绑定，尚无 TLS 入站；浏览器 PAC 见 `tools/ipp.pac`（HTTP 走 18080，HTTPS/内网直连）。
 
 **方式四：一键启停与观测**：见 §2 `ipp.ps1` 三命令；观测 Grafana `:3000`（7 面板）＋`:9091/metrics`（30+ 序列）＋`SELECT count() FROM proxy.proxy_telemetry_log` 随流量涨。
 
@@ -131,7 +131,7 @@ python tools/ipp_sdk.py --self-test   # expect self-test OK: plain=200 sticky=b'
 D:\DevSoft\Conda\Miniconda3\python.exe log/launch_detached.py D:\DevSoft\Conda\Miniconda3\python.exe log/ipp-forward.out log/ipp-forward.err tools/ipp_forward.py 18080 127.0.0.1 8916
 curl.exe -x http://127.0.0.1:18080 -H "X-Api-Key: default_key" http://127.0.0.1:8888/   # expect 200 mock body (direct-to-gateway same call is 400)
 ```
-Note: the adaptor translates shape only, never injects identity — send `X-Api-Key` yourself; CONNECT (HTTPS tunneling) gets honest 501, use app-level integration; browser PAC at `tools/ipp.pac` (HTTP via 18080, HTTPS/intranet direct).
+Note: the adaptor translates shape only, never injects identity — send `X-Api-Key` yourself; `ipp_forward.py` does not currently forward CONNECT. HTTP/1.1 CONNECT is available through the separate `CONNECT_ADDR` listener, plaintext loopback binding only, with no inbound TLS yet; browser PAC is at `tools/ipp.pac` (HTTP via 18080, HTTPS/intranet direct).
 
 **Mode 4: one-click ops**: the three `ipp.ps1` commands (§2); observe Grafana `:3000` (7 panels)＋`:9091/metrics` (30+ series)＋`SELECT count() FROM proxy.proxy_telemetry_log` growing.
 

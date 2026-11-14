@@ -15,7 +15,7 @@ IPProxyPool 是基于 Cloudflare Pingora（Rust）构建的企业级高可用智
 3. **可观测优先**：每个关键决策都有指标＋日志＋落库三重证据；回归验证以“包体/计数器 corroborate”为铁律。
 4. **诚实降级**：做不到的宁可明确拒绝（400/403/501/503 各有语义），不静默错 behavior。
 
-非目标：HTTPS CONNECT 隧道（诚实 501，见 spike 结论）、eBPF/io_uring/MASQUE（spike 不落地）、BGP（只给模板）。
+非目标：TLS 入站／HTTP/2 与 HTTP/3 CONNECT（HTTP/1.1 明文 CONNECT 已由可选独立 listener 支持，限回环绑定）、eBPF/io_uring/MASQUE（spike 不落地）、BGP（只给模板）。
 
 ### 2. 总览图
 
@@ -95,7 +95,7 @@ IPProxyPool 是基于 Cloudflare Pingora（Rust）构建的企业级高可用智
 
 ### 6. 非目标
 
-CONNECT 隧道（501）、uTLS/boring 定制、eBPF/io_uring/MASQUE、BGP 引流、多租户 hard 隔离（命名空间级软隔离已够）。
+TLS 入站／HTTP/2 与 HTTP/3 CONNECT（HTTP/1.1 明文 CONNECT 已由可选独立 listener 支持，限回环绑定）、uTLS/boring 定制、eBPF/io_uring/MASQUE、BGP 引流、多租户 hard 隔离（命名空间级软隔离已够）。
 
 ### 相关文档 / Related docs
 
@@ -113,7 +113,7 @@ Goals in priority order:
 3. **Observability first**: every key decision carries metrics＋logs＋warehouse triple evidence; regression requires body/counter corroboration.
 4. **Honest degradation**: what cannot be done is explicitly refused (400/403/501/503 each with semantics), never silently misbehaved.
 
-Non-goals: HTTPS CONNECT tunneling (honest 501), eBPF/io_uring/MASQUE (spikes only), BGP (templates only).
+Non-goals: inbound TLS and HTTP/2/3 CONNECT (optional standalone plaintext HTTP/1.1 CONNECT is supported on loopback only), eBPF/io_uring/MASQUE (spikes only), BGP (templates only).
 
 ### 2. Overview Diagram
 
@@ -194,4 +194,4 @@ Host (Windows dev / Linux prod)
 
 ### 6. Non-Goals
 
-CONNECT tunneling (501), uTLS/boring customization, eBPF/io_uring/MASQUE, BGP steering, hard multi-tenant isolation (namespace-level soft isolation suffices).
+This version excludes inbound TLS, HTTP/2/3 CONNECT, uTLS/boring customization, eBPF/io_uring/MASQUE, BGP steering, and hard multi-tenant isolation. Optional plaintext HTTP/1.1 CONNECT is provided by a separate listener bound to loopback only.

@@ -95,6 +95,21 @@ pub struct MetricsRegistry {
     /// OPT-R15：最近一次**成功**写入的 Unix 秒（`telemetry_sink_last_ok_unixtime_seconds{backend}`）。
     /// 0 = 存在但从未成功过；与 `telemetry_sink_up` 组合可区分「彻底不通」与「通但很久没写」。
     sink_last_ok: DashMap<String, AtomicU64>,
+    /// CONNECT listener 与隧道成功建立数；按上游协议标记。
+    connect_tunnels_established: DashMap<String, AtomicU64>,
+    /// CONNECT 隧道终止数；reason 是固定枚举字符串，不接受动态错误详情。
+    connect_tunnel_terminated: DashMap<String, AtomicU64>,
+    /// CONNECT 隧道存活时长累计毫秒。
+    connect_tunnel_duration_ms: AtomicU64,
+    /// 已结束的 CONNECT 隧道总数。
+    connect_tunnel_closed: AtomicU64,
+    /// CONNECT 上下行传输字节累计。
+    connect_bytes_up: AtomicU64,
+    connect_bytes_down: AtomicU64,
+    /// CONNECT listener 活跃连接数，包含未认证头部读取。
+    connect_active: AtomicU64,
+    /// 达到 admission 上限而拒绝的连接数。
+    connect_admission_rejected: AtomicU64,
     /// R2-8 后台重启计数（supervisor 直写，`supervisor_restarts_total{worker}` 渲染）。
     supervisor_restarts: DashMap<String, AtomicU64>,
     /// R2-8 日志采样序号（`sample_full_log` 发号，单调递增；5xx 不经过此处）。
@@ -313,6 +328,14 @@ impl MetricsRegistry {
             sink_up: DashMap::new(),
             sink_failures: DashMap::new(),
             sink_last_ok: DashMap::new(),
+            connect_tunnels_established: DashMap::new(),
+            connect_tunnel_terminated: DashMap::new(),
+            connect_tunnel_duration_ms: AtomicU64::new(0),
+            connect_tunnel_closed: AtomicU64::new(0),
+            connect_bytes_up: AtomicU64::new(0),
+            connect_bytes_down: AtomicU64::new(0),
+            connect_active: AtomicU64::new(0),
+            connect_admission_rejected: AtomicU64::new(0),
             supervisor_restarts: DashMap::new(),
             log_sample_seq: AtomicU64::new(0),
             logs_sampled: AtomicU64::new(0),

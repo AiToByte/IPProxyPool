@@ -37,19 +37,31 @@ impl RouterEngine {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reload_nodes(&self, new_nodes: Vec<ProxyNode>) {
         let _guard = self.write_lock.lock();
+        // 全量替换建立新的节点生命周期；旧节点的自动状态不能按地址复用。
+        self.paid_base_weight.clear();
+        self.sla_derated_nodes.clear();
         let pools_vec: Vec<Arc<ProxyNode>> = new_nodes.into_iter().map(Arc::new).collect();
         self.store_nodes(pools_vec);
     }
     pub fn replace_vendor_nodes(&self, prefix: &str, nodes: Vec<ProxyNode>) {
         let _guard = self.write_lock.lock();
         let guard = self.pools.load();
+        let replaced_addrs: Vec<String> = guard
+            .iter()
+            .filter(|n| n.provider.starts_with(prefix))
+            .map(|n| n.addr.clone())
+            .collect();
         let mut next: Vec<Arc<ProxyNode>> = guard
             .iter()
             .filter(|n| !n.provider.starts_with(prefix))
             .map(Arc::clone)
             .collect();
-        next.extend(nodes.into_iter().map(Arc::new));
         drop(guard);
+        for addr in replaced_addrs {
+            self.paid_base_weight.remove(&addr);
+            self.sla_derated_nodes.remove(&addr);
+        }
+        next.extend(nodes.into_iter().map(Arc::new));
         self.store_nodes(next);
         // OPT-R4 B11：merge（含空快照）后顺带清理僵尸因子。
         self.prune_free_scales();
@@ -76,8 +88,9 @@ impl RouterEngine {
         let next: Vec<Arc<ProxyNode>> = guard.iter().filter(|n| n.addr != addr).cloned().collect();
         drop(guard);
         self.store_nodes(next);
-        // 自动调权基准表也要清，否则同 addr 重新加入后会沿用旧基准。
+        // 自动调权基准表与 SLA 自动摘除意图均不能跨节点生命周期复用。
         self.paid_base_weight.remove(addr);
+        self.sla_derated_nodes.remove(addr);
         Some(removed)
     }
     pub fn adjust_vendor_weight(&self, vendor: &str, country: &str, weight: u32) {
@@ -87,6 +100,11 @@ impl RouterEngine {
             .iter()
             .map(|n| {
                 if n.provider == vendor && n.country.eq_ignore_ascii_case(country) {
+                    // 手动调权代表新的基准意图，含零权重摘除；后续 boost 不得恢复旧基准。
+                    if !n.provider.starts_with("free") {
+                        self.paid_base_weight.insert(n.addr.clone(), weight);
+                    }
+                    self.sla_derated_nodes.remove(&n.addr);
                     let mut updated = (**n).clone();
                     updated.weight = weight;
                     Arc::new(updated)
@@ -98,6 +116,53 @@ impl RouterEngine {
         drop(guard);
         self.store_nodes(next);
     }
+    /// 自动 SLA 调整入口：记录自动摘除意图，以区分 SLA 权重 0 与人工禁用。
+    pub fn adjust_vendor_weight_from_sla(&self, vendor: &str, country: &str, weight: u32) {
+        let _guard = self.write_lock.lock();
+        let guard = self.pools.load();
+        let mut next: Vec<Arc<ProxyNode>> = Vec::with_capacity(guard.len());
+        for node in guard.iter() {
+            if node.provider != vendor || !node.country.eq_ignore_ascii_case(country) {
+                next.push(Arc::clone(node));
+                continue;
+            }
+
+            if weight == 0 {
+                if node.weight == 0 {
+                    next.push(Arc::clone(node));
+                    continue;
+                }
+                self.sla_derated_nodes.insert(node.addr.clone());
+                let mut updated = (**node).clone();
+                updated.weight = 0;
+                next.push(Arc::new(updated));
+                continue;
+            }
+
+            if node.weight == 0 {
+                if self.sla_derated_nodes.remove(&node.addr).is_some() {
+                    let restored_weight = self
+                        .paid_base_weight
+                        .get(&node.addr)
+                        .map(|base| *base)
+                        .filter(|base| *base > 0)
+                        .unwrap_or(weight);
+                    let mut updated = (**node).clone();
+                    updated.weight = restored_weight.min(200);
+                    next.push(Arc::new(updated));
+                } else {
+                    next.push(Arc::clone(node));
+                }
+                continue;
+            }
+
+            let mut updated = (**node).clone();
+            updated.weight = weight;
+            next.push(Arc::new(updated));
+        }
+        drop(guard);
+        self.store_nodes(next);
+    }
     pub fn set_paid_weight_boost(&self, boost_percent: u32) {
         let _guard = self.write_lock.lock();
         let boost = boost_percent.clamp(1, 500);
@@ -105,7 +170,8 @@ impl RouterEngine {
         let next: Vec<Arc<ProxyNode>> = guard
             .iter()
             .map(|n| {
-                if n.provider.starts_with("free") {
+                // 零权重表示显式摘除，含关闭自动调权的因子 100 也不得复活。
+                if n.provider.starts_with("free") || n.weight == 0 {
                     return Arc::clone(n);
                 }
                 let base = *self

@@ -15,6 +15,198 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use utoipa::OpenApi;
 
+/// 使用独立测试进程安装 logger，避免与并行测试或已有全局 logger 冲突。
+#[test]
+fn audit_logging_redacts_credentials_in_real_records() {
+    let output = std::process::Command::new(std::env::current_exe().expect("测试程序"))
+        .args([
+            "--exact",
+            "admin::tests::audit_logging_capture_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("IPP_ADMIN_AUDIT_CAPTURE_CHILD", "1")
+        .output()
+        .expect("启动日志捕获子进程");
+    assert!(
+        output.status.success(),
+        "日志行为回归失败：\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct AuditCapture(std::sync::Mutex<Vec<(log::Level, String)>>);
+
+impl log::Log for AuditCapture {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        let message = record.args().to_string();
+        if message.starts_with("[admin] ") {
+            self.0
+                .lock()
+                .expect("捕获锁")
+                .push((record.level(), message));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[tokio::test]
+async fn audit_logging_capture_child() {
+    if std::env::var_os("IPP_ADMIN_AUDIT_CAPTURE_CHILD").is_none() {
+        return;
+    }
+    static CAPTURE: AuditCapture = AuditCapture(std::sync::Mutex::new(Vec::new()));
+    log::set_logger(&CAPTURE).expect("子进程独占 logger");
+    log::set_max_level(log::LevelFilter::Info);
+    let app = super::router(test_state(vec![], &["tenant-secret-P0", "tenant/secret"]));
+    // 同一条真实审计链路覆盖成功、认证拒绝、租户不存在、未匹配和方法错误。
+    let cases = [
+        (
+            "GET",
+            "tenant-secret-P0",
+            true,
+            200,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "tenant-%73ecret-P0",
+            true,
+            200,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "tenant%2fsecret",
+            true,
+            200,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "PATCH",
+            "tenant-secret-P0/balance",
+            true,
+            200,
+            "/api/v1/tenants/{api_key}/balance",
+        ),
+        (
+            "PATCH",
+            "tenant-%73ecret-P0/active",
+            true,
+            200,
+            "/api/v1/tenants/{api_key}/active",
+        ),
+        (
+            "GET",
+            "tenant-secret-P0",
+            false,
+            401,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "tenant-%73ecret-P0",
+            false,
+            401,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "missing-secret-P0",
+            true,
+            404,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "missing-%73ecret-P0",
+            true,
+            404,
+            "/api/v1/tenants/{api_key}",
+        ),
+        (
+            "GET",
+            "tenant-secret-P0/unknown/tenant-secret-P0",
+            true,
+            404,
+            "/[unmatched]",
+        ),
+        (
+            "GET",
+            "tenant-%73ecret-P0/unknown",
+            false,
+            404,
+            "/[unmatched]",
+        ),
+        (
+            "POST",
+            "tenant-secret-P0",
+            true,
+            405,
+            "/api/v1/tenants/{api_key}",
+        ),
+    ];
+    for (index, (method, tail, authenticated, status, path)) in cases.into_iter().enumerate() {
+        // 查询参数和两种 Admin 认证头的值也不能进入日志。
+        let uri = format!("/api/v1/tenants/{tail}?api_key=query-secret-P0");
+        let mut request = Request::builder().method(method).uri(uri);
+        if authenticated {
+            request = request.header("Authorization", format!("Admin {KEY}"));
+        }
+        let body = if method == "PATCH" {
+            request = request.header(CONTENT_TYPE, "application/json");
+            Body::from(r#"{"balance_usd":3.5,"active":true}"#)
+        } else {
+            Body::empty()
+        };
+        let response = app
+            .clone()
+            .oneshot(request.body(body).expect("请求"))
+            .await
+            .expect("响应");
+        assert_eq!(response.status().as_u16(), status, "{method} {tail}");
+        let records = CAPTURE.0.lock().expect("捕获锁");
+        if records.is_empty() {
+            panic!("第 {index} 次请求必须产生真实审计日志");
+        }
+        let (level, message) = records.last().expect("必须产生真实审计日志");
+        assert_eq!(records.len(), 1, "每次请求恰有一条审计记录");
+        assert_eq!(
+            *level,
+            if status < 400 {
+                log::Level::Info
+            } else {
+                log::Level::Warn
+            }
+        );
+        assert!(
+            message.starts_with(&format!("[admin] {method} {path} -> {status} (")),
+            "实际日志：{message}"
+        );
+        assert!(message.ends_with(&format!("ms, key={authenticated})")));
+        for secret in [
+            KEY,
+            "tenant-secret-P0",
+            "tenant-%73ecret-P0",
+            "tenant/secret",
+            "tenant%2fsecret",
+            "missing-secret-P0",
+            "missing-%73ecret-P0",
+            "query-secret-P0",
+        ] {
+            assert!(!message.contains(secret), "整条日志不得泄漏凭据：{message}");
+        }
+        drop(records);
+        CAPTURE.0.lock().expect("捕获锁").clear();
+    }
+}
+
 /// 结构编译验证（历史保留）+ 步骤 52 新端点必须进 OpenAPI。
 #[test]
 fn openapi_doc_builds() {
@@ -145,6 +337,33 @@ async fn missing_admin_key_returns_json_401() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).expect("错误体必须是 JSON");
     assert_eq!(v["code"], 401);
     assert!(v["error"].as_str().unwrap().contains("admin key"));
+}
+
+#[tokio::test]
+async fn empty_configured_admin_key_rejects_empty_credentials() {
+    let mut state = test_state(vec![], &[]);
+    state.admin_api_key.clear();
+    let app = super::router(state);
+
+    for (header_name, header_value) in [
+        ("X-Admin-Key", ""),
+        ("X-Admin-Key", "unexpected-key"),
+        ("Authorization", "Admin "),
+        ("Authorization", "Admin unexpected-key"),
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header(header_name, header_value)
+            .body(Body::empty())
+            .expect("request");
+        let res = app.clone().oneshot(req).await.expect("response");
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "header={header_name}"
+        );
+    }
 }
 
 /// 契约 ②：`/nodes` 列表是**裸数组**（首版包装对象 `{nodes:[...]}` 与文档、

@@ -1570,3 +1570,17 @@ ode.addr.clone()）需改臂表键生命周期，留待独立立项。
 - **本步选择审计第 3 条**：现有 CanaryProber 每 60s 探测，但 main.rs 只写日志；RouterEngine 无主动健康字段，matches 只检查 weight/proto/country/tier/域级 quarantine；候选又只取 get_healthy_candidates，一旦摘除就永不再探测。
 - **设计要点**：Router 内 ctive_health + 阈值/冷却 + 安全阀（至少留 1 个 weight>0）；probe_candidates() 绕过 matches 探全池；Healthy/Degraded 清连续失败，仅 Dead 计入；信号量关闭跳过不记健康；新增 ctive_probe_results_total{result} / ctive_probe_unhealthy_nodes；PROBE_ACTIVE_HEALTH_ENABLED 总开关。
 - **状态**：仅完成计划落库，代码/测试/E2E 均未执行；下一步 T1（Router 状态与策略）。
+
+---
+
+## 2026-11-13 — 步骤 71：出站 TLS 校验契约取证与失败关闭加固
+
+**范围**：只做证书校验/信任源相关安全加固；不含 ClientHello 指纹伪装、JA4 或 WAF 绕过。对应待办 #24。
+
+- **取证**：pingora-core 0.9.0 `src/connectors/tls/rustls/mod.rs:213-258` —— `HttpPeer::get_peer_options()` 恒为 `Some`（默认 `alpn=H1`），每次握手都会克隆自定义 config；`sni.is_empty()` 或 `verify_cert=false` → `VerificationMode::SkipAll`（`:361` 直接 `Ok(ServerCertVerified::assertion())`，证书链与主机名全不验），`verify_hostname=false` → `SkipHostname`。`PeerOptions::new()` 缺省虽为 `true`，但本仓 `build_http_peer` 把请求 `Host` 直接当 SNI，该值为空即静默关闭全部校验。
+- **纠正三处声明失实**：步骤 45「Pingora 默认跳过校验」错；步骤 46 与 `docs/OPERATION.md`「rustls 后端 `verify_cert=false` 无效」**错且最危险**（它其实有效，不能拿「反正关不掉」当安全边界）；测试名 `skip_cert_verify_requires_loopback_and_test_channel` 描述的是步骤 47 已删除的分支，改名 `tls_and_loopback_predicates_are_distinct` 并按实际断言重写说明。
+- **改动**：`gateway/src/gateway/upstream.rs` 新增 `is_valid_tls_sni()`；TLS 分支遇空/全空白/含控制字符的 SNI 直接 `HTTPStatus(400)`，并显式固定 `verify_cert=true` / `verify_hostname=true`（不依赖框架缺省值）；明文分支行为不变。`gateway/src/gateway/tests.rs` 新增 3 条单测。`docs/OPERATION.md`、`CHANGELOG.md`、`TASK_PLAN.md`、`docs/QUALITY_BASELINE.md` 与全部活文档数字同步；`docs/COMPONENTS.md` 经 `--refresh` 对齐。
+- **RED/GREEN 与变异**：`tls_peer_rejects_blank_or_control_sni` 首跑判红（`TLS peer 不得接受空/含控制字符的 SNI: ""`）；实现后 3 测全绿。把 `verify_cert` 临时改回 `false` ⇒ `tls_peer_pins_certificate_verification_flags` 判红并指名「证书链校验不得关闭」，还原即绿（判别力实证）。
+- **验证**：`cargo fmt --check` exit 0；`cargo clippy --locked --workspace --all-targets -- -D warnings` exit 0；`cargo test --locked --workspace` **421 passed / 0 failed / 10 ignored**；`check_components_docs` 26 模块 / 431 = 421+10；`check_doc_consistency` tests=421 / live=6。
+- **未验证（如实登记）**：真实 TLS 握手下的 fail-open 活流量复现未跑，证据为框架源码；Host 含端口时的 SNI 形态属既有契约，本轮未改。
+- **本轮遗留（非本步引入）**：22 道 Python 门中 `check_supply_chain.py` 判红；本地 RustSec DB 快照新增 3 条 quinn 公告（RUSTSEC-2026-0523/0524 quinn-proto 0.11.18、RUSTSEC-2026-0538 quinn-udp 0.5.15），`cargo deny` OK 而 `cargo audit` 报 3 vulnerabilities。本轮未动 Cargo.toml/Cargo.lock/deny.toml，按「一次只做一个步骤、供应链单独论证可达性」另立待办，不在本步混入豁免或升级。

@@ -79,7 +79,7 @@ OPT-2 环境门：D3 起默认开启，无 `X-Api-Key` 头直接 403，
 不重启网关增删节点，且重启后保持：
 
 ```powershell
-# 启动参数（均可选；ADMIN_API_KEY 必须设，否则 Admin API 全部 401）
+# 启动参数（均可选；ADMIN_API_KEY 必须设为非空值，否则 Admin API 全部 401）
 $env:ADMIN_API_KEY = "<强随机值>"
 $env:ADMIN_ADDR = "127.0.0.1:9092"                   # 缺省；容器内须 0.0.0.0:9092
 $env:NODES_FILE = "D:\IPProxyPool\data\nodes.json"   # 缺省 data/nodes.json；空串=关闭持久化
@@ -503,10 +503,26 @@ $env:SSL_CERT_FILE = "C:\path\to\ca.pem"
   `Missing Authority Key Identifier`。别依赖校验器宽松。
 - **叶证书 SAN 必须覆盖目标域名**，否则报 hostname 不匹配而非 UnknownIssuer。
 
-**不要用"关闭证书校验"绕过**：`PeerOptions::verify_cert = false` 在 rustls 后端
-**无效**（它只参与 hostname 匹配，证书链校验是硬编码的；作者在同一处留了
-`allowing to disable verification` 的 TODO），而且即便有效也是不该采用的做法。
-正解就是给代理配受信任证书。
+**不要用「关闭证书校验」绕过**（此处更正 OPT-R15 步骤 45/46 留下的错误说法）：
+pingora-core 0.9.0 的 rustls 连接器**确实能**关掉校验。`src/connectors/tls/rustls/mod.rs:213-258`
+里 `HttpPeer::get_peer_options()` 恒为 `Some`（默认 `alpn=H1`），每次握手都会克隆出
+自定义 config；`verify_cert=false` 或 **SNI 为空** 都被映射成
+`VerificationMode::SkipAll`（同文件 `:361` 直接返回 `ServerCertVerified::assertion()`），
+证书链与主机名**一个都不验**，且生产构建可达、日志上看不出异常。
+⇒「反正关不掉」是错的，不能拿它当安全边界。正解仍是给代理配受信任证书。
+
+**网关侧的失败关闭（步骤 71）**：`gateway/upstream.rs::build_http_peer` 现在
+① 显式写死 `verify_cert=true` / `verify_hostname=true`，不依赖框架缺省值；
+② TLS peer 的 SNI 为空、全空白或含控制字符时直接返回 **400**，不进入握手；
+   明文 peer 不受影响（不进 rustls 连接器）。`request_filter` 对空 Host 的 400 是
+   **另一道**守卫，分属不同回调，互不替代。单测
+   `tls_peer_pins_certificate_verification_flags` 与
+   `tls_peer_rejects_blank_or_control_sni` 分别钉住开关与空 SNI；把 `verify_cert`
+   改成 `false` 或删掉 SNI 守卫都会当场判红（已实测变异）。
+
+> **本轮未验证**：`SkipAll` 行为取证来自 pingora-core 0.9.0 源码，未做真实 TLS
+> 握手下的 fail-open 活流量复现；Host 含端口时的 SNI 形态属既有契约（其后果是
+> rustls 拒绝握手，而非绕过校验），本轮未改动。
 
 **可复现验证**：`tools/verify_tls_egress.py` 生成 CA+叶证书并校验本地 443 代理链路；
 端到端需再用 `TEST_POOL_NODES` 把 `127.0.0.1:443` 注入池（见下条）。

@@ -1,14 +1,13 @@
-//! GW-6 Redis Stream 分片预留（SPIKE-R3 / 集群部署待放行）。
+//! GW-6 Redis Stream 分片纯工具预留（SPIKE-R3 / 集群部署待放行）。
 //!
-//! 默认 `REDIS_STREAM_SHARDS=1`：单 stream `stream:proxy:telemetry`，与现有
-//! `TelemetryWorker` / `ChSinkWorker` / `CircuitBreaker` 行为逐字节一致。
-//! 设置 `REDIS_STREAM_SHARDS=N (N>1)`：按 `target_domain` hash 分发到
-//! `stream:proxy:telemetry:{0..N-1}`，各分片独立消费组，横向扩展遥测写入
-//! 与 ClickHouse 落库吞吐。
+//! 当前启动仅支持 `REDIS_STREAM_SHARDS=1`，未设置时也默认 1：单 stream
+//! `stream:proxy:telemetry`，与现有遥测发布、落库及熔断消费行为一致。
+//! 临时拒绝多分片：publisher 已能分片写入，但 ChSinkWorker / CircuitBreaker
+//! 仍只消费单 stream；放行 >1 会使分片遥测无人消费，造成落库和熔断失效。
 //!
-//! Redis Cluster 部署时，各分片 key 建议含 `{telemetry}` hash tag（如
-//! `stream:proxy:telemetry:{telemetry}:{i}`），保证同 slot，消费组可用。
-//! 当前 key 模式未带 hash tag，单实例部署无影响；集群迁移时再加 tag。
+//! 以下 hash、stream key、消费组名纯工具保留供将来消费端接通后使用，
+//! 不代表当前可通过配置启用多分片。Redis Cluster 的 key / hash tag 策略
+//! 同样需要在未来接入时验证。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -26,7 +25,29 @@ pub const SINK_GROUP_PREFIX: &str = "ch_sink_group";
 #[allow(dead_code)]
 pub const CB_GROUP_PREFIX: &str = "circuit_breaker_group";
 
-/// Redis Stream 分片路由：按 `target_domain` hash 到 shard index。
+/// 启动时解析并校验 `REDIS_STREAM_SHARDS`。
+///
+/// 当前只有单 stream 消费链完整，因此显式拒绝 0、空值、非法值及 >1；
+/// 未设置时返回兼容默认值 1。错误文本固定，不回显环境变量内容或其它 secret。
+pub fn parse_redis_stream_shards(
+    value: Result<String, std::env::VarError>,
+) -> Result<usize, &'static str> {
+    const CONFIG_ERROR: &str =
+        "REDIS_STREAM_SHARDS must be exactly 1 (single stream is temporarily supported)";
+
+    let raw = match value {
+        Ok(raw) if !raw.is_empty() => raw,
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => return Err(CONFIG_ERROR),
+        Err(std::env::VarError::NotPresent) => return Ok(REDIS_STREAM_SHARDS_DEFAULT),
+    };
+
+    match raw.parse::<usize>() {
+        Ok(1) => Ok(1),
+        Ok(_) | Err(_) => Err(CONFIG_ERROR),
+    }
+}
+
+/// 预留的纯分片工具：按 `target_domain` hash 到 shard index；不负责启动配置校验。
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct RedisStreamSharder {
@@ -86,6 +107,79 @@ impl RedisStreamSharder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_unset_defaults_to_single_stream() {
+        assert_eq!(
+            parse_redis_stream_shards(Err(std::env::VarError::NotPresent)),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn config_explicit_one_keeps_single_stream_keys() {
+        let shards = parse_redis_stream_shards(Ok("1".to_owned())).unwrap();
+        let sharder = RedisStreamSharder::new(shards);
+        assert_eq!(sharder.shards(), 1);
+        assert_eq!(sharder.stream_key_for(0), TELEMETRY_STREAM_BASE);
+        assert_eq!(sharder.sink_group_for(0), SINK_GROUP_PREFIX);
+        assert_eq!(sharder.cb_group_for(0), CB_GROUP_PREFIX);
+    }
+
+    #[test]
+    fn config_rejects_multiple_shards() {
+        for value in ["2", "4", "16", &usize::MAX.to_string()] {
+            assert!(parse_redis_stream_shards(Ok(value.to_owned())).is_err());
+        }
+    }
+
+    #[test]
+    fn config_rejects_zero_empty_and_invalid_values() {
+        for value in [
+            "0",
+            "",
+            " ",
+            "\t",
+            "abc",
+            "-1",
+            "1.0",
+            " 1",
+            "1 ",
+            "184467440737095516160",
+        ] {
+            assert!(parse_redis_stream_shards(Ok(value.to_owned())).is_err());
+        }
+    }
+
+    #[test]
+    fn config_rejects_non_unicode_without_exposing_value() {
+        let error = parse_redis_stream_shards(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("non-unicode-secret-sentinel"),
+        )))
+        .unwrap_err();
+        assert!(error.contains("REDIS_STREAM_SHARDS"));
+        assert!(!error.contains("non-unicode-secret-sentinel"));
+    }
+
+    #[test]
+    fn config_errors_are_actionable_and_do_not_echo_input() {
+        let error = parse_redis_stream_shards(Ok("2".to_owned())).unwrap_err();
+        assert!(error.contains("REDIS_STREAM_SHARDS"));
+        assert!(error.contains("1"));
+        assert!(error.contains("single stream"));
+        for value in [
+            "redis://user:secret-sentinel@127.0.0.1:6379",
+            "secret-sentinel\nforged-log-entry",
+            "",
+            "0",
+            "invalid",
+        ] {
+            assert_eq!(
+                parse_redis_stream_shards(Ok(value.to_owned())).unwrap_err(),
+                error
+            );
+        }
+    }
 
     #[test]
     fn shard_single_is_base_key() {

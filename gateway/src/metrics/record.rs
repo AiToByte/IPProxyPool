@@ -10,6 +10,49 @@
 use super::*;
 
 impl MetricsRegistry {
+    /// CONNECT listener admission 统计。
+    pub fn connect_admission_acquired(&self, acquired: bool) {
+        if acquired {
+            self.connect_active.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.connect_admission_rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// CONNECT listener admission 槽释放。
+    pub fn connect_admission_released(&self) {
+        self.connect_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// CONNECT 隧道建立后的结束与寿命统计；未成功返回 200 的尝试不调用此方法。
+    pub fn connect_closed(&self, reason: &str, duration_ms: u64) {
+        self.connect_tunnel_closed.fetch_add(1, Ordering::Relaxed);
+        self.connect_tunnel_duration_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.connect_tunnel_terminated
+            .entry(reason.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// CONNECT 上游协议握手成功。
+    pub fn connect_established(&self, proto: &str) {
+        self.connect_tunnels_established
+            .entry(proto.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// CONNECT 方向字节写入统计。
+    pub fn connect_bytes_written(&self, direction: &str, n: u64) {
+        match direction {
+            "upstream" => self.connect_bytes_up.fetch_add(n, Ordering::Relaxed),
+            "downstream" => self.connect_bytes_down.fetch_add(n, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
     /// 免费池在池节点数（FreePool worker 每次合并后设置，只写不参与 observe）。
     pub fn set_free_pool_nodes(&self, n: u64) {
         self.free_pool_nodes.store(n, Ordering::Relaxed);

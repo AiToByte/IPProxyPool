@@ -134,6 +134,7 @@ mod analytics;
 mod bandit;
 mod ch_sink;
 mod circuit_breaker;
+mod connect;
 mod fingerprint;
 mod free_pool;
 mod gateway;
@@ -149,6 +150,7 @@ mod redis_shard;
 mod router;
 mod socks_bridge;
 mod socks_handshake;
+mod startup_config;
 mod telemetry;
 mod tenant;
 mod vendor_arbitrage;
@@ -208,6 +210,24 @@ fn env_str(key: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// 明文 CONNECT 只能绑定回环地址；TLS listener 尚未接线前拒绝公网暴露。
+fn connect_listener_addr(raw: Option<&str>) -> Result<Option<std::net::SocketAddr>, &'static str> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => {
+            let addr: std::net::SocketAddr = value
+                .parse()
+                .map_err(|_| "CONNECT_ADDR must be an IP:port socket address")?;
+            if !addr.ip().is_loopback() {
+                return Err(
+                    "plain CONNECT listener must bind to a loopback IP until TLS is configured",
+                );
+            }
+            Ok(Some(addr))
+        }
+    }
 }
 
 /// R2-8 间隔秒数读值（非法/0 回落默认；单位秒）。
@@ -394,7 +414,48 @@ fn main() {
 
 /// 原 async main 本体：装配全部依赖＋后台 workers，返回配好的 Server。
 async fn setup_gateway() -> Server {
-    // Must run before any rustls use (ring + aws-lc-rs both compiled in).
+    // 当前 Admin API 是进程运行的必需控制面：先解析地址并绑定，避免后续依赖或 worker
+    // 初始化后才在 detached task 中发现地址错误或端口冲突，留下无 Admin API 的半启动进程。
+    let admin_addr =
+        match startup_config::parse_admin_addr(std::env::var("ADMIN_ADDR").ok().as_deref()) {
+            Ok(addr) => addr,
+            Err(message) => {
+                eprintln!("[GW-5] invalid ADMIN_ADDR: {message}");
+                std::process::exit(1);
+            }
+        };
+    let admin_listener = match tokio::net::TcpListener::bind(&admin_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("[GW-5] ADMIN_ADDR listener bind failed: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    // GW-6 临时限制：publisher 已支持预留分片路由，但 ChSinkWorker 与
+    // CircuitBreaker 仍只消费单 stream。必须在任何 Redis 初始化前拒绝 >1，
+    // 否则会静默写入无人消费的 stream；0/空/非法值也不能静默回退。
+    // 错误文本由纯 parser 固定生成，不回显环境变量内容或其它 secret。
+    let redis_stream_shards =
+        match redis_shard::parse_redis_stream_shards(std::env::var("REDIS_STREAM_SHARDS")) {
+            Ok(shards) => shards,
+            Err(message) => {
+                eprintln!("[GW-6] invalid Redis stream shard configuration: {message}");
+                std::process::exit(1);
+            }
+        };
+
+    // 显式开关在任何外部依赖/后台任务启动之前校验，不设置时不创建 listener。
+    let connect_addr = match connect_listener_addr(std::env::var("CONNECT_ADDR").ok().as_deref()) {
+        Ok(addr) => addr,
+        Err(message) => {
+            eprintln!("[CONNECT] invalid listener configuration: {message}");
+            std::process::exit(1);
+        }
+    };
+
+    // CONNECT listener 的总并发上限（未认证连接也必须受限）。
+    let connect_max_concurrent = env_u32_clamped("CONNECT_MAX_CONCURRENT", 256, 1, 10_000);
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
@@ -839,12 +900,8 @@ async fn setup_gateway() -> Server {
     }
 
     if let Some(ref conn) = redis_conn {
-        // GW-6：Redis Stream 分片数（默认 1=单 stream，兼容现有行为）。
-        let redis_stream_shards: usize = std::env::var("REDIS_STREAM_SHARDS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(redis_shard::REDIS_STREAM_SHARDS_DEFAULT);
+        // GW-6：启动阶段已完成严格校验；这里仅使用经过校验的单 stream 配置。
+        // 多分片纯工具保留供消费端接通后的后续迭代，不在当前链路误启用。
         // Telemetry batch worker → Redis Stream（OPT-4：传入共享丢弃计数器）。
         let tele_worker = TelemetryWorker::new(
             rx_opt.take().expect("telemetry rx held for worker"),
@@ -1441,10 +1498,26 @@ async fn setup_gateway() -> Server {
     );
     server.add_service(proxy_service);
 
+    // CONNECT 专项使用独立 Pingora ServerApp listener；环境变量缺省或空值时不注册，
+    // 因而既有普通 ProxyHttp 端口及行为保持不变。
+    if let Some(connect_addr) = connect_addr {
+        let mut connect_service = pingora_core::services::listening::Service::new(
+            "HTTP/1.1 CONNECT Tunnel".to_string(),
+            connect::ConnectServerApp::with_max_concurrent_and_metrics(
+                router.clone(),
+                tenant_mgr.clone(),
+                connect_max_concurrent,
+                metrics.clone(),
+            ),
+        );
+        connect_service.add_tcp(&connect_addr.to_string());
+        log::info!("[CONNECT] HTTP/1.1 CONNECT listener on {connect_addr}");
+        server.add_service(connect_service);
+    }
+
     // GW-5 Admin REST API：独立端口（:9092），与数据面 :8916 和指标 :9091 完全隔离。
     // 由 axum 驱动，所有端点走 `X-Admin-Key` 认证（env `ADMIN_API_KEY`）；
     // 未设置时服务仍启动，但全部 401（fail-closed），不泄露任何节点/租户信息。
-    let admin_addr = env_str("ADMIN_ADDR", "127.0.0.1:9092");
     let admin_api_key = std::env::var("ADMIN_API_KEY").unwrap_or_default();
     if admin_api_key.is_empty() {
         log::warn!(
@@ -1461,18 +1534,15 @@ async fn setup_gateway() -> Server {
         autotune: Arc::new(AutotuneConfig::new()),
     };
     let admin_app = admin_router(admin_state);
-    let admin_listener_addr = admin_addr.clone();
     tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(&admin_listener_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("[GW-5] Admin 服务绑定 {admin_listener_addr} 失败: {e:?}");
-                return;
-            }
-        };
-        log::info!("[GW-5] Admin REST API on http://{admin_listener_addr}/api/v1");
-        if let Err(e) = axum::serve(listener, admin_app).await {
-            log::error!("[GW-5] Admin 服务退出: {e:?}");
+        let bound_addr = admin_listener.local_addr().ok();
+        if let Some(bound_addr) = bound_addr {
+            log::info!("[GW-5] Admin REST API on http://{bound_addr}/api/v1");
+        } else {
+            log::info!("[GW-5] Admin REST API listener started");
+        }
+        if let Err(error) = axum::serve(admin_listener, admin_app).await {
+            log::error!("[GW-5] Admin 服务退出: {error:?}");
         }
     });
 
@@ -1482,6 +1552,174 @@ async fn setup_gateway() -> Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CONNECT 配置缺省关闭，显式地址必须合法，误配不静默打开其他端口。
+    #[test]
+    fn connect_listener_config_is_explicit() {
+        assert_eq!(connect_listener_addr(None).unwrap(), None);
+        assert_eq!(connect_listener_addr(Some("")).unwrap(), None);
+        assert_eq!(connect_listener_addr(Some("  ")).unwrap(), None);
+        assert_eq!(
+            connect_listener_addr(Some("127.0.0.1:8917"))
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:8917"
+        );
+        assert!(connect_listener_addr(Some("0.0.0.0:8917")).is_err());
+        assert!(connect_listener_addr(Some("localhost:8917")).is_err());
+        assert!(connect_listener_addr(Some("bad-address")).is_err());
+    }
+
+    #[test]
+    fn admin_addr_startup_child() {
+        if std::env::var_os("ADMIN_ADDR_STARTUP_TEST_CHILD").is_none() {
+            return;
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(setup_gateway());
+        panic!("invalid admin address must abort setup");
+    }
+
+    #[test]
+    fn invalid_admin_addr_aborts_before_redis_setup() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::admin_addr_startup_child", "--nocapture"])
+            .env("ADMIN_ADDR_STARTUP_TEST_CHILD", "1")
+            .env("ADMIN_ADDR", "admin-address-secret-sentinel")
+            .env("ADMIN_API_KEY", "")
+            .env("CONNECT_ADDR", "")
+            .env("CONNECT_MAX_CONCURRENT", "256")
+            .env("REDIS_STREAM_SHARDS", "1")
+            .env("REDIS_URL", "invalid-redis-url-secret-sentinel")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("invalid ADMIN_ADDR did not abort setup promptly");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("ADMIN_ADDR"), "{logs}");
+        assert!(!logs.contains("admin-address-secret-sentinel"));
+        assert!(!logs.contains("invalid-redis-url-secret-sentinel"));
+        assert!(!logs.contains("Invalid Redis URL"));
+        assert!(!logs.contains("[GW-2]"));
+    }
+
+    #[test]
+    fn occupied_admin_addr_aborts_before_redis_setup() {
+        use std::process::{Command, Stdio};
+
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap().to_string();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::admin_addr_startup_child", "--nocapture"])
+            .env("ADMIN_ADDR_STARTUP_TEST_CHILD", "1")
+            .env("ADMIN_ADDR", addr)
+            .env("ADMIN_API_KEY", "")
+            .env("CONNECT_ADDR", "")
+            .env("CONNECT_MAX_CONCURRENT", "256")
+            .env("REDIS_STREAM_SHARDS", "1")
+            .env("REDIS_URL", "invalid-redis-url-secret-sentinel")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("occupied ADMIN_ADDR did not abort setup promptly");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("ADMIN_ADDR listener bind failed"), "{logs}");
+        assert!(!logs.contains("invalid-redis-url-secret-sentinel"));
+        assert!(!logs.contains("Invalid Redis URL"));
+        assert!(!logs.contains("[GW-2]"));
+        drop(reserved);
+    }
+
+    #[test]
+    fn redis_shard_startup_child() {
+        // 子进程单独运行 setup，避免修改父进程环境或启动真实 workers。
+        if std::env::var_os("REDIS_SHARD_STARTUP_TEST_CHILD").is_none() {
+            return;
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(setup_gateway());
+        panic!("invalid shard configuration must abort setup");
+    }
+
+    #[test]
+    fn redis_shard_config_aborts_before_redis_setup() {
+        use std::process::{Command, Stdio};
+
+        // 无效 URL 检查校验顺序；不可达 URL 检查降级不能绕过校验。
+        for redis_url in [
+            "invalid-redis-url-secret-sentinel",
+            "redis://user:redis-secret-sentinel@127.0.0.1:0/",
+        ] {
+            for value in ["2", "0", "", "invalid-shards-secret-sentinel"] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::redis_shard_startup_child", "--nocapture"])
+                    .env("REDIS_SHARD_STARTUP_TEST_CHILD", "1")
+                    .env("REDIS_STREAM_SHARDS", value)
+                    .env("REDIS_URL", redis_url)
+                    .env("RUST_LOG", "info")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("invalid shard configuration did not abort setup promptly");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert_eq!(output.status.code(), Some(1));
+                let logs = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(logs.contains("REDIS_STREAM_SHARDS"), "{logs}");
+                assert!(logs.contains("single stream"), "{logs}");
+                assert!(!logs.contains("secret-sentinel"));
+                assert!(!logs.contains("[GW-2]"));
+                assert!(!logs.contains("Invalid Redis URL"));
+            }
+        }
+    }
 
     #[test]
     fn env_str_defaults_and_overrides() {

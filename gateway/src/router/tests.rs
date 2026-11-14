@@ -358,6 +358,187 @@ fn weight_zero_filtered_but_snapshot_keeps() {
     assert!(r.select_node(&us_spec()).is_none());
 }
 
+fn assert_paid_boost_preserves_zero_weight(has_cached_base: bool, boost: u32) {
+    let node = ProxyNode {
+        weight: if has_cached_base { 100 } else { 0 },
+        ..us_pair()[0].clone()
+    };
+    let addr = node.addr.clone();
+    let r = RouterEngine::new(vec![node]);
+    if has_cached_base {
+        // 先产生正数基准，再手动摘除，复现旧基准恢复已停用节点的问题。
+        r.set_paid_weight_boost(150);
+        assert_eq!(r.get_node_by_addr(&addr).expect("节点存在").weight, 150);
+        r.adjust_vendor_weight("mock-a", "us", 0);
+    }
+
+    r.set_paid_weight_boost(boost);
+
+    assert_eq!(r.snapshot_all().len(), 1, "摘除保留节点，以便手动恢复");
+    assert_eq!(
+        r.get_node_by_addr(&addr).expect("节点存在").weight,
+        0,
+        "因子 {boost} 不得复活零权重节点"
+    );
+    // 同时覆盖宽泛候选扫描与全指定条件的桶快路径。
+    for spec in [
+        us_spec(),
+        spec_exact("residential", "US", EgressProto::Http),
+    ] {
+        assert!(r.get_healthy_candidates(&spec).is_empty());
+        assert!(r.select_node(&spec).is_none());
+    }
+}
+
+#[test]
+fn paid_boost_preserves_manual_zero_with_cached_positive_base() {
+    assert_paid_boost_preserves_zero_weight(true, 150);
+}
+
+#[test]
+fn paid_boost_disable_preserves_manual_zero_with_cached_positive_base() {
+    // 关闭自动调权走因子 100，同样不得恢复手动摘除的节点。
+    assert_paid_boost_preserves_zero_weight(true, 100);
+}
+
+#[test]
+fn paid_boost_preserves_initial_zero() {
+    assert_paid_boost_preserves_zero_weight(false, 150);
+}
+
+#[test]
+fn paid_boost_disable_preserves_initial_zero() {
+    assert_paid_boost_preserves_zero_weight(false, 100);
+}
+
+#[test]
+fn paid_boost_repeated_calls_use_base_without_compounding() {
+    let paid = ProxyNode {
+        weight: 40,
+        ..us_pair()[0].clone()
+    };
+    let free = ProxyNode {
+        provider: "free-test".to_string(),
+        ..us_pair()[1].clone()
+    };
+    let r = RouterEngine::new(vec![paid, free]);
+
+    // 重复调用与切换因子都从原始基准计算，关闭时还原基准；免费节点不参与。
+    for (boost, expected) in [(150, 60), (150, 60), (200, 80), (100, 40)] {
+        r.set_paid_weight_boost(boost);
+        assert_eq!(
+            r.get_node_by_addr("10.0.0.1:8080")
+                .expect("付费节点")
+                .weight,
+            expected
+        );
+        assert_eq!(
+            r.get_node_by_addr("10.0.0.2:8080")
+                .expect("免费节点")
+                .weight,
+            100
+        );
+    }
+}
+
+#[test]
+fn paid_boost_uses_manual_restore_weight_as_new_base() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+    r.set_paid_weight_boost(150);
+    r.adjust_vendor_weight("mock-a", "us", 0);
+    r.set_paid_weight_boost(100);
+    r.adjust_vendor_weight("mock-a", "us", 40);
+
+    // 手动恢复应更新基准，后续调权不得再套用摘除前的陈旧权重。
+    for (boost, expected) in [(150, 60), (150, 60), (200, 80), (100, 40)] {
+        r.set_paid_weight_boost(boost);
+        assert_eq!(
+            r.get_node_by_addr("10.0.0.1:8080")
+                .expect("付费节点")
+                .weight,
+            expected
+        );
+        assert!(r.select_node(&us_spec()).is_some());
+    }
+}
+
+#[test]
+fn sla_restore_recovers_node_derated_to_zero_by_sla() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 100);
+
+    let node = r
+        .get_node_by_addr("10.0.0.1:8080")
+        .expect("node remains in snapshot");
+    assert_eq!(node.weight, 100);
+    assert!(!r.get_healthy_candidates(&us_spec()).is_empty());
+}
+
+#[test]
+fn sla_restore_does_not_reactivate_manually_disabled_node() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+    // 手动摘除代表运维意图；后续 SLA 恢复不能越过这道闸门。
+    r.adjust_vendor_weight("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 100);
+
+    let node = r.get_node_by_addr("10.0.0.1:8080").expect("节点仍在快照");
+    assert_eq!(node.weight, 0);
+    assert!(r.get_healthy_candidates(&us_spec()).is_empty());
+}
+
+#[test]
+fn sla_restore_does_not_reactivate_manual_zero_after_sla_derate() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+
+    r.adjust_vendor_weight("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 100);
+
+    let node = r
+        .get_node_by_addr("10.0.0.1:8080")
+        .expect("node remains in snapshot");
+    assert_eq!(node.weight, 0);
+    assert!(r.get_healthy_candidates(&us_spec()).is_empty());
+}
+
+#[test]
+fn sla_derate_state_is_cleared_when_node_is_reloaded() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    let mut replacement = us_pair()[0].clone();
+    replacement.weight = 0;
+    r.reload_nodes(vec![replacement]);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 100);
+
+    let node = r
+        .get_node_by_addr("10.0.0.1:8080")
+        .expect("node remains in snapshot");
+    assert_eq!(node.weight, 0);
+}
+
+#[test]
+fn sla_derate_state_is_cleared_when_vendor_nodes_are_replaced() {
+    let r = RouterEngine::new(vec![us_pair()[0].clone()]);
+
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    let replacement = ProxyNode {
+        weight: 0,
+        ..us_pair()[0].clone()
+    };
+    r.replace_vendor_nodes("mock-a", vec![replacement]);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 0);
+    r.adjust_vendor_weight_from_sla("mock-a", "US", 100);
+
+    let node = r
+        .get_node_by_addr("10.0.0.1:8080")
+        .expect("node remains in snapshot");
+    assert_eq!(node.weight, 0);
+}
+
 #[test]
 fn weighted_pick_skews_toward_heavy() {
     // R2-1：1:99 权重下重节点显著多（种子 RNG 确定性断言方向，不卡精确值）。

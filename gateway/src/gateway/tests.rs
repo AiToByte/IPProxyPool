@@ -499,12 +499,73 @@ fn is_tls_for_node_port_443() {
     assert!(!is_tls_for_node(&http_alt), "端口 80 应为明文");
 }
 
-/// OPT-R15 步骤 46：跳过证书校验的**双重门控**必须成立。
+/// 出站 TLS 校验契约（取证：pingora-core 0.9.0
+/// `src/connectors/tls/rustls/mod.rs:213-258`）。
 ///
-/// 这是本步最需要防回归的地方：一旦门控被放宽成"任意节点可跳过校验"，
-/// 就等于给生产节点开了一个 MITM 口子，且**静默**（日志上看不出异常）。
+/// `HttpPeer::get_peer_options()` 恒为 `Some`（默认 `alpn=H1`），因此连接器
+/// 每次都会克隆出 `updated_config_opt`；随后 `sni` 为空或 `verify_cert=false`
+/// 都被映射成 `VerificationMode::SkipAll`，其 `verify_server_cert` 直接返回
+/// `ServerCertVerified::assertion()`（同文件 :361）——证书链与主机名**一个都不验**。
+/// 这不是「理论上可能」：把 SNI 置空即可在生产构建触发，且日志里看不出异常。
+/// 故本仓必须显式把这几个字段钉住，而不是依赖框架默认值。
 #[test]
-fn skip_cert_verify_requires_loopback_and_test_channel() {
+fn tls_peer_pins_certificate_verification_flags() {
+    let node = test_node("10.0.0.1", 443);
+    let peer = build_http_peer(&node, "api.example.com").expect("valid TLS peer");
+    assert!(peer.is_tls(), "端口 443 必须走 TLS");
+    assert_eq!(peer.sni, "api.example.com");
+    assert!(peer.options.verify_cert, "证书链校验不得关闭");
+    assert!(peer.options.verify_hostname, "主机名校验不得关闭");
+    assert!(
+        peer.options.alternative_cn.is_none(),
+        "不得用 alternative_cn 放宽主机名匹配"
+    );
+    assert!(
+        peer.options.ca.is_none(),
+        "信任源由平台/SSL_CERT_FILE 提供，不在代码里另设 per-peer CA"
+    );
+}
+
+/// RED→GREEN：空 SNI = Pingora 的 fail-open 分支。
+///
+/// `request_filter` 现在会拒绝空 Host（400），但那个守卫在**另一个回调**里。
+/// 上游选路路径变更、或将来出现 `build_http_peer` 的新调用方时，peer 装配
+/// 必须自己失败关闭，不能把「不验证书」当作可接受的降级。
+#[test]
+fn tls_peer_rejects_blank_or_control_sni() {
+    let node = test_node("10.0.0.1", 443);
+    for host in [
+        "",
+        "   ",
+        "\t",
+        "api.example.com\u{0}",
+        "api.example.com\r\n",
+    ] {
+        assert!(
+            build_http_peer(&node, host).is_err(),
+            "TLS peer 不得接受空/含控制字符的 SNI: {host:?}"
+        );
+    }
+}
+
+/// 边界：明文 peer 不进 rustls 连接器，SNI 不参与任何校验，行为保持不变。
+#[test]
+fn plain_http_peer_does_not_enter_rustls_connector() {
+    let node = test_node("10.0.0.2", 8080);
+    let peer = build_http_peer(&node, "").expect("plain HTTP peer does not use SNI");
+    assert!(!peer.is_tls());
+}
+
+/// OPT-R15：`is_tls_for_node` 与 `is_loopback_addr` 各守各的口径。
+///
+/// **更正一处声明失实**：原名 `skip_cert_verify_requires_loopback_and_test_channel`
+/// 描述的是一条**已经不存在**的生产分支（步骤 47 移除了「跳过证书校验」的尝试）。
+/// 本仓现在没有任何按回环地址放宽 TLS 校验的代码——`upstream.rs` 显式固定
+/// `verify_cert=true`，由 `tls_peer_pins_certificate_verification_flags` 守住。
+/// 测试体实际只断言「公网 443 判为 TLS、但不判为回环」，故按真实行为改名：
+/// 测试名也是声明，声明同样不能失实。
+#[test]
+fn tls_and_loopback_predicates_are_distinct() {
     // 回环判定
     assert!(is_loopback_addr("127.0.0.1:443"));
     assert!(is_loopback_addr("127.0.0.53:8443"));

@@ -29,9 +29,13 @@ pub const SINK_GROUP: &str = "ch_sink_group";
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(60);
 /// Backoff when ClickHouse insert fails (weights/acks hold, loop continues).
 pub const INSERT_BACKOFF: Duration = Duration::from_secs(1);
-/// R2-5 已见 event_id 窗口：命中即重复（ack+skip，不进仓）。
-/// 10k × ~40B ≈ 400KB 常驻，insert→ack 间崩溃的重放对消于此。
+/// R2-5 已见 event_id 窗口（仅当前进程内存有效，不跨重启持久化）。
+/// 用于同进程内对消重复的 fresh XADD；不能作为崩溃恢复或跨重启去重保证。
 pub const SEEN_IDS_CAP: usize = 10_000;
+
+fn advance_reclaim_cursor(cursor: &mut String, reply: &redis::streams::StreamAutoClaimReply) {
+    *cursor = reply.next_stream_id.clone();
+}
 
 /// Parse one stream entry into a warehouse row (`None` = poison, ack+skip).
 /// R2-5：返回 `(row, event_id)`，空 id 表示滚动升级中的老事件（永不去重）。
@@ -42,7 +46,8 @@ pub fn parse_entry(fields: &HashMap<String, redis::Value>) -> Option<(TelemetryR
     Some((TelemetryRow::from(&event), id))
 }
 
-/// R2-5 已见 ID 环形窗（`check_and_insert` 复合操作，调用方无需二次查找）。
+/// R2-5 已见 ID 环形窗（仅当前进程内存有效，重启后不持久化）。
+/// `check_and_insert` 是复合操作，调用方无需二次查找。
 pub struct SeenIds {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -91,7 +96,8 @@ pub struct ChSinkWorker {
     consumer: String,
     batch_size: usize,
     flush_interval: Duration,
-    /// R2-5 去重窗：insert→ack 间崩溃的重放对消于此，不进仓。
+    reclaim_cursor: String,
+    /// R2-5 去重窗：仅当前进程内存有效，不能消除跨重启重放。
     seen: SeenIds,
     /// OPT-R15：落地端健康上报口（ClickHouse 这一级；Redis 级由 `TelemetryWorker` 上报）。
     metrics: Arc<MetricsRegistry>,
@@ -114,6 +120,7 @@ impl ChSinkWorker {
             consumer: format!("sink_{}", std::process::id()),
             batch_size,
             flush_interval,
+            reclaim_cursor: "0-0".to_string(),
             seen: SeenIds::new(SEEN_IDS_CAP),
             metrics,
         }
@@ -126,8 +133,9 @@ impl ChSinkWorker {
     ///   不 ack 不丢，留待下轮，内存有界）；
     /// - 空 id 老事件 → 按有效处理（永不去重）。
     /// - P5 重放直通：`is_redelivery` 为 true（autoclaim 取回的 hold 条目，
-    ///   同 stream id 重现）时跳过去重检查，直进 rows——hold 条目首读已进过去重窗，
+    ///   同 stream id 重现）时跳过去重检查，直进 rows——hold 条目首读已进当前进程的去重窗，
     ///   若再检查必被误判重复而吞掉（P5-2 CH 中断演练抓获的静默丢数，见 EXEC_LOG）。
+    ///   进程重启后内存窗会丢失，因此这里不提供跨重启去重保证。
     ///   重试新条目恒走 fresh 路径（不同 stream id），去重语义不受影响。
     ///   自由函数（不借 `self`）：单测无需构造 worker（免 Redis/CH）。
     // 8 参数沿 ProxyNode::new 惯例放行（调用点皆为固定容器＋标量，打包反增分配）。
@@ -173,18 +181,23 @@ impl ChSinkWorker {
         // 1. Reclaim stale pending from crashed consumers.
         let mut conn = self.redis_conn.clone();
         let opts = redis::streams::StreamAutoClaimOptions::default().count(self.batch_size);
+        let reclaim_start = self.reclaim_cursor.clone();
         if let Ok(reply) = conn
             .xautoclaim_options(
                 &self.stream_key,
                 &self.group,
                 &self.consumer,
                 RECLAIM_IDLE.as_millis() as usize,
-                "0-0",
+                &reclaim_start,
                 opts,
             )
             .await
         {
             let reply: redis::streams::StreamAutoClaimReply = reply;
+            // Redis returns the next scan position even when no entries were claimed.
+            // Advance only after a successful command; pending entries remain durable
+            // when ClickHouse insertion fails, and the next cycle continues the scan.
+            advance_reclaim_cursor(&mut self.reclaim_cursor, &reply);
             for entry in reply.claimed {
                 Self::classify_entry(
                     &mut self.seen,
@@ -265,9 +278,13 @@ impl ChSinkWorker {
         }
     }
 
-    /// R2-5 启动时清一次幽灵消费者（idle 超过 reclaim horizon 且非本实例）。
-    /// 被删者的未 ack 条目由 autoclaim 接管重放（去重窗对消重复），故删除安全。
-    async fn cleanup_stale_consumers(&self) {
+    /// 启动时观测闲置消费者，但不自动执行 `XGROUP DELCONSUMER`。
+    ///
+    /// Redis 的 `XINFO CONSUMERS` 与 `XGROUP DELCONSUMER` 无法在客户端两条命令
+    /// 之间保持原子。即使查询时 pending 为零，旧消费者也可能在删除前恢复并
+    /// 领取消息；随后删除消费者会使新 PEL 永久不可 `XAUTOCLAIM`。在具备服务端
+    /// 原子脚本或显式运维确认前，宁可保留消费者元数据，也不能为清理付出丢数风险。
+    async fn observe_stale_consumers(&self) {
         let mut conn = self.redis_conn.clone();
         let reply: redis::RedisResult<redis::streams::StreamInfoConsumersReply> =
             conn.xinfo_consumers(&self.stream_key, &self.group).await;
@@ -275,12 +292,8 @@ impl ChSinkWorker {
             Ok(info) => {
                 for c in info.consumers {
                     if c.name != self.consumer && c.idle as u64 > RECLAIM_IDLE.as_millis() as u64 {
-                        let _: () = conn
-                            .xgroup_delconsumer(&self.stream_key, &self.group, &c.name)
-                            .await
-                            .unwrap_or(());
                         log::info!(
-                            "[ChSink] delconsumer {} (idle {}ms, pending {})",
+                            "[ChSink] stale consumer observed {} (idle {}ms, pending {}); automatic deletion disabled",
                             c.name,
                             c.idle,
                             c.pending
@@ -305,7 +318,7 @@ impl ChSinkWorker {
             self.group,
             self.batch_size
         );
-        self.cleanup_stale_consumers().await;
+        self.observe_stale_consumers().await;
         loop {
             self.pump_once().await;
         }
@@ -352,6 +365,38 @@ mod tests {
             timestamp: 1_700_000_000_000,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn reclaim_cursor_advances_to_redis_next_start() {
+        let mut cursor = "0-0".to_string();
+        let reply = redis::streams::StreamAutoClaimReply {
+            next_stream_id: "1713465536578-0".to_string(),
+            ..Default::default()
+        };
+
+        advance_reclaim_cursor(&mut cursor, &reply);
+
+        assert_eq!(cursor, "1713465536578-0");
+    }
+
+    #[test]
+    fn reclaim_cursor_wraps_when_redis_reaches_end() {
+        let mut cursor = "1713465536578-0".to_string();
+        let reply = redis::streams::StreamAutoClaimReply {
+            next_stream_id: "0-0".to_string(),
+            ..Default::default()
+        };
+
+        advance_reclaim_cursor(&mut cursor, &reply);
+
+        assert_eq!(cursor, "0-0");
+    }
+
+    #[test]
+    fn stale_consumer_cleanup_is_observation_only() {
+        // 清理判断与删除之间无法原子化；生产路径必须只观察，不冒险丢失 PEL。
+        assert_eq!(RECLAIM_IDLE, Duration::from_secs(60));
     }
 
     #[test]
@@ -525,6 +570,231 @@ mod tests {
         assert!(rows.is_empty());
         assert!(valid.is_empty());
         assert_eq!(skip.len(), 3);
+    }
+
+    /// Exercise paged reclaim with a held first page and then verify retry after CH recovery.
+    #[tokio::test]
+    #[ignore]
+    async fn live_reclaim_cursor_progresses_and_recovers_held_rows() {
+        use redis::{streams::StreamClaimOptions, AsyncCommands};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        let client = redis::Client::open(url).expect("valid Redis URL");
+        let manager = ConnectionManager::new(client)
+            .await
+            .expect("Redis must be available for this live test");
+        let clickhouse_url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".to_string());
+        let clickhouse_user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "proxy".into());
+        let clickhouse_password =
+            std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "123456".into());
+        let clickhouse_db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "proxy".into());
+        let healthy = Arc::new(AnalyticsEngine::new_with_batch(
+            &clickhouse_url,
+            &clickhouse_user,
+            &clickhouse_password,
+            &clickhouse_db,
+            1,
+        ));
+        healthy.ping().await.expect("ClickHouse must be available");
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let stream = format!("stream:proxy:telemetry:reclaim-test:{suffix}");
+        let group = format!("ch_sink_reclaim_{suffix}");
+        let consumer = format!("seed_{suffix}");
+        let provider = format!("sinkreclaim{suffix}");
+        let invalid_url = "http://127.0.0.1:1";
+        let broken = Arc::new(AnalyticsEngine::new_with_batch(
+            invalid_url,
+            "unused",
+            "unused",
+            "proxy",
+            1,
+        ));
+        let mut conn = manager.clone();
+        let mut ids = Vec::new();
+        let mut cleanup_needed = false;
+
+        let result = async {
+            let _: () = conn.xgroup_create_mkstream(&stream, &group, "0").await?;
+            cleanup_needed = true;
+            for index in 0..3 {
+                let payload = serde_json::json!({
+                    "event_id": format!("reclaim-{suffix}-{index}"),
+                    "trace_id": "",
+                    "client_ip": "test-client",
+                    "target_domain": "reclaim.example",
+                    "out_ip": "127.0.0.1",
+                    "provider": provider,
+                    "tier": "datacenter",
+                    "country": "US",
+                    "status_code": 200,
+                    "latency_ms": 2,
+                    "transferred_bytes": 1,
+                    "retry_count": 0,
+                    "tenant_id": null,
+                    "error_type": null,
+                    "timestamp": 1_700_000_000_000_i64 + index,
+                })
+                .to_string();
+                let id: String = conn
+                    .xadd(
+                        &stream,
+                        "*",
+                        &[
+                            ("payload", payload.as_str()),
+                            ("domain", "reclaim.example"),
+                            ("status", "200"),
+                        ],
+                    )
+                    .await?;
+                ids.push(id);
+            }
+
+            let seeded: redis::streams::StreamReadReply = conn
+                .xread_options(
+                    &[&stream],
+                    &[">"],
+                    &redis::streams::StreamReadOptions::default()
+                        .group(&group, &consumer)
+                        .count(3),
+                )
+                .await?;
+            assert_eq!(
+                seeded.keys.iter().map(|key| key.ids.len()).sum::<usize>(),
+                3
+            );
+            let _: Vec<String> = conn
+                .xclaim_options(
+                    &stream,
+                    &group,
+                    &consumer,
+                    0,
+                    &ids,
+                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
+                )
+                .await?;
+
+            let mut worker = ChSinkWorker::new(
+                manager.clone(),
+                broken,
+                stream.clone(),
+                Arc::new(MetricsRegistry::new()),
+            );
+            worker.group = group.clone();
+            worker.consumer = format!("sink_{suffix}");
+
+            assert_eq!(
+                worker.pump_once().await,
+                0,
+                "unreachable ClickHouse must fail insert"
+            );
+            assert_eq!(pending_ids(&mut conn, &stream, &group).await?.len(), 3);
+            let cursor_after_first_page = worker.reclaim_cursor.clone();
+            assert_ne!(
+                cursor_after_first_page, "0-0",
+                "first reclaim must advance the scan"
+            );
+
+            let pending_after_claim = pending_ids(&mut conn, &stream, &group).await?;
+            let second_id = ids[1].clone();
+            let _: Vec<String> = conn
+                .xclaim_options(
+                    &stream,
+                    &group,
+                    &consumer,
+                    0,
+                    &[second_id.as_str()],
+                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
+                )
+                .await?;
+            assert_ne!(pending_after_claim.len(), 0);
+
+            worker.analytics = healthy.clone();
+            assert_eq!(
+                worker.pump_once().await,
+                1,
+                "cursor must reach the later pending row"
+            );
+            let pending = pending_ids(&mut conn, &stream, &group).await?;
+            assert_eq!(
+                pending.len(),
+                2,
+                "only the later row should be acknowledged"
+            );
+            assert!(!pending.iter().any(|id| id == &second_id));
+            assert!(pending.contains(&ids[0]) && pending.contains(&ids[2]));
+
+            for id in [&ids[0], &ids[2]] {
+                let _: Vec<String> = conn
+                    .xclaim_options(
+                        &stream,
+                        &group,
+                        &consumer,
+                        0,
+                        &[id.as_str()],
+                        StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
+                    )
+                    .await?;
+            }
+            assert_eq!(
+                worker.pump_once().await,
+                1,
+                "cursor tail must finish before the next scan wraps"
+            );
+            assert_eq!(
+                pending_ids(&mut conn, &stream, &group).await?,
+                vec![ids[0].clone()]
+            );
+
+            let _: Vec<String> = conn
+                .xclaim_options(
+                    &stream,
+                    &group,
+                    &consumer,
+                    0,
+                    &[ids[0].as_str()],
+                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
+                )
+                .await?;
+            assert_eq!(
+                worker.pump_once().await,
+                1,
+                "wrap must revisit the held first page"
+            );
+            assert!(pending_ids(&mut conn, &stream, &group).await?.is_empty());
+            Ok::<(), redis::RedisError>(())
+        }
+        .await;
+
+        if cleanup_needed {
+            let _: redis::RedisResult<()> = conn.xgroup_destroy(&stream, &group).await;
+            let _: redis::RedisResult<usize> = conn.xdel(&stream, &ids).await;
+            let statement = format!(
+                "ALTER TABLE proxy.proxy_telemetry_log DELETE WHERE provider = '{provider}'"
+            );
+            let cleanup = healthy.ch_client().query(&statement).execute().await;
+            assert!(
+                cleanup.is_ok(),
+                "ClickHouse cleanup must succeed: {cleanup:?}"
+            );
+        }
+        result.expect("Redis reclaim/hold/recovery scenario must succeed");
+    }
+
+    async fn pending_ids(
+        conn: &mut ConnectionManager,
+        stream: &str,
+        group: &str,
+    ) -> redis::RedisResult<Vec<String>> {
+        let pending: redis::streams::StreamPendingCountReply =
+            conn.xpending_count(stream, group, "-", "+", 100).await?;
+        Ok(pending.ids.into_iter().map(|item| item.id).collect())
     }
 
     /// Live pump: XADD 2 events (1 valid + 1 poison), `pump_once` lands 1 row

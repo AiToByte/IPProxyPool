@@ -60,7 +60,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
@@ -229,7 +231,7 @@ class Arm:
 
 @dataclass(frozen=True)
 class RequestRow:
-    """一条历史请求。字段取自 ClickHouse `proxy_telemetry` 的实际列。"""
+    """一条历史请求。字段取自 ClickHouse `proxy.proxy_telemetry_log` 的实际列。"""
 
     ts: float
     trace_id: str
@@ -534,18 +536,29 @@ def load_jsonl(path: Path) -> list[RequestRow]:
     return rows
 
 
-def load_clickhouse(url: str, user: str, password: str, hours: int) -> list[RequestRow]:
+def load_clickhouse(
+    url: str,
+    user: str,
+    password: str,
+    hours: int,
+    database: str | None = None,
+) -> list[RequestRow]:
     """从 ClickHouse 拉遥测。
 
     只取**回放必需**的列：多取一列就多一份内存与带宽，而回放是单进程的。
     `FORMAT JSONEachRow` 让结果直接按行解析，不需要额外的 JSON 库。
     """
+    if database is None:
+        database = os.environ.get("CLICKHOUSE_DB", "proxy")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
+        raise SystemExit("数据库名必须是字母、数字或下划线组成且不能以数字开头")
+    table = f"{database}.proxy_telemetry_log"
     query = (
-        "SELECT toUnixTimestamp(timestamp) AS ts, trace_id, target_domain, out_ip, "
+        "SELECT toUnixTimestamp64Milli(event_time) / 1000.0 AS ts, trace_id, target_domain, out_ip, "
         "provider, tier, status_code, latency_ms "
-        "FROM proxy_telemetry "
-        f"WHERE timestamp >= now() - INTERVAL {int(hours)} HOUR "
-        "ORDER BY timestamp ASC FORMAT JSONEachRow"
+        f"FROM {table} "
+        f"WHERE event_time >= now64(3) - INTERVAL {int(hours)} HOUR "
+        "ORDER BY event_time ASC FORMAT JSONEachRow"
     )
     req = urllib.request.Request(
         url,
@@ -573,7 +586,9 @@ def load_clickhouse(url: str, user: str, password: str, hours: int) -> list[Requ
             )
         )
     if not rows:
-        raise SystemExit("ClickHouse 返回 0 行：检查时间窗、表名与凭据")
+        raise SystemExit(
+            f"ClickHouse 返回 0 行：检查时间窗 ({int(hours)} 小时)、表名 {table} 与凭据"
+        )
     return rows
 
 
@@ -691,6 +706,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--ch-url", default="http://127.0.0.1:8123/")
     ap.add_argument("--ch-user", default="proxy")
     ap.add_argument("--ch-password", default="123456")
+    ap.add_argument(
+        "--ch-db",
+        default=None,
+        help="ClickHouse 数据库名；默认读取 CLICKHOUSE_DB，未设置时为 proxy",
+    )
     ap.add_argument("--hours", type=int, default=24)
     ap.add_argument(
         "--policies",
@@ -708,7 +728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = (
         load_jsonl(args.path)
         if args.source == "jsonl"
-        else load_clickhouse(args.ch_url, args.ch_user, args.ch_password, args.hours)
+        else load_clickhouse(args.ch_url, args.ch_user, args.ch_password, args.hours, args.ch_db)
     )
     model = OutcomeModel(rows)
     tiers: dict[str, str] = {}

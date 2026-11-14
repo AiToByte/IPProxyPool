@@ -5,7 +5,7 @@
 //! Mobile $15/GB.
 
 use atomic_float::AtomicF64;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -49,13 +49,14 @@ pub struct TenantAccount {
 
 pub struct TenantManager {
     tenants: DashMap<String, Arc<TenantAccount>>,
-    /// 待落盘的租户键集合（只存 key，值在 flush 时从 `tenants` 现读）。
+    /// 待写回的租户及修改代数。只保存键与版本，不在请求路径复制账户快照。
     ///
-    /// 为什么存 key 而不是存"变更事件/完整快照"：快照要在热路径上克隆
-    /// `tenant_id`（一次堆分配/请求），而 key 只需要一次 `to_string`；
-    /// 事件流则要处理乱序与重放。存 key 的语义最省心——flush 时读到的一定是
-    /// **最新**状态，天然幂等，重复写同一个 key 不产生副作用。
-    dirty: DashSet<String>,
+    /// 写入期间仍可修改账户：旧快照写成功，只能确认它读取时对应的版本，
+    /// 不能删除等待期间产生的新脏标记。版本比较与删除由同一个分片锁保护。
+    dirty: DashMap<String, u64>,
+    /// 周期写回与停机写回串行执行，避免较早的快照在较晚快照之后覆盖存储。
+    /// 此锁只约束持久化调用，不阻塞请求计量；持有期间不保留 DashMap 守卫。
+    flush_gate: tokio::sync::Mutex<()>,
     store: Store,
 }
 
@@ -134,7 +135,7 @@ impl PersistBackend for RedisBackend {
         pipe.sadd(format!("{}:index", self.prefix), key).ignore();
         pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| format!("write {hash_key}: {e}"))
+            .map_err(|e| format!("租户状态写回失败（Redis 前缀已隐藏）: {e}"))
     }
 
     async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
@@ -142,18 +143,20 @@ impl PersistBackend for RedisBackend {
         let index_key = format!("{}:index", self.prefix);
         let keys: Vec<String> = redis::AsyncCommands::smembers(&mut conn, &index_key)
             .await
-            .map_err(|e| format!("SMEMBERS {index_key}: {e}"))?;
+            .map_err(|e| format!("租户状态索引读取失败: {e}"))?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             let hash_key = format!("{}:{key}", self.prefix);
             let hash: std::collections::HashMap<String, String> =
                 redis::AsyncCommands::hgetall(&mut conn, &hash_key)
                     .await
-                    .map_err(|e| format!("HGETALL {hash_key}: {e}"))?;
+                    .map_err(|e| format!("租户状态读取失败: {e}"))?;
             match PersistedTenant::from_hash(&hash) {
                 Some(rec) => out.push((key, rec)),
                 None => {
-                    log::warn!("[Tenant] {hash_key} 无法解析（余额字段缺失或非有限值），保留内存值")
+                    log::warn!(
+                        "[Tenant] 租户状态记录无法解析（余额字段缺失或非有限值），保留内存值"
+                    )
                 }
             }
         }
@@ -213,7 +216,7 @@ impl RecordingBackend {
 impl PersistBackend for RecordingBackend {
     async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String> {
         if self.fail_keys.lock().contains(key) {
-            return Err(format!("write {key}: injected failure"));
+            return Err("租户状态写回失败（测试注入）".to_string());
         }
         // 守卫在 return 前自然释放，不跨 await（本函数体内无 await）。
         self.hashes
@@ -501,7 +504,8 @@ impl TenantManager {
     pub fn with_store(store: Store) -> Self {
         Self {
             tenants: DashMap::new(),
-            dirty: DashSet::new(),
+            dirty: DashMap::new(),
+            flush_gate: tokio::sync::Mutex::new(()),
             store,
         }
     }
@@ -521,15 +525,15 @@ impl TenantManager {
         }
     }
 
-    /// 标记某租户需要落盘（幂等；未启用持久化时是空操作）。
-    ///
-    /// 成本：启用持久化后每请求一次 `String` 克隆（约 20B）。这是有意的——
-    /// 关掉时零成本，开启时换来"重启不丢余额"。用 DashSet 而非队列：
-    /// 同一租户的高频计量会反复命中同一个 key，集合天然把它们合并成一条。
+    /// 修改完成后推进脏版本；未启用持久化时为空操作。
+    /// 同一租户的多次修改合并为一条记录，但不能合并掉“写入中又修改”的事实。
     #[inline]
     fn mark_dirty(&self, api_key: &str) {
         if self.is_persistent() {
-            self.dirty.insert(api_key.to_string());
+            self.dirty
+                .entry(api_key.to_string())
+                .and_modify(|version| *version = version.wrapping_add(1))
+                .or_insert(1);
         }
     }
 
@@ -600,36 +604,32 @@ impl TenantManager {
         }
     }
 
-    /// flush 算法本体（与后端无关）。
+    /// 串行写回算法。取消或失败不确认版本，下次调用仍会读取并重试最新状态。
     async fn flush_via<B: PersistBackend>(&self, backend: &B) -> Result<usize, String> {
-        if self.dirty.is_empty() {
-            return Ok(0);
-        }
-        // 先把脏集快照成 Vec：flush 过程中 `mark_dirty` 可能并发插入新 key，
-        // 而 `DashSet` 的迭代守卫同样不可跨 await。
-        let keys: Vec<String> = self.dirty.iter().map(|e| e.key().clone()).collect();
+        let _flush = self.flush_gate.lock().await;
+        // 先捕获版本，再读账户：反序会把“旧值 + 新版本”写出并错误确认新修改。
+        // 不跨 await 持有迭代守卫，写入期间数据面可正常标记更新。
+        let keys: Vec<(String, u64)> = self
+            .dirty
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
         let mut written = 0usize;
-        for key in keys {
-            // 先取快照再 await：DashMap 的读守卫不可跨 await。
+        for (key, version) in keys {
             let rec = match self.tenants.get(&key) {
                 Some(e) => PersistedTenant::from_account(e.value()),
                 None => {
-                    // 账户已不在（理论上不会发生：没有删除 API）⇒ 清脏避免空转。
-                    self.dirty.remove(&key);
+                    self.dirty.remove_if(&key, |_, current| *current == version);
                     continue;
                 }
             };
-            match backend.write(&key, &rec).await {
-                Ok(()) => {
-                    // 只有写成功才删脏：删早了等于丢更新（见方法文档）。
-                    self.dirty.remove(&key);
-                    written += 1;
-                }
-                Err(e) => {
-                    // 保留脏标记（不清），下一轮重试；立即返回让上层打 warn。
-                    return Err(format!("{e} (已写 {written} 条)"));
-                }
-            }
+            backend
+                .write(&key, &rec)
+                .await
+                .map_err(|e| format!("{e} (已写 {written} 条)"))?;
+            // 比较与删除必须原子完成；先 get 再 remove 会再次引入丢更新窗口。
+            self.dirty.remove_if(&key, |_, current| *current == version);
+            written += 1;
         }
         Ok(written)
     }
@@ -1160,6 +1160,95 @@ mod tests {
         );
     }
 
+    /// 可控阻塞后端：精确停在快照已生成、写入未完成的窗口，避免依赖 sleep 猜竞态。
+    struct PausedWriteBackend {
+        inner: Arc<RecordingBackend>,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl PausedWriteBackend {
+        fn new(inner: Arc<RecordingBackend>) -> Self {
+            Self {
+                inner,
+                entered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl PersistBackend for PausedWriteBackend {
+        async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String> {
+            self.entered.notify_one();
+            self.resume.notified().await;
+            self.inner.write(key, rec).await
+        }
+
+        async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+            self.inner.read_all().await
+        }
+    }
+
+    /// 老快照写成功不能确认等待期间产生的新修改；空闲后仍须补写最新余额。
+    #[tokio::test]
+    async fn flush_preserves_changes_made_during_write() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        let paused = PausedWriteBackend::new(Arc::clone(&backend));
+        let (result, ()) = tokio::join!(m.flush_via(&paused), async {
+            paused.entered.notified().await;
+            assert!(m.set_balance("k1", 42.5));
+            assert!(m.set_active("k1", false));
+            paused.resume.notify_one();
+        });
+        assert_eq!(result.expect("首次写入"), 1);
+        assert_eq!(backend.stored("k1").unwrap()["balance_usd"], "100");
+        assert_eq!(m.flush_dirty().await.expect("补写新版本"), 1);
+        let stored = backend.stored("k1").unwrap();
+        assert_eq!(stored["balance_usd"], "42.5");
+        assert_eq!(stored["is_active"], "0");
+        assert_eq!(m.flush_dirty().await.expect("已持久化后空闲"), 0);
+    }
+
+    /// 取消进行中的 flush 不得吞掉待保存状态，下一轮仍可重试。
+    #[tokio::test]
+    async fn cancelled_flush_keeps_pending_state() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        let paused = PausedWriteBackend::new(Arc::clone(&backend));
+        {
+            let pending = m.flush_via(&paused);
+            tokio::pin!(pending);
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+        }
+        assert_eq!(backend.writes(), 0);
+        assert_eq!(m.flush_dirty().await.expect("取消后重试"), 1);
+    }
+
+    /// 周期写回占用提交槽时，停机写回必须等待，不能用新快照抢先覆盖存储。
+    #[tokio::test]
+    async fn concurrent_flushes_commit_in_order() {
+        let (m, backend) = persistent_manager();
+        register_default(&m, "k1");
+        let paused = PausedWriteBackend::new(Arc::clone(&backend));
+        let (first, ()) = tokio::join!(m.flush_via(&paused), async {
+            paused.entered.notified().await;
+            m.set_balance("k1", 17.0);
+            {
+                let second = m.flush_dirty();
+                tokio::pin!(second);
+                assert!(
+                    futures::poll!(second.as_mut()).is_pending(),
+                    "旧写回未完成时，新写回不得提交"
+                );
+            }
+            paused.resume.notify_one();
+        });
+        assert_eq!(first.expect("旧版本完成"), 1);
+        assert_eq!(m.flush_dirty().await.expect("新版本补写"), 1);
+        assert_eq!(backend.stored("k1").unwrap()["balance_usd"], "17");
+    }
+
     /// 写出去 → 读回来，运行期可变状态一字不差。
     #[tokio::test]
     async fn p2_2_flush_then_load_roundtrips_runtime_state() {
@@ -1241,7 +1330,7 @@ mod tests {
         backend.fail_on("k1");
 
         let err = m.flush_dirty().await.expect_err("注入失败必须冒泡给调用方");
-        assert!(err.contains("injected failure"), "{err}");
+        assert!(err.contains("租户状态写回失败"), "{err}");
         assert_eq!(backend.writes(), 0);
         assert!(!m.dirty.is_empty(), "失败后脏标记必须保留");
 

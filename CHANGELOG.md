@@ -23,6 +23,16 @@
 
 ### Security
 
+- **出站 TLS 校验改为显式失败关闭（步骤 71）**：源码级取证发现 pingora-core 0.9.0
+  的 rustls 连接器在 `HttpPeer` 的 SNI 为空、或 `verify_cert=false` 时切到
+  `VerificationMode::SkipAll`（`verify_server_cert` 直接放行，证书链与主机名全不验），
+  且生产构建可达；而 `docs/OPERATION.md` 与 `gateway/upstream.rs` 的注释却写着
+  「rustls 后端关闭校验无效」——**这句是错的，且是最危险的那类错**（让人误以为
+  天然安全）。`build_http_peer` 现在显式固定 `verify_cert=true` /
+  `verify_hostname=true`，并在 TLS peer 的 SNI 为空、全空白或含控制字符时返回 400；
+  明文 peer 行为不变。新增 3 条单测（含 RED 证据与变异复验），更正运维文档的 TLS
+  段，并把一处描述「已删除的跳过校验分支」的旧测试名改回真实行为。
+  未验证：真实 TLS 握手下的 fail-open 活流量复现；Host 含端口的 SNI 形态未改。
 - 升级 `rustls-webpki 0.103.15→0.103.16`（RUSTSEC-2026-0382：证书校验可能接受
   不受信任的中间证书）、`webpki-roots 1.0.9→1.0.10`（RUSTSEC-2026-0381：
   内置根证书信任了已撤销的 emSign 中间证书）与 `tokio 1.53.1→1.53.3`

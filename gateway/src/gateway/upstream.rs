@@ -25,6 +25,23 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         || addr.starts_with("[::1]")
 }
 
+/// TLS SNI 合法性：非空、不含空白与控制字符。
+///
+/// 取证（pingora-core 0.9.0 `src/connectors/tls/rustls/mod.rs:226-257`）：
+/// `peer.sni().is_empty()` 会被映射成 `VerificationMode::SkipAll`，其
+/// `verify_server_cert` 直接返回 `ServerCertVerified::assertion()`（:361）
+/// ——证书链与主机名**全都不验**，且生产构建可达。`request_filter` 已在另一个
+/// 回调里拒绝空 Host，但那里守不住 peer 装配的新调用方；这里是独立兜底。
+///
+/// 刻意只挡「空 / 空白 / 控制字符」：含端口的 Host 形态属于既有对外契约，
+/// 本轮不改（其后果是 rustls 拒绝握手，而不是绕过校验）。
+fn is_valid_tls_sni(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| !b.is_ascii_control() && !b.is_ascii_whitespace())
+}
+
 /// P2：HttpPeer 装配（含 socks 守卫）。
 ///
 /// 守卫正常走不到（显式 socks 请求被 `proxy_upstream_filter` 短路，默认请求被
@@ -46,20 +63,33 @@ pub(super) fn build_http_peer(node: &ProxyNode, target_host: &str) -> Result<Box
     // 对 443 节点连续 50/50 次全部 `200`，响应体均为真实公网出口 IP；
     // 去掉该变量则 503 + `TLSHandshakeFailure`（反向对照）。
     //
-    // ⚠️ 纠正步骤 45/46 的两处错误说法（都留档，避免后人重犯）：
-    //   1. 步骤 45 写"TLS 证书校验使用 Pingora 默认行为（跳过验证）"——**错**，默认是严格校验。
-    //   2. 步骤 46 由"rustls 不支持关闭校验"推断出"只能靠受信 CA 或升级 Pingora"——
-    //      **结论对，但当时把"框架不支持关闭校验"当成了终点，漏了正规通道**：
-    //      `pingora-rustls` 的 `load_platform_certs_incl_env_into_store` 会处理
-    //      **`SSL_CERT_FILE` / `SSL_CERT_DIR`** 环境变量，rustls 的 root store 在
-    //      连接器构建时由它填充 ⇒ **零生产代码改动**即可让 rustls 信任自建 CA。
-    //      （`PeerOptions::ca` 只能填 `ConnectorOptions` 级别的 CA，且与本路径无关。）
+    // ⚠️ 纠正步骤 45/46 留下的两处错误说法（docs/OPERATION.md 同步更正）：
+    //   1. 步骤 45 写「Pingora 默认跳过证书校验」——**错**，`PeerOptions::new()`
+    //      的 `verify_cert` / `verify_hostname` 缺省都是 `true`。
+    //   2. 步骤 46 写「rustls 后端 `verify_cert=false` 无效」——**错，且这句最危险**。
+    //      pingora-core 0.9.0 `connectors/tls/rustls/mod.rs:213-258` 中，
+    //      `HttpPeer::get_peer_options()` 恒为 `Some`（默认 `alpn=H1`），因此每次
+    //      都会克隆出自定义 config；随后 `verify_cert=false` 或**空 SNI** 都被映射为
+    //      `VerificationMode::SkipAll`（:361 直接放行证书）。⇒ 校验**是能关掉的**，
+    //      「反正关不掉」只是自我安慰，不能当安全边界。
     //
-    // ⇒ 正确做法：**不要关闭校验**，而是让代理证书由受信任 CA 签发（本仓即如此）。
-    // 之前尝试的 `peer.options.verify_cert = false` 在 rustls 下无效且危险，已移除。
+    // ⇒ 正确做法：不依赖框架缺省值，显式钉死开关 + 拒绝空 SNI；信任源由
+    //   `pingora-rustls` 的 `load_platform_certs_incl_env_into_store` 从平台 CA 及
+    //   **`SSL_CERT_FILE` / `SSL_CERT_DIR`** 填充（零生产代码改动即可信任自建 CA）。
     let is_tls = is_tls_for_node(node);
+    if is_tls && !is_valid_tls_sni(target_host) {
+        return Err(Error::explain(
+            pingora_core::ErrorType::HTTPStatus(400),
+            "invalid upstream TLS SNI: empty or control characters in Host",
+        ));
+    }
     let mut peer = HttpPeer::new(node.addr.clone(), is_tls, target_host.to_string());
 
+    // Fail-closed：把校验开关写成显式赋值，而不是「默认值应该是 true」。
+    // 配合 `gateway/tests.rs::tls_peer_pins_certificate_verification_flags`，
+    // 任何日后「为了排障临时关一下」的改动都会被单测当场拦下。
+    peer.options.verify_cert = true;
+    peer.options.verify_hostname = true;
     peer.options.connection_timeout = Some(Duration::from_millis(1500));
     peer.options.read_timeout = Some(Duration::from_millis(5000));
     peer.options.write_timeout = Some(Duration::from_millis(3000));

@@ -80,7 +80,7 @@ prometheus/protobuf 链）。但 0.x 的 minor 升级即 breaking change，
 
 ### 3.3 升级验收标准（届时执行）
 
-1. 编译通过 + 全量门禁绿（360 单测、clippy、21 门）。
+1. 编译通过 + 全量门禁绿（421 单测、clippy、22 门）。
 2. Windows 300s+ 存活实测（OPT-R14 方法复用）。
 3. 端到端压测复跑（`tools/bench_gateway.py`），QPS 不低于本次基线。
 4. `cargo deny check` + `cargo audit` 全绿（含 unmaintained 重 triage）。
@@ -213,7 +213,7 @@ Linux 分支（消 1 个 unmaintained）。
 
 **§3.3 验收标准对照（当场执行）**：
 
-1. ✅ 编译 + 360 单测 + clippy + fmt（见上）。
+1. ✅ 编译 + 当时实测 `338 passed / 8 ignored` + clippy + fmt（见上；这是 2026-10-17 当时的实测值）。
 2. ✅ Windows 存活实测：dev 实例（debug build）live E2E 全程存活 **397s**
     （2026-10-17 11:25:28Z 起至 11:32:05Z taskkill），期间 admin API 批次
     正常响应；P0 kill 演练（C1 口径）已于 2026-10-17 下午复跑通过——

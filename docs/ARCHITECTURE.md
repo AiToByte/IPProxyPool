@@ -33,7 +33,7 @@
     PubSub)         _log)
 ```
 
-网关为宿主二进制（不在 compose 内）；依赖一键起：`docker compose up -d`。
+网关为宿主二进制（不在 compose 内）；依赖一键起：`docker compose up -d`。HTTP/1.1 CONNECT 使用 `CONNECT_ADDR` 独立启用，明文 listener 仅接受回环地址；TLS 入站尚未支持。
 
 ### 2. 请求五阶段（数据面）
 
@@ -91,7 +91,7 @@ Redis 中断：数据面 200 不降级（内存隔离独立），恢复后行数
     keys/PubSub)   telemetry_log)   + 5 panels)
 ```
 
-The gateway runs as a host binary (not in compose); dependencies start with `docker compose up -d`.
+The gateway runs as a host binary (not in compose); dependencies start with `docker compose up -d`. HTTP/1.1 CONNECT uses a separate opt-in `CONNECT_ADDR` listener that accepts loopback addresses only for plaintext; inbound TLS is not supported yet.
 
 ### 2. Five request phases (data plane)
 

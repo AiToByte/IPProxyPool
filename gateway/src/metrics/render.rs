@@ -21,6 +21,7 @@ impl MetricsRegistry {
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(1024);
         self.render_requests_and_probe(&mut out);
+        self.render_connect(&mut out);
         self.render_latency(&mut out);
         self.render_breaker(&mut out);
         self.render_telemetry(&mut out);
@@ -135,7 +136,78 @@ impl MetricsRegistry {
         ));
     }
 
-    /// 字节计量与两个直方图（网关开销、per-stage 开销）。
+    /// CONNECT 隧道观测：协议、终止原因、并发、方向字节和寿命。
+    fn render_connect(&self, out: &mut String) {
+        out.push_str("# HELP connect_tunnels_established_total CONNECT tunnels established by upstream protocol.\n");
+        out.push_str("# TYPE connect_tunnels_established_total counter\n");
+        let mut established: Vec<_> = self
+            .connect_tunnels_established
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        established.sort();
+        for (proto, count) in established {
+            out.push_str(&format!(
+                "connect_tunnels_established_total{{proto=\"{proto}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP connect_tunnel_terminated_total CONNECT tunnel terminations by reason.\n",
+        );
+        out.push_str("# TYPE connect_tunnel_terminated_total counter\n");
+        let mut terminated: Vec<_> = self
+            .connect_tunnel_terminated
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        terminated.sort();
+        for (reason, count) in terminated {
+            out.push_str(&format!(
+                "connect_tunnel_terminated_total{{reason=\"{reason}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str("# HELP connect_tunnel_active Current CONNECT connections.\n");
+        out.push_str("# TYPE connect_tunnel_active gauge\n");
+        out.push_str(&format!(
+            "connect_tunnel_active {}\n",
+            self.connect_active.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP connect_admission_rejected_total CONNECT admission limit rejections.\n",
+        );
+        out.push_str("# TYPE connect_admission_rejected_total counter\n");
+        out.push_str(&format!(
+            "connect_admission_rejected_total {}\n",
+            self.connect_admission_rejected.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP connect_bytes_total CONNECT bytes by direction.\n");
+        out.push_str("# TYPE connect_bytes_total counter\n");
+        out.push_str(&format!(
+            "connect_bytes_total{{direction=\"upstream\"}} {}\n",
+            self.connect_bytes_up.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "connect_bytes_total{{direction=\"downstream\"}} {}\n",
+            self.connect_bytes_down.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP connect_tunnel_duration_ms_sum CONNECT tunnel duration sum in milliseconds.\n",
+        );
+        out.push_str("# TYPE connect_tunnel_duration_ms_sum counter\n");
+        out.push_str(&format!(
+            "connect_tunnel_duration_ms_sum {}\n",
+            self.connect_tunnel_duration_ms.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP connect_tunnel_closed_total CONNECT tunnels closed.\n");
+        out.push_str("# TYPE connect_tunnel_closed_total counter\n");
+        out.push_str(&format!(
+            "connect_tunnel_closed_total {}\n",
+            self.connect_tunnel_closed.load(Ordering::Relaxed)
+        ));
+    }
+
     ///
     /// 见 [`Self::render`]：段序即输出序，调整会改变抓取端看到的行序。
     fn render_latency(&self, out: &mut String) {

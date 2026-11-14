@@ -115,7 +115,8 @@ impl VendorArbitrageWorker {
                 Ok(rate) => {
                     log::info!("[Arbitrage] vendor={vendor} country={country} success={rate:.2}%");
                     if let Some(weight) = arbitrage_action(rate) {
-                        self.router.adjust_vendor_weight(&vendor, &country, weight);
+                        self.router
+                            .adjust_vendor_weight_from_sla(&vendor, &country, weight);
                         log::warn!(
                             "[Arbitrage] vendor={vendor} country={country} weight->{weight} (rate={rate:.2}%)"
                         );

@@ -6,6 +6,7 @@
 //! logging (bandit reward update + telemetry emit, GW-2 bus).
 
 use crate::bandit::{compute_reward, BanditArm, LinUCBEngine, VectorD};
+use crate::connect::parse_connect_authority;
 use crate::fingerprint::FingerprintHardener;
 use crate::metrics::MetricsRegistry;
 use crate::model::{EgressProto, ProxyContext, ProxyNode, RoutingSpec};
@@ -123,10 +124,16 @@ pub use policy::{
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use upstream::{is_loopback_addr, is_tls_for_node};
 
-/// Parse routing directives from headers + Basic Proxy-Authorization username.
+/// 将 CONNECT 的 authority-form 转成路由所需的目标域名。
 ///
-/// Supported: `X-Proxy-Country/Session/Tier` headers (preferred) and
-/// `user_country-us_session-xxx_tier-res` embedded in the Basic username.
+/// 复用独立 CONNECT ServerApp 的同一严格解析器，避免普通入口的兼容 API
+/// 与 tunnel listener 产生不同的 authority 校验口径。
+pub fn parse_connect_target(value: &str) -> Result<crate::connect::ConnectTarget, &'static str> {
+    parse_connect_authority(value)
+}
+
+/// 解析普通 HTTP 路由指令：支持 Header 与 Basic 用户名中的兼容 token。
+////// `user_country-us_session-xxx_tier-res` embedded in the Basic username.
 pub fn parse_routing_spec(header: &RequestHeader) -> RoutingSpec {
     let mut spec = RoutingSpec::default();
 

@@ -125,6 +125,10 @@ jobs:
           Invoke-ScriptAnalyzer -Path tools -Recurse -Severity Error -EnableExit
       - name: Python scripts compile
         run: python3 -m compileall -q tools log/mock_upstream.py log/probe_free.py log/launch_detached.py deploy/geoip_update.py
+      - name: Routing replay ClickHouse contract tests
+        # 该测试使用本地 HTTP stub 捕获真实 POST，验证回放 SQL 与权威 DDL
+        # 对齐；不需要 ClickHouse 服务，也不会发送真实凭据。
+        run: python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
       - name: PowerShell scripts carry UTF-8 BOM (OPT-R7 D1)
         # git 会剥离 UTF-8 BOM 且不受 .gitattributes 控制（实测记录见
         # .gitattributes 的 OPT-R7 D1 段），故只能靠 CI 断言守住工作区副本。

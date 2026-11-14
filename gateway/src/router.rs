@@ -7,7 +7,7 @@
 use crate::janitor;
 use crate::model::{EgressProto, ProxyNode};
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 // `pick_weighted` 是**测试期参考实现**（`#[cfg(test)]`），`SliceRandom::choose`
 // 与 `Rng::gen_range` 仅它独有；故这两条 import 也必须是 `cfg(test)`——
@@ -214,6 +214,8 @@ pub struct RouterEngine {
     /// GW-6 自动调权：付费节点基准权重（addr → boost 前的原始权重），供
     /// 免费池干旱时上调付费权重、恢复后还原。仅记录非 free provider 节点。
     paid_base_weight: DashMap<String, u32>,
+    /// SLA 摘除状态独立于当前权重，便于恢复 SLA 自动摘除而不复活手动禁用节点。
+    sla_derated_nodes: DashSet<String>,
     /// 步骤 54：主动健康摘除表（addr → 连续失败/冷却截止）。
     ///
     /// 与域级 `quarantine_map` **刻意分离**：后者是"某目标域对该出口熔断"，
@@ -329,6 +331,7 @@ impl RouterEngine {
             buckets: ArcSwap::from_pointee(buckets),
             hot_nodes: ArcSwap::from_pointee(hot_nodes),
             paid_base_weight: DashMap::new(),
+            sla_derated_nodes: DashSet::new(),
             active_health: DashMap::new(),
             probe_mark_lock: Mutex::new(()),
             probe_cursor: AtomicUsize::new(0),
