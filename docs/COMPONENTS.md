@@ -47,9 +47,9 @@
 | `janitor.rs` | 3 | 淘汰计数助手：四处 sweep 共用一份「淘汰并报数」逻辑 | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 7 | 纯 liveness/readiness 状态决策模型与共享运行时快照：starting/ready/degraded/draining/stopped | `RuntimeHealthState/RuntimePhase/evaluate_readiness` |
+| `health.rs` | 8 | 纯 liveness/readiness 状态决策模型与共享运行时快照、Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
-**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 447（其中 437 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
+**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 448（其中 438 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
@@ -77,7 +77,7 @@ method）调用方直接 `engine.foo()` 即可，再导出会触发 `unused_impo
 
 `free_pool` 模块曾是 3727 行的单文件（抓取源＋两级质检＋注册表状态＋后台 worker
 混在一起）。现按职责拆为父模块 `free_pool/mod.rs`（类型定义＋`shared_client`＋
-再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，职责表目前共 26 行，子模块仍不单独占行。
+再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，职责表目前共 27 行，子模块仍不单独占行。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -102,7 +102,7 @@ method）调用方直接 `engine.foo()` 即可，再导出会触发 `unused_impo
 `gateway` 模块曾 2275 行的单文件，把**四类职责**混在一起：鉴权/分档的纯判定、
 LinUCB 选路上下文、上游 peer 装配、SOCKS 桥转发，外加 40 个单测。现按职责拆为
 父模块 `gateway/mod.rs`（结构体＋追踪 ID＋`parse_routing_spec`＋再导出）＋ 6 个子模块。
-**子模块的测试数已并入上表的 `gateway/mod.rs` 行**；组件职责表目前共 26 行，子模块仍折叠在父模块行中。
+**子模块的测试数已并入上表的 `gateway/mod.rs` 行**；组件职责表目前共 27 行，子模块仍折叠在父模块行中。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -246,7 +246,7 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `janitor.rs` | 3 | Eviction-count helper: one shared "evict and report" path for four sweeps | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | Transport connector abstraction: tokio today, io_uring hook on Linux | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 7 | Pure liveness/readiness decision model and shared runtime snapshot: starting/ready/degraded/draining/stopped | `RuntimeHealthState/RuntimePhase/evaluate_readiness` |
+| `health.rs` | 8 | Pure liveness/readiness decision model, shared runtime snapshot and Redis required/optional policy: starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
 
 `startup_config.rs` is a pure startup parser helper, including environment collection and invalid-Unicode rejection. The responsibility table also includes `health.rs`, which owns only pure readiness decisions; HTTP wiring remains a separate approved slice.
@@ -284,7 +284,7 @@ The `free_pool` module used to be a 3727-line single file (fetch sources + two-s
 verify + registry state + background worker all mixed together). It is now the
 parent module `free_pool/mod.rs` (types + `shared_client` + re-exports) plus 5
 submodules. **Submodule tests are folded into the `free_pool/mod.rs` row above**;
-the component table has 26 rows total and keeps submodules folded into their parent row.
+the component table has 27 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|
@@ -312,7 +312,7 @@ The `gateway` module used to be a 2275-line single file mixing **four concerns**
 pure auth/tier decisions, LinUCB routing context, upstream peer assembly, and SOCKS
 bridge forwarding — plus 40 unit tests. It is now the parent module `gateway/mod.rs`
 (struct + trace id + `parse_routing_spec` + re-exports) plus 6 submodules.
-**Submodule tests are folded into the `gateway/mod.rs` row above**; the component table has 26 rows total and keeps submodules folded into their parent row.
+**Submodule tests are folded into the `gateway/mod.rs` row above**; the component table has 27 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|

@@ -400,24 +400,46 @@ fn main() {
 /// This is a bounded, local TCP connect probe rather than a request-path dependency
 /// check. It closes immediately after confirming the listener accepts connections.
 async fn monitor_required_listener(addr: String, health: Arc<health::RuntimeHealthState>) {
+    const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
     loop {
-        match tokio::time::timeout(
-            Duration::from_millis(250),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                drop(stream);
-                health.set_required_listener_ready(true);
-                return;
-            }
-            Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
+        let listener_ready = matches!(
+            tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await,
+            Ok(Ok(_stream))
+        );
+        health.set_required_listener_ready(listener_ready);
+        tokio::time::sleep(PROBE_INTERVAL).await;
     }
 }
 
-/// Assemble the Gateway and its background workers from validated startup inputs.
+async fn monitor_redis_health(
+    client: redis::Client,
+    tenant_store_requires_redis: bool,
+    health: Arc<health::RuntimeHealthState>,
+) {
+    const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    loop {
+        tokio::time::sleep(PROBE_INTERVAL).await;
+        let probe = async {
+            let mut connection = client.get_multiplexed_async_connection().await?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await
+        };
+        let redis_available = matches!(
+            tokio::time::timeout(PROBE_TIMEOUT, probe).await,
+            Ok(Ok(response)) if response == "PONG"
+        );
+        let (required_ready, optional_ready) =
+            health::redis_dependency_facts(tenant_store_requires_redis, redis_available);
+        health.set_required_dependency_ready(required_ready);
+        health.set_optional_dependencies_ready(optional_ready);
+    }
+}
+
 async fn setup_gateway() -> Server {
     // 先完成所有纯配置校验，再创建 listener 或发起任何外部依赖连接。
     let startup_input = startup_config::StartupConfigInput::from_environment();
@@ -477,10 +499,22 @@ async fn setup_gateway() -> Server {
         }
     };
 
-    runtime_health.set_required_dependency_ready(
-        startup.tenant_store != startup_config::TenantStoreMode::Redis || redis_conn.is_some(),
-    );
-    runtime_health.set_optional_dependencies_ready(redis_conn.is_some());
+    let tenant_store_requires_redis =
+        startup.tenant_store == startup_config::TenantStoreMode::Redis;
+    let (required_dependency_ready, optional_dependencies_ready) =
+        health::redis_dependency_facts(tenant_store_requires_redis, redis_conn.is_some());
+    runtime_health.set_required_dependency_ready(required_dependency_ready);
+    runtime_health.set_optional_dependencies_ready(optional_dependencies_ready);
+    let redis_health_client = redis_client.clone();
+    let redis_health_state = runtime_health.clone();
+    tokio::spawn(async move {
+        monitor_redis_health(
+            redis_health_client,
+            tenant_store_requires_redis,
+            redis_health_state,
+        )
+        .await;
+    });
 
     // 2a. OPT-2 API Key 环境门：D3 起默认开启（`REQUIRE_API_KEY=0` 显式关闭）。
     // 开启后，未带 `X-API-Key` 头的请求在网关入口直接 403（见 gateway.rs）；

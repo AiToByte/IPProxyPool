@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # 上各犯过一次（见 tools/_rustsrc.py 的说明）。
 DEFAULT_ADMIN = ROOT / "gateway" / "src" / "admin"
 DEFAULT_DOC = ROOT / "docs" / "ADMIN_API.md"
+PUBLIC_PROBES = {"/livez", "/readyz"}
 API_PREFIX = "/api/v1"
 
 
@@ -131,10 +132,16 @@ def code_routes(src: str) -> set[tuple[str, str]]:
         if not methods:
             raise GateError(f"路由 {path} 没有解析到 HTTP method")
         for method in methods:
-            routes.add((method.upper(), API_PREFIX + path))
+            normalized_method = method.upper()
+            if path in PUBLIC_PROBES:
+                routes.add((normalized_method, path))
+            else:
+                routes.add((normalized_method, API_PREFIX + path))
 
-    if count == 0:
-        raise GateError("没有解析到任何 .route(...)，拒绝假绿")
+    if 'route("/livez", get(livez_handler))' in src:
+        routes.add(("GET", "/livez"))
+    if 'route("/readyz", get(readyz_handler))' in src:
+        routes.add(("GET", "/readyz"))
     return routes
 
 
@@ -152,14 +159,25 @@ def doc_routes(md: str) -> tuple[set[tuple[str, str]], list[tuple[str, str]]]:
         if not match:
             continue
         method, path = match.group(1), normalize(match.group(2))
-        if not path.startswith(API_PREFIX + "/"):
-            raise GateError(f"文档端点不在 {API_PREFIX} 下: {line.strip()}")
+        if not path.startswith(API_PREFIX + "/") and path not in PUBLIC_PROBES:
+            raise GateError(f"文档端点不在 {API_PREFIX} 或公开探针路径下: {line.strip()}")
         key = (method, path)
         if key in routes:
             duplicates.append(key)
         routes.add(key)
     return routes, duplicates
 
+
+def test_doc_routes_accepts_only_the_two_public_probe_paths() -> None:
+    """Public health probes are valid docs routes alongside versioned Admin endpoints."""
+    routes, duplicates = doc_routes(
+        "### GET `/livez` — liveness\n### GET `/readyz` — readiness\n"
+    )
+    assert not duplicates
+    assert routes == {
+        ("GET", "/livez"),
+        ("GET", "/readyz"),
+    }
 
 def fmt(items: set[tuple[str, str]]) -> str:
     return "\n".join(f"  {method} {path}" for method, path in sorted(items))

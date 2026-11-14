@@ -285,6 +285,8 @@ fn build_router_with(
     //     30s 仍远高于正常耗时）。
     let audit = middleware::from_fn(audit_logging);
 
+    // Public probes are deliberately outside the authenticated `/api/v1` nest.
+    // They still pass through the fixed-path audit layer and share the same state.
     Router::new()
         .route("/livez", get(livez_handler))
         .route("/readyz", get(readyz_handler))

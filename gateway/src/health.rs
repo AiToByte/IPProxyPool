@@ -139,6 +139,16 @@ pub(crate) struct ReadinessDecision {
     pub(crate) reason: ReadinessReason,
 }
 
+pub(crate) fn redis_dependency_facts(
+    tenant_store_requires_redis: bool,
+    redis_available: bool,
+) -> (bool, bool) {
+    (
+        !tenant_store_requires_redis || redis_available,
+        redis_available,
+    )
+}
+
 pub(crate) fn evaluate_readiness(facts: RuntimeFacts) -> ReadinessDecision {
     if facts.stopped {
         return ReadinessDecision {
@@ -322,6 +332,14 @@ mod tests {
         let draining = state.evaluate();
         assert_eq!(draining.phase, RuntimePhase::Draining);
         assert!(!draining.ready);
+    }
+
+    #[test]
+    fn redis_dependency_policy_separates_required_and_optional_modes() {
+        assert_eq!(redis_dependency_facts(true, true), (true, true));
+        assert_eq!(redis_dependency_facts(true, false), (false, false));
+        assert_eq!(redis_dependency_facts(false, true), (true, true));
+        assert_eq!(redis_dependency_facts(false, false), (true, false));
     }
 
     #[test]

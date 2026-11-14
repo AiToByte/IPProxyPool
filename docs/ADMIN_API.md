@@ -2,7 +2,7 @@
 
 > 双语：中文在前，English after. Bilingual: Chinese first, English second.
 
-IPProxyPool Phase 1 引入独立的 **Admin REST API**（端口 `:9092`），与数据面 Pingora（`:8916`）和 Prometheus 指标（`:9091`）完全隔离。所有端点统一在 `/api/v1/*` 下，通过请求头 `X-Admin-Key` 认证，key 值由环境变量 `ADMIN_API_KEY` 提供；未设置时整个 Admin 服务拒绝所有请求（fail-closed）。
+所有 `/api/v1/*` 管理端点使用 `X-Admin-Key` 认证。供编排系统使用的 `/livez`、`/readyz` 位于该认证边界之外，具有固定、低基数响应；它们不是 Admin API 的鉴权替代方案。
 
 OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 获取，供前端、Swagger UI 和后续多语言 SDK 代码生成使用。
 
@@ -24,7 +24,23 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 
 ## 2. 端点列表 / Endpoints
 
-### GET `/api/v1/health` — 健康检查
+### GET `/livez` — 进程存活探针（无需认证）
+
+由 Admin HTTP 服务直接响应，不检查 Redis、ClickHouse 或数据面 listener。成功响应仅表示服务仍能处理 HTTP 请求。
+
+**响应**：`200 OK`，JSON `{ "status": "ok", "phase": "live", "reason": "event_loop_responding" }`。
+
+### GET `/readyz` — 流量就绪探针（无需认证）
+
+返回数据面是否可接收流量。尚未通过启动配置、必需 listener 或 required dependency 条件时返回 `503 Service Unavailable`；optional dependency 不可用时返回 `200 OK`，phase 为 `degraded`。Redis 状态每 5 秒检查一次，单次 PING 最长 2 秒；该端点只读取最近状态，不在请求内发起依赖 I/O。
+
+**响应字段**：`status`（`ok`/`unready`）、`phase`、`reason`，后两者使用固定枚举字符串，不包含依赖错误文本或密钥。
+
+**当前边界**：就绪状态在本地 TCP 连接探测到主数据面 listener 接收连接后才置为 ready。可选 CONNECT listener 当前不参与主数据面 ready 判定。
+
+---
+
+### GET `/api/v1/health` — Admin API 健康检查（兼容端点）
 
 供负载均衡器或监控探活使用。
 
