@@ -79,7 +79,7 @@
 
 ### 7. 门禁定义（见 `CONTRIBUTING.md`）
 
-`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 421 单测（10 ignored）＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
+`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 432 单测（10 ignored）＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
 
 ## English
 
@@ -152,4 +152,4 @@
 
 ### 7. Gates (see `CONTRIBUTING.md`)
 
-`fmt --check` clean + `clippy -D warnings` zero + `test` 421 unit tests (10 ignored) + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.
+`fmt --check` clean + `clippy -D warnings` zero + `test` 432 unit tests (10 ignored) + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.

@@ -576,7 +576,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_reclaim_cursor_progresses_and_recovers_held_rows() {
-        use redis::{streams::StreamClaimOptions, AsyncCommands};
+        use redis::AsyncCommands;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let url =
@@ -669,15 +669,15 @@ mod tests {
                 seeded.keys.iter().map(|key| key.ids.len()).sum::<usize>(),
                 3
             );
-            let _: Vec<String> = conn
-                .xclaim_options(
-                    &stream,
-                    &group,
-                    &consumer,
-                    0,
-                    &ids,
-                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
-                )
+            let _: () = redis::cmd("XCLAIM")
+                .arg(&stream)
+                .arg(&group)
+                .arg(&consumer)
+                .arg(0)
+                .arg(&ids)
+                .arg("IDLE")
+                .arg(RECLAIM_IDLE.as_millis() as usize + 1)
+                .query_async(&mut conn)
                 .await?;
 
             let mut worker = ChSinkWorker::new(
@@ -703,15 +703,15 @@ mod tests {
 
             let pending_after_claim = pending_ids(&mut conn, &stream, &group).await?;
             let second_id = ids[1].clone();
-            let _: Vec<String> = conn
-                .xclaim_options(
-                    &stream,
-                    &group,
-                    &consumer,
-                    0,
-                    &[second_id.as_str()],
-                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
-                )
+            let _: () = redis::cmd("XCLAIM")
+                .arg(&stream)
+                .arg(&group)
+                .arg(&consumer)
+                .arg(0)
+                .arg(second_id.as_str())
+                .arg("IDLE")
+                .arg(RECLAIM_IDLE.as_millis() as usize + 1)
+                .query_async(&mut conn)
                 .await?;
             assert_ne!(pending_after_claim.len(), 0);
 
@@ -731,15 +731,15 @@ mod tests {
             assert!(pending.contains(&ids[0]) && pending.contains(&ids[2]));
 
             for id in [&ids[0], &ids[2]] {
-                let _: Vec<String> = conn
-                    .xclaim_options(
-                        &stream,
-                        &group,
-                        &consumer,
-                        0,
-                        &[id.as_str()],
-                        StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
-                    )
+                let _: () = redis::cmd("XCLAIM")
+                    .arg(&stream)
+                    .arg(&group)
+                    .arg(&consumer)
+                    .arg(0)
+                    .arg(id.as_str())
+                    .arg("IDLE")
+                    .arg(RECLAIM_IDLE.as_millis() as usize + 1)
+                    .query_async(&mut conn)
                     .await?;
             }
             assert_eq!(
@@ -752,15 +752,15 @@ mod tests {
                 vec![ids[0].clone()]
             );
 
-            let _: Vec<String> = conn
-                .xclaim_options(
-                    &stream,
-                    &group,
-                    &consumer,
-                    0,
-                    &[ids[0].as_str()],
-                    StreamClaimOptions::default().idle(RECLAIM_IDLE.as_millis() as usize + 1),
-                )
+            let _: () = redis::cmd("XCLAIM")
+                .arg(&stream)
+                .arg(&group)
+                .arg(&consumer)
+                .arg(0)
+                .arg(ids[0].as_str())
+                .arg("IDLE")
+                .arg(RECLAIM_IDLE.as_millis() as usize + 1)
+                .query_async(&mut conn)
                 .await?;
             assert_eq!(
                 worker.pump_once().await,
