@@ -1,8 +1,11 @@
 # IPProxyPool 世界级同类对比与当前能力评估
 
-**评估日期：2026-11-11**  
+**评估基准日期：2026-11-11；证据增补：2026-11-18**
+
 **评估范围：当前工作区源码、仓库内基线/执行记录，以及选定的官方产品/标准资料。**  
 **性质：工程评估，不是安全认证、生产 SLA、独立基准测试或商业尽调。**
+
+> **2026-11-18 证据增补**：Linux fmt/Clippy/workspace tests/release build 已通过；隔离 Linux 环境完成 Gateway probes、loopback 数据面、Redis memory/required-mode readiness、ClickHouse 恢复与 graceful SIGTERM。细节和证据边界见 [`EXEC_LOG.md`](../EXEC_LOG.md) 顶部收口快照。容量测试仍 `NOT RUN/BLOCKED`，不据此推断容量、SLO 或生产可用性。以下评估主体保留 11-11 基线判断；本增补仅更新相关事实，不重写其余结论。
 
 ## 1. 执行摘要
 
@@ -62,7 +65,7 @@ IPProxyPool 已形成具备差异化的智能出口网关：HTTP/SOCKS 出站、
 | 租户 Redis 写穿 | 部分 | 异步 dirty flush、版本化确认和取消安全；不是金融账本，不保证多实例原子配额。 |
 | Admin API/UI | 部分 | 节点查询、增删、调权、隔离、节点文件持久化和 UI；租户生命周期、RBAC、全量配置发布和集群协调尚缺。 |
 | Prometheus/Grafana | 已验证（仓内） | 具备 exposition、告警与仪表盘；指标语义门禁存在。尚未证明目标生产 SLO。 |
-| 自动化质量门 | 已验证（测试范围内） | 当前 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md) 记录 438 passed、10 ignored、22 Python 静态门；Windows 覆盖率见专用基线，测试数量不等于生产成熟度。 |
+| 自动化质量门 | 已验证（测试范围内） | 当前 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md) 记录 445 passed、10 ignored、22 Python 静态门；Windows 覆盖率见专用基线，测试数量不等于生产成熟度。 |
 | 真实容量 | 部分 | [`PERF_BASELINE.md`](PERF_BASELINE.md) 为单进程、loopback 上游、遥测关闭环境，持续约 10k 成功 QPS 受到租户限流器限制；裸产能、遥测开销、真实远端上游及 Linux 长稳未覆盖。 |
 
 ## 4. 外部参照与可比边界
@@ -115,8 +118,8 @@ IPProxyPool 的智能域名感知选路是差异化；Squid/HAProxy 则拥有更
 ### P0：生产可信度
 
 - 配置校验与运行状态缺少统一 typed 模型；错误模式可能降级而非 fail-fast。
-- 当前 `/api/v1/health` 不等同于 listener、依赖和业务 ready；需要明确 livez/readyz。
-- Redis/ClickHouse 故障恢复、积压、重启、pending reclaim 和长时间运行需真依赖演练。
+- 当前已补齐 `livez` / `readyz` 和若干隔离 Linux live 依赖恢复证据（2026-11-18）；这不证明 admission gate 在所有数据面路径生效，也不证明生产容量、HA 或 SLO。
+- Redis/ClickHouse 故障恢复、积压、重启、pending reclaim 和长期运行仍需按场景持续演练；当前已有的恢复证据仅覆盖 `EXEC_LOG.md` 明确记载的注入与对账路径。
 - 当前性能数据未覆盖 telemetry enabled、多实例、Linux、真实远端节点与长隧道并发。
 - 尚缺生产 SLO、告警接收方、runbook、回滚时间目标和故障演习证据。
 
@@ -150,9 +153,10 @@ CONNECT-UDP/CONNECT-IP/MASQUE、QUIC-native dataplane、eBPF/io_uring 只有在�
 可以说：
 
 - 仓库包含成熟的 HTTP/SOCKS egress、智能选路、节点治理、租户限额和遥测实现；
-- 当前质量基线记录 438 pass / 10 ignored，具体值以 `QUALITY_BASELINE.md` 为唯一真源；
-- 当前工作树存在 loopback-only HTTP/1.1 CONNECT 实现与协议测试；
-- 性能基线是在单进程、回环上游、遥测关闭条件下取得，限流器影响持续吞吐。
+- 当前质量基线记录 445 pass / 10 ignored，具体值以 `QUALITY_BASELINE.md` 为唯一真源；
+- **当前工作树中**存在 loopback-only HTTP/1.1 CONNECT 实现与协议测试；
+- 性能基线是在单进程、回环上游、遥测关闭条件下取得，限流器影响持续吞吐；
+- Linux 隔离构建与 live 依赖恢复已有按特定版本/拓扑记录的证据；仍未证明 Linux 容量、长稳、HA、目标生产 SLO 或真实远端上游表现。
 
 不能说：
 
@@ -161,7 +165,8 @@ CONNECT-UDP/CONNECT-IP/MASQUE、QUIC-native dataplane、eBPF/io_uring 只有在�
 - 已支持 TLS/H2/H3/MASQUE/PAC 的全链路浏览器代理；
 - LinUCB 合成回放数字是线上收益预测；
 - 测试数量或静态门数量代表生产 SLA、安全认证或 80% 覆盖率；
-- 未运行的 Redis/ClickHouse live 测试已经通过。
+- 未运行的 Redis/ClickHouse live 测试已经通过；
+- Linux 隔离构建与 live 依赖恢复证明了 Linux 容量、长稳、HA、目标生产 SLO 或真实远端上游表现。
 
 ## 8. 官方参考资料
 

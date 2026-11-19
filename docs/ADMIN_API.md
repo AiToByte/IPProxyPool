@@ -36,7 +36,7 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 
 **响应字段**：`status`（`ok`/`unready`）、`phase`、`reason`，后两者使用固定枚举字符串，不包含依赖错误文本或密钥。
 
-**当前边界**：就绪状态在本地 TCP 连接探测到主数据面 listener 接收连接后才置为 ready。可选 CONNECT listener 当前不参与主数据面 ready 判定。
+**当前边界**：就绪状态在本地 TCP 连接探测到主数据面 listener 接收连接后才置为 ready。可选 CONNECT listener 当前不参与主数据面 ready 判定。进入 `draining` 后，`/readyz` 返回 `503`，`/livez` 在 Admin 仍可响应时返回 `200`。HTTP 与 CONNECT 的入口在观察到 draining 时返回 `503`。监听器关闭后，客户端也可能直接收到连接失败。启动中或必需依赖不可用触发的 `/readyz=503` 目前只用于流量调度。
 
 ---
 

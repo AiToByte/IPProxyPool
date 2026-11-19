@@ -26,6 +26,7 @@ fn test_node(ip: &str, port: u16) -> ProxyNode {
 
 fn test_gateway(nodes: Vec<ProxyNode>) -> SmartProxyGateway {
     SmartProxyGateway {
+        health: crate::health::RuntimeHealthState::new(),
         router: Arc::new(RouterEngine::new(nodes)),
         telemetry: None,
         bandit_engine: Arc::new(LinUCBEngine::new(0.4)),
@@ -38,6 +39,45 @@ fn test_gateway(nodes: Vec<ProxyNode>) -> SmartProxyGateway {
         bridge: None,
         tier_quota_window: Mutex::new(VecDeque::new()),
     }
+}
+
+#[tokio::test]
+async fn draining_http_request_is_rejected_before_tenant_authentication() {
+    use pingora_core::protocols::l4::stream::Stream;
+    use pingora_proxy::Session;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let gateway = test_gateway(vec![]);
+    gateway.health.request_drain();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let addr = listener.local_addr().expect("listener address");
+    let client = tokio::net::TcpStream::connect(addr);
+    let (server, client) = tokio::join!(listener.accept(), client);
+    let (server, _) = server.expect("accept client");
+    let mut client = client.expect("connect client");
+    let task = tokio::spawn(async move {
+        let mut session = Session::new_h1(Box::new(Stream::from(server)));
+        session.read_request().await.expect("parse request");
+        let mut ctx = gateway.new_ctx();
+        let response_sent = gateway
+            .request_filter(&mut session, &mut ctx)
+            .await
+            .expect("request filter");
+        assert!(response_sent);
+    });
+    client
+        .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .expect("send request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+        .await
+        .expect("response timeout")
+        .expect("read response");
+    assert!(response.starts_with(b"HTTP/1.1 503"));
+    task.await.expect("request task");
 }
 
 #[test]

@@ -8,6 +8,7 @@
 use crate::bandit::{compute_reward, BanditArm, LinUCBEngine, VectorD};
 use crate::connect::parse_connect_authority;
 use crate::fingerprint::FingerprintHardener;
+use crate::health::RuntimeHealthState;
 use crate::metrics::MetricsRegistry;
 use crate::model::{EgressProto, ProxyContext, ProxyNode, RoutingSpec};
 use crate::router::{normalize_domain, RouterEngine};
@@ -35,6 +36,7 @@ use std::time::{Duration, Instant};
 /// 1% 的探测流量是可接受的代价，换来的是"free 供给从第 1 个请求起就可被评估"。
 const TIER_QUOTA_WINDOW: usize = 100;
 pub struct SmartProxyGateway {
+    pub(crate) health: Arc<RuntimeHealthState>,
     pub router: Arc<RouterEngine>,
     /// GW-2 telemetry publisher; `None` = degraded mode (log only, no Redis).
     pub telemetry: Option<Arc<TelemetryPublisher>>,

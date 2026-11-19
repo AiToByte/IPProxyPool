@@ -121,6 +121,8 @@ curl.exe -s -X DELETE http://127.0.0.1:9092/api/v1/nodes/203.0.113.10:8080 `
 
 ### 2.2 租户状态持久化：余额会不会跨重启（OPT-R18 P2-2）
 
+> `TENANT_STORE=redis` 是 fail-closed 启动模式：Redis 连接或初次状态加载失败会让进程以非零状态退出；它不会静默回退到内存。
+
 **先说结论：缺省不保。** 不设 `TENANT_STORE` 时租户表在进程内存里，重启后
 余额、启停状态、累计流量全部回到初始值（余额回到 `100.0`）。
 
@@ -150,23 +152,19 @@ $env:REDIS_URL = "redis://127.0.0.1:6379/"
   记录**不会**复活一个已从配置里删掉的租户。反过来 `is_active` /
   `balance_usd` / `total_bytes` 会从 Redis 恢复。因此"删租户"仍然是改配置，
   不是删 Redis 键（删了也只会让它回到初始余额）。
-- **最大丢失窗口 = `TENANT_FLUSH_SECS`**（缺省 5s）。进程被强杀（含 Windows
-  上 Pingora 不等待信号的场景）时，最多丢这么多秒的计量。优雅停机
-  （Unix SIGTERM / Ctrl-C）会额外补一次 flush，把窗口压到 0——但**别依赖它**，
-  周期 flush 才是兜底。
-- **`TENANT_STORE=redis` 但 Redis 不可达** ⇒ 启动日志里一条显式 `warn`，然后
-  **降级为 memory 继续跑**。看到这条告警就别以为余额被保住了。
+- **周期写回不是数据丢失上限**：`TENANT_FLUSH_SECS`（默认 5 秒）是健康状态下的写回周期；Redis 故障或写回积压可能扩大未持久化窗口。收到关停信号后，应用标记 `draining` 并通知后台任务停止，再尝试一次最多等待 5 秒的租户写回。该尝试不与 Pingora 退出同步，不保证成功，也不保证覆盖仍在处理的请求产生的更新。
+- **关停探针与入口**：进入 `draining` 后，编排器应依据 `/readyz=503` 停止调度新流量；`/livez` 在 Admin 可响应时仍返回 200。HTTP/CONNECT 入口检测到 draining 后会拒绝新请求；监听器关闭后可能直接连接失败。CONNECT 的生命周期边界是：握手/建链和 `200 Connection Established` 刷新前仍可被 Pingora 的 shutdown watch 取消；`200` 已刷出后，初始 shutdown 广播不会直接取消已建立的 relay，relay 继续受现有 idle/max-lifetime 约束。该本地回归不等于最终 runtime shutdown、完整 grace 或 bounded in-flight drain 已被证明。
+- **`TENANT_STORE=redis` 要求持久化后端可用**：Redis 连接失败/超时，或租户状态读取失败/超时，启动以非零状态退出；不会启动为 memory、不会启动写回循环、也不会开启数据面 listener。修复 Redis/索引/记录读取问题后再重启。`TENANT_STORE=memory` 仍可在 Redis 不可用时启动，遥测与熔断工作者按原有 degraded 语义运行。
+- Redis PING 恢复只会反映可选 Redis 依赖状态；它不重新配置 tenant store。required Redis 模式在连接及初次租户状态加载成功后才继续启动，并开始运行期健康探测。
 - **启动顺序**：先加载 Redis，再起 flush 循环。反过来会让首轮 flush 把刚注册
   的初始余额（100）写回 Redis，把上次的余额覆盖掉——一个只在重启后才暴露的
   静默清零。`p2_2_load_must_precede_flush` 这条测试就是为了钉住它。
 - **凭据**：Redis 的键名是 `{prefix}:{api_key}`，**明文含 API Key**。Redis
   实例要按凭据对待（ACL/密码/网络隔离），别用共享实例。
 - **验证**（两条命令就够）：`PATCH /api/v1/tenants/{key}/balance` 改一个值 →
-  重启 → `GET /api/v1/tenants` 看是否还是那个值。若不是，先看启动日志里有没有
-  那条降级 `warn`。
-- **回滚**：把 `TENANT_STORE` 去掉即可回到内存模式；Redis 里的残留记录不会被
-  读取，也不影响启动（下次打开时会以 Redis 里的旧值为准，如需干净起步先删
-  `{prefix}:*` 与 `{prefix}:index`）。
+  重启 → `GET /api/v1/tenants` 看是否还是那个值。required Redis 启动失败时先确认
+  进程以非零状态退出；若状态索引/记录读取失败，不会启动 flusher 或 listener。
+5. **回滚**：把 `TENANT_STORE` 设为 `memory`，即可显式切回内存模式；这会跳过 Redis 租户状态加载，Redis 旧记录会保留供后续重新启用时使用。
 
 ---
 

@@ -395,6 +395,22 @@ fn main() {
     server.run_forever();
 }
 
+enum BoundedFlushError<E> {
+    Failed(E),
+    TimedOut,
+}
+
+async fn bounded_flush<F, T, E>(flush: F, timeout: Duration) -> Result<T, BoundedFlushError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, flush).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(BoundedFlushError::Failed(error)),
+        Err(_) => Err(BoundedFlushError::TimedOut),
+    }
+}
+
 /// Poll the configured data-plane socket until Pingora has successfully bound it.
 ///
 /// This is a bounded, local TCP connect probe rather than a request-path dependency
@@ -472,8 +488,8 @@ async fn setup_gateway() -> Server {
 
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
-    // 1. Redis connection (degraded mode when unavailable, e.g. no Docker).
-    // R2-8：`REDIS_URL` env 化（缺省沿用 code 常量）。
+    use startup_config::TenantStoreMode;
+    let tenant_store_requires_redis = startup.tenant_store == TenantStoreMode::Redis;
     let redis_client = redis::Client::open(startup.redis_url).expect("validated Redis URL");
     let redis_conn: Option<ConnectionManager> = match tokio::time::timeout(
         Duration::from_secs(3),
@@ -482,39 +498,35 @@ async fn setup_gateway() -> Server {
     .await
     {
         Ok(Ok(manager)) => {
-            log::info!("[GW-2] Redis connected, self-healing workers online");
+            log::info!("[GW-2] Redis connected");
             Some(manager)
         }
-        Ok(Err(e)) => {
-            log::warn!(
-                "[GW-2] Redis unreachable ({e:?}), running degraded without telemetry/CB workers"
-            );
-            None
-        }
-        Err(_) => {
-            log::warn!(
-                "[GW-2] Redis connect timed out, running degraded without telemetry/CB workers"
-            );
+        failure => {
+            let reason = if failure.is_err() {
+                "connection timed out"
+            } else {
+                "connection failed"
+            };
+            if tenant_store_requires_redis {
+                eprintln!("[Tenant] startup aborted: TENANT_STORE=redis requires a Redis connection ({reason})");
+                std::process::exit(1);
+            }
+            log::warn!("[GW-2] Redis {reason}, running degraded without telemetry/CB workers");
             None
         }
     };
 
-    let tenant_store_requires_redis =
-        startup.tenant_store == startup_config::TenantStoreMode::Redis;
-    let (required_dependency_ready, optional_dependencies_ready) =
-        health::redis_dependency_facts(tenant_store_requires_redis, redis_conn.is_some());
-    runtime_health.set_required_dependency_ready(required_dependency_ready);
-    runtime_health.set_optional_dependencies_ready(optional_dependencies_ready);
-    let redis_health_client = redis_client.clone();
-    let redis_health_state = runtime_health.clone();
-    tokio::spawn(async move {
-        monitor_redis_health(
-            redis_health_client,
-            tenant_store_requires_redis,
-            redis_health_state,
-        )
-        .await;
-    });
+    if !tenant_store_requires_redis {
+        let (required_dependency_ready, optional_dependencies_ready) =
+            health::redis_dependency_facts(false, redis_conn.is_some());
+        runtime_health.set_required_dependency_ready(required_dependency_ready);
+        runtime_health.set_optional_dependencies_ready(optional_dependencies_ready);
+        let redis_health_client = redis_client.clone();
+        let redis_health_state = runtime_health.clone();
+        tokio::spawn(async move {
+            monitor_redis_health(redis_health_client, false, redis_health_state).await;
+        });
+    }
 
     // 2a. OPT-2 API Key 环境门：D3 起默认开启（`REQUIRE_API_KEY=0` 显式关闭）。
     // 开启后，未带 `X-API-Key` 头的请求在网关入口直接 403（见 gateway.rs）；
@@ -680,12 +692,11 @@ async fn setup_gateway() -> Server {
     // 缺省保持 memory 的理由：写穿会在计量热路径上多一次 `String` 克隆，且依赖
     // Redis 可用。做成**显式开关**，避免升级后行为悄悄变化——但也正因如此，
     // 缺省值必须被文档写清楚（OPERATION §2.2），否则"以为余额会保住"。
-    let tenant_store_mode = match startup.tenant_store {
-        startup_config::TenantStoreMode::Memory => "memory",
-        startup_config::TenantStoreMode::Redis => "redis",
-    };
-    let tenant_store = match (tenant_store_mode, redis_conn.as_ref()) {
-        ("redis", Some(conn)) => {
+    let tenant_store = match startup.tenant_store {
+        TenantStoreMode::Redis => {
+            let conn = redis_conn
+                .as_ref()
+                .expect("required Redis is checked before tenant setup");
             let prefix = env_str("TENANT_REDIS_PREFIX", "ipp:tenant");
             log::info!("[Tenant] persistence=redis prefix={prefix}");
             tenant::Store::Redis {
@@ -693,17 +704,7 @@ async fn setup_gateway() -> Server {
                 prefix,
             }
         }
-        ("redis", None) => {
-            // 明确要求持久化但没有 Redis ⇒ **响亮降级**，不静默。
-            // 静默降级的后果是运维以为余额被保住了，重启后才发现没有。
-            log::warn!(
-                "[Tenant] TENANT_STORE=redis 但 Redis 不可达，降级为 MEMORY —— \
-                 余额/启停状态不会跨重启保留"
-            );
-            tenant::Store::Memory
-        }
-        ("memory", _) => tenant::Store::Memory,
-        _ => unreachable!("TenantStoreMode is exhaustively mapped above"),
+        TenantStoreMode::Memory => tenant::Store::Memory,
     };
     let tenant_mgr = Arc::new(TenantManager::with_store(tenant_store));
 
@@ -763,10 +764,36 @@ async fn setup_gateway() -> Server {
     // 反过来的话，`register_tenant` 刚标脏的初始状态（余额 100）会被首轮 flush
     // 立刻写回 Redis，把上次运行时的真实余额覆盖掉——一个只在"重启后"才暴露的
     // 静默清零。实测证据见 TASK_PLAN 步骤 60。
-    match tenant_mgr.load_persisted().await {
-        Ok(0) => {}
-        Ok(n) => log::info!("[Tenant] restored {n} tenant record(s) from Redis"),
-        Err(e) => log::warn!("[Tenant] load failed, starting from config defaults: {e}"),
+    let persisted_load = if tenant_store_requires_redis {
+        tokio::time::timeout(Duration::from_secs(3), tenant_mgr.load_persisted())
+            .await
+            .map(|result| result.map(|_| ()))
+            .map_err(|_| "timeout")
+            .and_then(|result| result.map_err(|_| "unavailable"))
+    } else {
+        tenant_mgr
+            .load_persisted()
+            .await
+            .map(|_| ())
+            .map_err(|_| "unavailable")
+    };
+    match persisted_load {
+        Ok(()) => {
+            if tenant_store_requires_redis {
+                runtime_health.set_required_dependency_ready(true);
+                let redis_health_client = redis_client.clone();
+                let redis_health_state = runtime_health.clone();
+                tokio::spawn(async move {
+                    monitor_redis_health(redis_health_client, true, redis_health_state).await;
+                });
+            }
+            log::info!("[Tenant] persisted tenant state loaded");
+        }
+        Err(_) if tenant_store_requires_redis => {
+            eprintln!("[Tenant] startup aborted: failed to load Redis tenant state");
+            std::process::exit(1);
+        }
+        Err(_) => log::warn!("[Tenant] optional state load failed; starting from config defaults"),
     }
     let tenant_flush_secs = env_secs("TENANT_FLUSH_SECS", 5);
     if tenant_mgr.spawn_flusher(tenant_flush_secs).is_some() {
@@ -1469,14 +1496,19 @@ async fn setup_gateway() -> Server {
         }
         runtime_health_for_signal.request_drain();
         log::warn!("[Shutdown] signal received, stopping background respawns");
-        // OPT-R18 P2-2：停机前补一次 flush（best-effort）。
-        //
-        // 为什么不是"保证"：Windows 上 Pingora 不等待信号（OPT-R14），进程可能
-        // 直接消失，这条路径根本跑不到。真正的兜底是 5s 的周期 flush，把可能
-        // 丢失的窗口压到 ≤`TENANT_FLUSH_SECS` 秒。这里只是把优雅停机（Unix
-        // SIGTERM / Ctrl-C）的那部分窗口也消掉。
-        let _ = flush_on_shutdown.flush_dirty().await;
         let _ = signal_tx.send(true);
+        // Keep the tenant flush best-effort but strictly bounded; Pingora owns the
+        // listener grace period while this watcher continues independently.
+        const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+        match bounded_flush(flush_on_shutdown.flush_dirty(), SHUTDOWN_FLUSH_TIMEOUT).await {
+            Ok(flushed) => log::info!("[Shutdown] tenant flush completed: {flushed} updates"),
+            Err(BoundedFlushError::Failed(_)) => {
+                log::warn!("[Shutdown] tenant flush failed; some updates may not be persisted")
+            }
+            Err(BoundedFlushError::TimedOut) => {
+                log::warn!("[Shutdown] tenant flush timed out after {SHUTDOWN_FLUSH_TIMEOUT:?}")
+            }
+        }
     });
     // 5. Pingora data plane.
     let opt = Opt::parse_args();
@@ -1508,6 +1540,7 @@ async fn setup_gateway() -> Server {
     let mut proxy_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         SmartProxyGateway {
+            health: runtime_health.clone(),
             router: router.clone(),
             telemetry,
             bandit_engine: bandit_engine.clone(),
@@ -1538,11 +1571,12 @@ async fn setup_gateway() -> Server {
     if let Some(connect_addr) = connect_addr {
         let mut connect_service = pingora_core::services::listening::Service::new(
             "HTTP/1.1 CONNECT Tunnel".to_string(),
-            connect::ConnectServerApp::with_max_concurrent_and_metrics(
+            connect::ConnectServerApp::with_max_concurrent_and_metrics_and_health(
                 router.clone(),
                 tenant_mgr.clone(),
                 connect_max_concurrent,
                 metrics.clone(),
+                runtime_health.clone(),
             ),
         );
         connect_service.add_tcp(&connect_addr.to_string());
@@ -1592,6 +1626,18 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     /// CONNECT 配置缺省关闭，显式地址必须合法，误配不静默打开其他端口。
+    #[tokio::test]
+    async fn shutdown_flush_is_bounded_when_storage_hangs() {
+        use std::future::pending;
+
+        let result = bounded_flush(
+            pending::<Result<(), &'static str>>(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(result, Err(BoundedFlushError::TimedOut)));
+    }
+
     #[test]
     fn connect_listener_config_is_explicit() {
         assert_eq!(startup_config::parse_connect_addr(None).unwrap(), None);

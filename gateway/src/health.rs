@@ -64,6 +64,10 @@ impl RuntimeHealthState {
         self.stopped.store(true, Ordering::Release);
     }
 
+    pub(crate) fn accepts_new_requests(&self) -> bool {
+        !self.drain_requested.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire)
+    }
+
     pub(crate) fn evaluate(&self) -> ReadinessDecision {
         evaluate_readiness(RuntimeFacts {
             config_valid: self.config_valid.load(Ordering::Acquire),
@@ -332,6 +336,23 @@ mod tests {
         let draining = state.evaluate();
         assert_eq!(draining.phase, RuntimePhase::Draining);
         assert!(!draining.ready);
+    }
+
+    #[test]
+    fn draining_state_closes_new_admission_without_affecting_readiness_facts() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+
+        assert!(state.accepts_new_requests());
+        assert!(state.evaluate().ready);
+
+        state.request_drain();
+
+        assert!(!state.accepts_new_requests());
+        assert_eq!(state.evaluate().phase, RuntimePhase::Draining);
+        assert!(!state.evaluate().ready);
     }
 
     #[test]

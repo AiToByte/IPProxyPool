@@ -21,9 +21,9 @@
 
 | 模块 | 单测 | 职责 | 关键 API |
 |------|------|------|----------|
-| `main.rs` | 24 | 装配：typed startup preflight、启动环境采集、supervisor/后台 ticker/Pingora 启动/平台感知优雅期 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 43 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
-| `connect.rs` | 23 | 可选标准 HTTP/1.1 CONNECT：authority 解析、鉴权、独立 listener、双向隧道 | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
+| `main.rs` | 25 | 装配：typed startup preflight、启动环境采集、supervisor/后台 ticker/Pingora 启动/平台感知优雅期 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 44 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `connect.rs` | 27 | 可选标准 HTTP/1.1 CONNECT：authority 解析、鉴权、独立 listener、双向隧道 | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
 | `router.rs` | 73 | 选路：加权/粘滞/隔离/原子替换/套利缩放/主动健康探测闸门 | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | 模型：节点/规格/上下文＋tier 归一 | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
 | `free_pool/mod.rs` | 59 | 免费第二线：抓取/两级质检/注册/熔断/合并 | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
@@ -47,9 +47,9 @@
 | `janitor.rs` | 3 | 淘汰计数助手：四处 sweep 共用一份「淘汰并报数」逻辑 | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 8 | 纯 liveness/readiness 状态决策模型与共享运行时快照、Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
+| `health.rs` | 9 | 纯 liveness/readiness 状态决策模型与共享运行时快照、Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
-**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 448（其中 438 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
+**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 455（其中 445 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
@@ -220,9 +220,9 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 
 | Module | Tests | Responsibility | Key APIs |
 |--------|-------|----------------|----------|
-| `main.rs` | 24 | Wiring: typed startup preflight/env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 43 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge short-circuit | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
-| `connect.rs` | 23 | Optional standard HTTP/1.1 CONNECT: authority parsing, auth, standalone listener, bidirectional tunnel | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
+| `main.rs` | 25 | Wiring: typed startup preflight/env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 44 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge short-circuit | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `connect.rs` | 27 | Optional standard HTTP/1.1 CONNECT: authority parsing, auth, standalone listener, bidirectional tunnel | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
 | `router.rs` | 73 | Routing: weighted/sticky/quarantine/atomic swap/arbitrage scaling/active-health gate | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | Models: node/spec/context + tier canonicalization | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
 | `startup_config.rs` | 6 | Startup configuration: typed preflight, Admin/Gateway/Metrics/CONNECT/Redis/TenantStore/API key parsing, non-Unicode rejection, and sanitized diagnostics | `StartupConfigInput/StartupConfig/parse_startup_config` |
@@ -246,7 +246,7 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `janitor.rs` | 3 | Eviction-count helper: one shared "evict and report" path for four sweeps | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | Transport connector abstraction: tokio today, io_uring hook on Linux | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 8 | Pure liveness/readiness decision model, shared runtime snapshot and Redis required/optional policy: starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
+| `health.rs` | 9 | Pure liveness/readiness decision model, shared runtime snapshot and Redis required/optional policy: starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
 
 `startup_config.rs` is a pure startup parser helper, including environment collection and invalid-Unicode rejection. The responsibility table also includes `health.rs`, which owns only pure readiness decisions; HTTP wiring remains a separate approved slice.

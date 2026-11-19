@@ -48,6 +48,8 @@ T4 智能路由 2.0
 - 未提交对象均已盘点；未验证能力没有写成正式已交付能力。
 - 关键行为测试可复现；Rust workspace、Python 和相关文档门结果留档。
 - P0 与 CONNECT 各自的剩余项、回滚开关和依赖明确。
+- Linux 隔离构建与 live 故障恢复已有特定 revision/topology 证据；容量测试仍 `NOT RUN/BLOCKED`，Linux 长稳、生产 SLO、HA 仍未验证。2026-11-18 有本地 HTTP/CONNECT drain admission 与有界 flush 单测，非 Linux SIGTERM lifecycle 验证。
+- 当前工作树和能力声明冻结仍需在每个新实现切片前重新执行；路线阶段状态以最新执行记录为准，不因本次 live 验证自动授权下一轨实现。
 
 ## 3. T1：生产可信化（第一优先级）
 
@@ -58,7 +60,7 @@ T4 智能路由 2.0
 ### 工作流
 
 1. **配置与启动**：typed 配置解析；非法监听、密钥、Redis/ClickHouse、shard 和连接组合 fail-fast；敏感错误不回显凭据。
-2. **健康语义**：区分进程存活、配置有效、listener 已就绪、外部依赖降级和数据面可接流量；明确 `livez` / `readyz`，不把现有无条件 health 当 readiness。
+2. **健康语义**：区分进程存活、配置有效、listener 已就绪、外部依赖降级和数据面可接流量；`livez` / `readyz` 已存在并经隔离 Linux 验证。2026-11-18 本地实现增加 drain/stopped 时 HTTP 与 CONNECT admission gate，但尚未对齐“其他 unready 状态是否拒绝流量”的决策，也未闭合 drain 标志与 Pingora shutdown watch 的 race 或证明有界 in-flight completion；不能把 probe 状态当 drain 完成证明。
 3. **恢复与停止**：真实 Redis/ClickHouse 中断、恢复、积压、pending reclaim、worker 退出、强杀重启、优雅 drain、遥测 flush。
 4. **容量基线**：Linux release、真实上游、telemetry on/off、连接池复用、长 CONNECT 隧道、p50/p95/p99/p999 和资源水位。
 5. **发布准入**：SLO/告警接收方、runbook、错误预算、停止条件、二进制/配置回滚和演练证据。

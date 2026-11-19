@@ -20,6 +20,11 @@ impl ProxyHttp for SmartProxyGateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        if !self.health.accepts_new_requests() {
+            session.respond_error(503).await?;
+            return Ok(true);
+        }
+
         if let Some(addr) = session.client_addr() {
             ctx.client_ip = addr.to_string();
         }

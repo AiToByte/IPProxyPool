@@ -1,7 +1,53 @@
 # 任务执行流水日志（IPProxyPool GW-R1）
 
-> 本文件只留活跃轮条目。历史归档方法见 banyan-skills 仓（独立仓库，不随本仓分发）；本仓暂未归档。
-> 跟踪表：`plan/2026年9月19日-GW-R1实施计划.md`。
+- **E1 Redis required-mode**：新增本地 loopback Redis RESP fixture 的 4 个启动集成测试，覆盖不可达、状态加载失败、成功加载、memory 可选模式。required 连接/加载失败均 exit `1`，不启动 flusher；原始 Redis sentinel 不进入错误输出。当前 workspace **445 passed / 0 failed / 10 ignored**，startup integration **4 passed**；未运行远端 Linux/live Redis。
+ `5ba7ae3bce162679ddebf726712b7876f84e2281` 基础上，仅修改 `gateway/src/health.rs`、`gateway/src/gateway/{mod.rs,hooks.rs,tests.rs}`、`gateway/src/connect.rs`、`gateway/src/main.rs` 和相应计划/基线文档。新增 HTTP draining→503（gate 在 tenant auth 前）、CONNECT draining→503 且无上游 accept、已建立 CONNECT tunnel 在 runtime drain 后仍可双向传输、bounded tenant flush timeout tests。RED 已确认：移除 HTTP gate 后返回非 503；移除 CONNECT gate 后等待拒绝响应超时。GREEN 后 `cargo clippy --locked --workspace --all-targets -- -D warnings` 通过，workspace tests **443 passed / 0 failed / 10 ignored**。三个 Python 文档/路由/可观测性门通过。
+- **本轮 E1 关停边界复核**：按 `200 Connection Established` 刷新点拆分 CONNECT 生命周期：握手/建链前的 `ShutdownWatch` 取消仍由 `shutdown_cancels_pending_request` 覆盖；`200` 已刷出后，`process_new_keeps_established_tunnel_alive_after_shutdown_watch` 证明初始 shutdown watch 不直接取消 relay，`EstablishedTunnel` 持有 admission、租户结算和 tunnel metrics 守卫到 relay 结束。该回归不证明最终 runtime shutdown、完整 grace 或 bounded in-flight drain。
+- **补充回归**：在 CONNECT 请求头读取期间切换到 `draining`，旧路径返回 `403`（进入鉴权），修复后返回 `503`；已建立 CONNECT 在应用层 drain 后继续双向 relay；框架 shutdown watch 在 `200` 建立后不直接取消 relay。Windows 最终结果为 **445 passed / 0 failed / 10 ignored**；历史 Linux 438 测试结果不变。覆盖率未复测：本机缺少 `llvm-tools-preview`，组件下载未完成。
+
+### [2026-11-18] Linux 验证收口快照（E1 改动前）
+
+- **已完成**：Linux fmt、Clippy、workspace tests（`438 passed / 0 failed / 10 ignored`）、release build；Gateway probes 和 loopback 数据面；Redis memory/required-mode readiness、ClickHouse sink 恢复；SIGTERM graceful shutdown 的 readiness withdrawal（`/readyz=503`、`/livez=200`）、listener shutdown、300 秒 grace 到期及进程 exit `0`。已批准的独立精确 SIGKILL 演练此前 exit `137`，且测试依赖数据核对未见受影响。
+- **本次关停观察证据**：测试 Gateway 容器 `7af00347680710cf0453c78f6534fbfb7494a9475d2a75daf47d74da34927999` 在 SIGTERM 后约 105 秒由容器状态观察为 exited/exit `0`；探针期间保持 `live=200`、`ready=503`。容器日志记录 grace period 在 `2026-11-18T05:11:39Z` 开始、`05:16:39Z` 结束并报告 `All runtimes exited`。该轮实际经过约 5 分钟 grace，观察脚本的 105 秒时间标记与服务日志时钟不一致，因此以服务日志证明 grace 到期，不把 105 秒当作 grace 时长。
+- **清理核验**：2026-11-18 只读检查未发现 `ipproxy-verify-20261115` Compose project、匹配测试容器、网络、卷或测试监听端口 `48163-48171`；专属 workspace `/tmp/ipproxypool-verify-5ba7ae3-20261115` 不存在。Compose project 清单仅显示原有业务项目，未执行清理/删除命令。
+- **未执行/未证明**：容量测试 `NOT RUN/BLOCKED`（此前共享主机可用内存低于 6 GiB 硬停止线，且用户选择只做最终清理）；Ctrl-C 路径、完整状态转换矩阵、生产容量/SLO 仍未验证。不得将其表述为通过。
+- **结论**：Linux 功能与故障恢复验证按已执行范围完成，测试资源清理状态经只读核验确认；后续不再有待执行的远程清理动作。本节是当前执行状态，下面的旧阶段状态与“下一步”条目属于历史快照，勿作为当前状态。
+
+- **尝试**：在服务器现有 Buildx `default` builder 上，以固定源码工作区 `gateway/Dockerfile` 构建 `builder` target，设置 `--memory 4g` 和唯一标签 `ipproxy-linux-builder-5ba7ae3:latest`；不映射端口、不运行服务。
+- **结果**：BuildKit 在解析 `FROM rust:1.93-bookworm` 时无法访问 Docker Hub，错误为 `proxyconnect tcp: dial tcp 192.168.31.131:10808: connect: no route to host`，退出码 `1`。构建未进入 Dockerfile 步骤，未创建目标镜像或运行容器。
+- **最新代理重试边界**：本次重试未修改代理/daemon/网络配置或现有容器/project。仍需等待 Docker Hub token 路径恢复，或提供可用的本地/内部镜像缓存；在此之前不改用宿主机安装 CMake，也不启动测试依赖。
+
+
+
+
+### [2026-11-15] Linux 构建门：工具链可用但缺少 CMake
+- **结果**：显式 `/root/.cargo/bin` PATH 后，Rust 依赖下载和编译已开始；构建在 `libz-ng-sys v1.1.29` 的 CMake build script 失败，退出码 `101`。错误为 `failed to execute command: No such file or directory`，并明确提示 `is cmake not installed?`；不是 Rust 源码诊断或测试失败。
+- **环境事实**：服务器已有 `rustc/cargo 1.98.1`、`cc`、`c++`、`make`；当前 shell 找不到 `cmake`。构建工作区和 Cargo 缓存均在隔离/既有缓存位置；未安装宿主机软件，未修改全局 Cargo 配置，未启动 Redis、ClickHouse、Gateway 或其他运行服务。
+- **处理边界**：不直接在宿主机安装 CMake。下一步只读确认是否已有可用 CMake 或已缓存的构建镜像；若无，则使用仅用于编译的隔离 Docker build 环境需单独记录其镜像、临时对象和资源边界，不能触碰现有 Compose project/卷。
+
+### [2026-11-15] Linux 构建门诊断：缺少 Cargo 工具链
+- **任务**：在独立工作区 `/tmp/ipproxypool-verify-5ba7ae3-20261115` 运行 `cargo fmt --check`、locked Clippy、locked workspace tests 和 locked release build。
+- **结果**：静态/测试/release 命令未能执行；远程 shell 返回 `bash: line 1: cargo: command not found`，退出码 `127`。这不是代码编译错误，也不构成 Linux 测试通过证据。未启动依赖容器或 Gateway。
+### [2026-11-15] Linux 构建门：工具链可用但缺少 CMake
+- **结果**：显式 `/root/.cargo/bin` PATH 后，Rust 依赖下载和编译已开始；构建在 `libz-ng-sys v1.1.29` 的 CMake build script 失败，退出码 `101`。错误为 `failed to execute command: No such file or directory`，并明确提示 `is cmake not installed?`；不是 Rust 源码诊断或测试失败。
+- **环境事实**：服务器已有 `rustc/cargo 1.98.1`、`cc`、`c++`、`make`；当前 shell 找不到 `cmake`。构建工作区和 Cargo 缓存均在隔离/既有缓存位置；未安装宿主机软件，未修改全局 Cargo 配置，未启动 Redis、ClickHouse、Gateway 或其他运行服务。
+- **处理边界**：不直接在宿主机安装 CMake。下一步只读确认是否已有可用 CMake 或已缓存的构建镜像；若无，则使用仅用于编译的隔离 Docker build 环境需单独记录其镜像、临时对象和资源边界，不能触碰现有 Compose project/卷。
+
+- **执行记录**：新增 `plan/2026年11月15日-Linux物理服务器安全验证执行记录与任务清单.md`，将当前已达成任务 A0-A6、进行中的 A7、待 A7 结果后的 B1、后续 B2-B9 行动、阶段门、端口隔离方案、禁止操作、硬停止条件和当前停止点落盘。
+- **当前状态**：阶段 0 只读主机盘点已完成；随后在独立目录 `/tmp/ipproxypool-verify-5ba7ae3-20261115` 创建了验证工作区并传输了固定 commit 的干净源码归档；Linux 构建门已执行但因远程 shell 找不到 `cargo` 返回 `127`，未启动任何新容器或服务。
+- **执行边界**：只读盘点与后续工作区创建/源码传输是两个不同步骤；后续依赖使用唯一 Compose project、无固定容器名、独立网络/卷、loopback 高端口和显式资源限制，再次核验端口后才启动。现有 Compose project、容器、卷、服务和进程不可触碰；故障注入、精确强杀和容量压测分别保留独立审批门。
+
+- **计划**：`plan/2026年11月15日-Linux物理服务器安全验证计划.md`。本条记录本地门禁与远程阶段 0 证据；不代表后续 Linux/live 阶段完成。
+- **范围/安全**：目标为用户明确授权的 WireGuard 地址 `11.8.0.5:22`，仅限当前 IPProxyPool 测试。本次阶段 0 仅执行只读 SSH 盘点；随后单独创建验证工作区并传输固定 commit 的源码归档。未创建账号，未安装软件，未启动/停止/重启容器或服务，未修改服务器上的网络、WireGuard、防火墙、路由、sysctl、密码或现有仓库文件；凭据未写入日志、命令参数或持久化配置。
+- **源码基线**：HEAD `5ba7ae3bce162679ddebf726712b7876f84e2281`；当前工作区已有其他本地改动保持原样。
+- **本地 Windows 验证**：`cargo fmt --manifest-path gateway/Cargo.toml --check`、`cargo clippy --manifest-path gateway/Cargo.toml --locked --workspace --all-targets -- -D warnings`、`cargo test --manifest-path gateway/Cargo.toml --locked --workspace` 与 `cargo build --manifest-path gateway/Cargo.toml --locked --release` 均退出 0；测试 `438 passed / 0 failed / 10 ignored`。`tools/check_doc_consistency.py`、`tools/check_admin_routes_documented.py`、`tools/check_observability_truth.py` 均退出 0。上述为本机 Windows/MSVC 证据，不代替 Linux 构建或 live 依赖。
+- **SSH 身份与认证**：严格 `StrictHostKeyChecking=yes` 校验通过；服务端 ED25519 指纹为 `SHA256:eHm+wf5r819l18/FWTUwITU6nX37Pt1trspb175GkGA`，与本机已固定记录匹配。用户提供的服务器日志另证实同一 WireGuard 来源 `11.8.0.4` 曾成功完成 root 密码登录；本次运行器随后通过一次性 askpass 子进程成功认证并执行盘点。临时密码环境变量、askpass 源码和二进制均已清理，不保留凭据。
+- **主机基线（远程只读，约 `2026-11-15 20:32:05 +08:00`）**：Ubuntu Server `24.04.3 LTS`；kernel `6.8.0-149-generic`；`x86-64`；Dell PowerEdge R730；72 个逻辑 CPU；内存 125 GiB，available 约 99 GiB；swap 8 GiB、当前未使用；load average `4.50 / 2.77 / 2.48`；根 ext4 约 15 TiB、可用约 13 TiB；另有约 978 GiB 的 ZFS `tank` 及 MySQL 数据集。主机资源满足推荐 8 vCPU/16 GiB/100 GB 的最低规格，但因现有业务密度仍不能直接推导可压测余量。
+- **现有服务与隔离事实**：Docker Engine `29.0.1`、Compose `v2.40.3`；发现 12 个运行中的 Compose project（`cnn`、`datasync`、`emqx`、`kafka`、`minio`、`nacos`、`nginx`、`portaineragent`、`redis`、`server`、`srs`、`tomcat`），共存大量业务容器；发现 MySQL、OpenVPN、WireGuard、FRP、iperf3、Fail2ban 等运行服务。没有发现名称/进程匹配 `ipproxy`、`pingora` 或 `proxy.pool` 的现有 IPProxyPool 实例；该结果不等同于对所有目录内容的穷举确认。
+- **端口冲突**：计划默认端口中至少 `6379`、`9092`、`9093` 已由现有 Docker proxy 占用；`8123`、`9010`、`9090`、`9091`、`8916`、`8917` 在本次 `ss` 过滤中未显示监听，但仍须在启动前再次核验。主机还有大量其他公开绑定端口。禁止直接使用仓库默认 Compose、固定 `container_name`、默认卷或 `docker compose down`；后续必须使用唯一 project 名、无固定容器名、专属网络/命名卷、loopback 高端口和显式资源限制，并在每次操作前核对对象 label/ID。
+- **阶段状态**：阶段 0 的远程只读盘点 `DONE`，但整个接入阶段仍为 `PARTIAL`，因为 host-key 的独立外部核验尚未记录。阶段 1 隔离 workspace `PARTIAL`；阶段 2 Linux release build `BLOCKED`（远程 `cargo` 不在 shell PATH，退出 127）；阶段 3 Linux probes、阶段 4 Redis/ClickHouse live recovery、阶段 5 lifecycle、阶段 6 capacity、阶段 7 remote cleanup/evidence 均 `NOT RUN`。
+- **继续前门禁**：按用户指示保持 root 密码不变，这相对计划 §13 是明确偏离；不将其表述为满足原计划的凭据轮换门禁。下一步先做只读 Rust 工具链诊断；只有发现可用工具链并重新通过构建门后，才确认隔离工作区内容并生成 Compose 覆盖配置。启动依赖前必须再次确认端口、资源、project label、专属卷/网络和允许范围。故障注入、精确强杀和容量压测仍需分别批准。
+
 
 ### [2026-09-19 12:00] GW-R1 规划完成：dated计划落plan/ + TASK_PLAN初始化
 - **实际操作**：通读manual/ 7份+Banyan四Skill（draft/track/log/gate）+templates；新建`plan/2026年9月19日-GW-R1实施计划.md`（6阶段GW-0~GW-5，勘察冻结7条，延后5项）；新建根`TASK_PLAN.md`（6步骤+决策约束）；本文件初始化。

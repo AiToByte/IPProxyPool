@@ -3,6 +3,7 @@
 //! 本路径是可选的独立 Pingora ServerApp，不改变普通 ProxyHttp 端口。只支持
 //! HTTP/1.1 CONNECT 到现有 HTTP/SOCKS 上游，不做 H2/H3、MITM 或上游 TLS proxy。
 
+use crate::health::RuntimeHealthState;
 use crate::metrics::MetricsRegistry;
 use crate::model::{EgressProto, RoutingSpec};
 use crate::router::RouterEngine;
@@ -390,8 +391,43 @@ impl Drop for TunnelGuard<'_> {
     }
 }
 
+/// Owns the streams and accounting guards after the 200 response has been flushed.
+struct EstablishedTunnel<'a, D> {
+    downstream: D,
+    upstream: tokio::net::TcpStream,
+    downstream_prefetched: Vec<u8>,
+    upstream_prefetched: Vec<u8>,
+    tunnel: TunnelGuard<'a>,
+    settlement: SettlementGuard<'a>,
+    _admission: AdmissionGuard,
+}
+
+impl<D: AsyncRead + AsyncWrite + Unpin> EstablishedTunnel<'_, D> {
+    async fn relay(mut self) {
+        let result = tokio::time::timeout(
+            CONNECT_MAX_LIFETIME,
+            relay_metered(
+                &mut self.downstream,
+                &mut self.upstream,
+                &self.downstream_prefetched,
+                &self.upstream_prefetched,
+                &self.settlement.usage,
+                self.tunnel.metrics,
+                CONNECT_IDLE_TIMEOUT,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => log::debug!("[CONNECT] relay closed: {error}"),
+            Err(_) => log::debug!("[CONNECT] relay closed: CONNECT tunnel lifetime"),
+        }
+    }
+}
+
 /// 可选启用的独立 HTTP/1.1 CONNECT 服务，不改变普通 ProxyHttp 请求处理路径。
 pub struct ConnectServerApp {
+    health: Arc<RuntimeHealthState>,
     max_concurrent: Arc<tokio::sync::Semaphore>,
     router: Arc<RouterEngine>,
     tenants: Arc<TenantManager>,
@@ -409,19 +445,37 @@ impl ConnectServerApp {
         )
     }
 
-    /// 生产入口注入共享指标；测试构造器保留默认本地注册表。
+    /// Production entry shares readiness and admission lifecycle state.
+    pub(crate) fn with_max_concurrent_and_metrics_and_health(
+        router: Arc<RouterEngine>,
+        tenants: Arc<TenantManager>,
+        max_concurrent: u32,
+        metrics: Arc<MetricsRegistry>,
+        health: Arc<RuntimeHealthState>,
+    ) -> Self {
+        Self {
+            health,
+            max_concurrent: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1) as usize)),
+            router,
+            tenants,
+            metrics,
+        }
+    }
+
+    /// Existing constructor for callers that do not configure runtime drain state.
     pub fn with_max_concurrent_and_metrics(
         router: Arc<RouterEngine>,
         tenants: Arc<TenantManager>,
         max_concurrent: u32,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
-        Self {
-            max_concurrent: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1) as usize)),
+        Self::with_max_concurrent_and_metrics_and_health(
             router,
             tenants,
+            max_concurrent,
             metrics,
-        }
+            RuntimeHealthState::new(),
+        )
     }
 
     /// 构造独立 listener；全局连接上限覆盖未认证请求，避免只依赖租户限流。
@@ -439,12 +493,28 @@ impl ConnectServerApp {
         )
     }
 
-    async fn serve_connection<D>(&self, mut downstream: D) -> Option<Stream>
+    #[cfg(test)]
+    async fn serve_connection<D>(&self, downstream: D) -> Option<Stream>
     where
         D: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        if let Some(tunnel) = self.establish_tunnel(downstream).await {
+            tunnel.relay().await;
+        }
+        None
+    }
+
+    async fn establish_tunnel<D>(&self, mut downstream: D) -> Option<EstablishedTunnel<'_, D>>
+    where
+        D: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        if !self.health.accepts_new_requests() {
+            let _ = write_connect_error(&mut downstream, 503).await;
+            return None;
+        }
+
         // 连接 permit 从读头开始持有，覆盖未认证阶段及整个隧道寿命。
-        let _admission = match self.max_concurrent.clone().try_acquire_owned() {
+        let admission = match self.max_concurrent.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.metrics.connect_admission_acquired(true);
                 AdmissionGuard {
@@ -473,6 +543,12 @@ impl ConnectServerApp {
                     return None;
                 }
             };
+
+        // The header read can span the transition into drain.
+        if !self.health.accepts_new_requests() {
+            let _ = write_connect_error(&mut downstream, 503).await;
+            return None;
+        }
 
         let Some(api_key) = request.api_key.as_deref() else {
             let _ = write_connect_error(&mut downstream, 403).await;
@@ -527,7 +603,7 @@ impl ConnectServerApp {
             }
         })
         .await;
-        let (mut upstream, upstream_prefetched) = match upstream_result {
+        let (upstream, upstream_prefetched) = match upstream_result {
             Ok(Ok(result)) => result,
             Ok(Err((status, reason))) => {
                 log::debug!("[CONNECT] upstream {} failed: {reason}", node.addr);
@@ -558,32 +634,18 @@ impl ConnectServerApp {
             EgressProto::Socks4 => "socks4",
             EgressProto::Socks5 => "socks5",
         });
-        let _tunnel = TunnelGuard {
-            metrics: &self.metrics,
-            started: tokio::time::Instant::now(),
-        };
-        if let Err(error) = tokio::time::timeout(
-            CONNECT_MAX_LIFETIME,
-            relay_metered(
-                &mut downstream,
-                &mut upstream,
-                &request.prefetched,
-                &upstream_prefetched,
-                &settlement.usage,
-                &self.metrics,
-                CONNECT_IDLE_TIMEOUT,
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "CONNECT tunnel lifetime",
-            ))
-        }) {
-            log::debug!("[CONNECT] relay closed: {error}");
-        }
-        None
+        Some(EstablishedTunnel {
+            downstream,
+            upstream,
+            downstream_prefetched: request.prefetched,
+            upstream_prefetched,
+            tunnel: TunnelGuard {
+                metrics: &self.metrics,
+                started: tokio::time::Instant::now(),
+            },
+            settlement,
+            _admission: admission,
+        })
     }
 }
 
@@ -595,12 +657,17 @@ impl ServerApp for ConnectServerApp {
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let mut shutdown = shutdown.clone();
-        // 取消覆盖读头、上游建链与 relay 全阶段；局部结算守卫自动结算并释放。
-        tokio::select! {
+        // Shutdown cancels setup. Once the 200 has been flushed, Pingora's
+        // runtime owns the relay until it finishes or the runtime shuts down.
+        let tunnel = tokio::select! {
             biased;
-            _ = shutdown.wait_for(|stop| *stop) => None,
-            result = self.serve_connection(session) => result,
+            _ = shutdown.wait_for(|stop| *stop) => return None,
+            tunnel = self.establish_tunnel(session) => tunnel,
+        };
+        if let Some(tunnel) = tunnel {
+            tunnel.relay().await;
         }
+        None
     }
 }
 
@@ -750,6 +817,7 @@ async fn write_connect_error<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::Duration;
 
     #[test]
     fn parses_domain_and_port() {
@@ -933,6 +1001,311 @@ mod tests {
         upstream.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"server-early");
         server.await.expect("stub task");
+    }
+
+    #[tokio::test]
+    async fn drain_rejects_new_connect_without_dialing_upstream() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let mut upstream_task = tokio::spawn(async move { upstream.accept().await });
+        let node = crate::model::ProxyNode::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "stub".to_string(),
+            100,
+        );
+        let router = Arc::new(RouterEngine::new(vec![node]));
+        let tenants = Arc::new(TenantManager::new());
+        tenants.register_tenant("tenant-a", "connect-key", 10_000, 10, 100);
+        let health = RuntimeHealthState::new();
+        health.request_drain();
+        let app = ConnectServerApp::with_max_concurrent_and_metrics_and_health(
+            router,
+            tenants,
+            DEFAULT_MAX_CONCURRENT as u32,
+            Arc::new(MetricsRegistry::new()),
+            health,
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        let app_task = tokio::spawn(async move {
+            app.serve_connection(Box::new(server)).await;
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nX-API-Key: connect-key\r\n\r\n")
+            .await
+            .expect("send CONNECT request");
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(1), client.read(&mut chunk))
+                .await
+                .expect("refusal response timeout")
+                .expect("read refusal response");
+            assert_ne!(n, 0, "connection closed without refusal response");
+            response.extend_from_slice(&chunk[..n]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable"));
+        app_task.await.expect("CONNECT app task");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut upstream_task)
+                .await
+                .is_err()
+        );
+        // A timeout cancels only the join wait, so explicitly stop the acceptor fixture.
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn drain_rejects_connect_headers_completed_after_drain() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let health = RuntimeHealthState::new();
+        let app = ConnectServerApp::with_max_concurrent_and_metrics_and_health(
+            Arc::new(RouterEngine::new(vec![])),
+            Arc::new(TenantManager::new()),
+            1,
+            Arc::new(MetricsRegistry::new()),
+            health.clone(),
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let mut request = std::pin::pin!(app.serve_connection(server));
+        // Poll through connection admission and into the incomplete header read.
+        assert!(poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx).is_pending())).await);
+
+        health.request_drain();
+        client.write_all(b"\r\n").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .unwrap()
+            .is_none());
+        let mut status = [0; b"HTTP/1.1 503".len()];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut status))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 503");
+    }
+
+    #[tokio::test]
+    async fn process_new_keeps_established_tunnel_alive_after_shutdown_watch() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("upstream address")
+            .port();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.expect("CONNECT request");
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("upstream response");
+            let mut payload = [0u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("client payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").await.expect("upstream payload");
+            let mut eof = [0u8; 1];
+            let _ = stream.read(&mut eof).await;
+        });
+        let node = crate::model::ProxyNode::new(
+            "127.0.0.1".into(),
+            upstream_port,
+            None,
+            None,
+            "US".into(),
+            "datacenter".into(),
+            "shutdown-fixture".into(),
+            100,
+        );
+        let tenants = Arc::new(TenantManager::new());
+        tenants.register_tenant("tenant-a", "shutdown-key", 1000, 10, 100);
+        let health = RuntimeHealthState::new();
+        let app = Arc::new(
+            ConnectServerApp::with_max_concurrent_and_metrics_and_health(
+                Arc::new(RouterEngine::new(vec![node])),
+                tenants,
+                1,
+                Arc::new(MetricsRegistry::new()),
+                health,
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            app.process_new(
+                Box::new(pingora_core::protocols::l4::stream::Stream::from(stream)),
+                &watch,
+            )
+            .await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nX-API-Key: shutdown-key\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 64];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+                .await
+                .expect("CONNECT response timeout")
+                .unwrap();
+            assert_ne!(count, 0, "CONNECT closed before establishment");
+            response.extend_from_slice(&chunk[..count]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200 Connection Established"));
+
+        stop.send(true).unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut pong = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut pong))
+            .await
+            .expect("established tunnel closed when shutdown watch fired")
+            .unwrap();
+        assert_eq!(&pong, b"pong");
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            upstream.await.unwrap();
+            task.await.unwrap();
+        })
+        .await
+        .expect("established tunnel settles after both peers close");
+    }
+
+    #[tokio::test]
+    async fn established_connect_tunnel_continues_relaying_after_drain() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("upstream addr")
+            .port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = upstream_listener.accept().await.expect("upstream accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                upstream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("CONNECT headers");
+                request.push(byte[0]);
+            }
+            upstream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("upstream handshake");
+            let mut payload = [0u8; 12];
+            upstream
+                .read_exact(&mut payload)
+                .await
+                .expect("client payload");
+            assert_eq!(&payload, b"after-drain!");
+            upstream
+                .write_all(b"reply-after-drain")
+                .await
+                .expect("upstream reply");
+            let mut eof = [0u8; 1];
+            let _ = upstream.read(&mut eof).await;
+        });
+
+        let node = crate::model::ProxyNode::new(
+            "127.0.0.1".to_string(),
+            upstream_port,
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "stub".to_string(),
+            100,
+        );
+        let router = Arc::new(RouterEngine::new(vec![node]));
+        let tenants = Arc::new(TenantManager::new());
+        tenants.register_tenant("tenant-a", "connect-key", 10_000, 10, 100);
+        let health = RuntimeHealthState::new();
+        let app = Arc::new(
+            ConnectServerApp::with_max_concurrent_and_metrics_and_health(
+                router,
+                tenants,
+                DEFAULT_MAX_CONCURRENT as u32,
+                Arc::new(MetricsRegistry::new()),
+                health.clone(),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("downstream listener");
+        let addr = listener.local_addr().expect("downstream address");
+        let app_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("downstream accept");
+            app.serve_connection(Box::new(pingora_core::protocols::l4::stream::Stream::from(
+                stream,
+            )))
+            .await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client connect");
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nX-API-Key: connect-key\r\n\r\n")
+            .await
+            .expect("send CONNECT");
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(1), client.read(&mut chunk))
+                .await
+                .expect("CONNECT response timeout")
+                .expect("read CONNECT response");
+            assert_ne!(n, 0, "CONNECT closed before established");
+            response.extend_from_slice(&chunk[..n]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200 Connection Established"));
+
+        health.request_drain();
+        assert!(!health.accepts_new_requests());
+        client
+            .write_all(b"after-drain!")
+            .await
+            .expect("write to established tunnel after drain");
+        let mut tunnel_reply = [0u8; 17];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut tunnel_reply))
+            .await
+            .expect("tunnel reply timeout")
+            .expect("read tunnel reply");
+        assert_eq!(&tunnel_reply, b"reply-after-drain");
+
+        client.shutdown().await.expect("close client write side");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), app_task)
+            .await
+            .expect("CONNECT task timeout")
+            .expect("CONNECT task join");
+        upstream_task.await.expect("upstream task");
     }
 
     #[tokio::test]
@@ -1250,7 +1623,12 @@ mod tests {
             .expect("shutdown must not wait for header timeout")
             .unwrap();
         let mut byte = [0];
-        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await,
+            Ok(Ok(0))
+        ) {
+            panic!("framework shutdown should still cancel an unestablished request");
+        }
     }
 
     /// 两端半关闭仍保留另一方向；空闲到期保留已写字节计数。
