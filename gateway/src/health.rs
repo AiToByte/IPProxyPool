@@ -5,7 +5,10 @@
 //! HTTP handlers to return stable, low-cardinality probe responses.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::Notify;
 
 /// Shared runtime facts for health handlers and startup/shutdown wiring.
 ///
@@ -16,9 +19,36 @@ pub(crate) struct RuntimeHealthState {
     config_valid: AtomicBool,
     required_listener_ready: AtomicBool,
     required_dependency_ready: AtomicBool,
+    tenant_store_requires_redis: AtomicBool,
     optional_dependencies_ready: AtomicBool,
     drain_requested: AtomicBool,
     stopped: AtomicBool,
+    admission: Mutex<AdmissionState>,
+    quiesced: Arc<Notify>,
+}
+
+struct AdmissionState {
+    accepting: bool,
+    active: usize,
+}
+
+pub(crate) struct AdmissionLease {
+    state: Arc<RuntimeHealthState>,
+}
+
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        let notify = self.state.quiesced.clone();
+        let mut admission = self
+            .state
+            .admission
+            .lock()
+            .expect("admission mutex poisoned");
+        admission.active = admission.active.saturating_sub(1);
+        if admission.active == 0 {
+            notify.notify_waiters();
+        }
+    }
 }
 
 impl RuntimeHealthState {
@@ -27,9 +57,15 @@ impl RuntimeHealthState {
             config_valid: AtomicBool::new(false),
             required_listener_ready: AtomicBool::new(false),
             required_dependency_ready: AtomicBool::new(false),
+            tenant_store_requires_redis: AtomicBool::new(false),
             optional_dependencies_ready: AtomicBool::new(true),
             drain_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            admission: Mutex::new(AdmissionState {
+                accepting: true,
+                active: 0,
+            }),
+            quiesced: Arc::new(Notify::new()),
         })
     }
 
@@ -49,6 +85,12 @@ impl RuntimeHealthState {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn set_tenant_store_requires_redis(&self, required: bool) {
+        self.tenant_store_requires_redis
+            .store(required, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn set_optional_dependencies_ready(&self, ready: bool) {
         self.optional_dependencies_ready
             .store(ready, Ordering::Release);
@@ -57,15 +99,67 @@ impl RuntimeHealthState {
     #[allow(dead_code)]
     pub(crate) fn request_drain(&self) {
         self.drain_requested.store(true, Ordering::Release);
+        let mut admission = self.admission.lock().expect("admission mutex poisoned");
+        admission.accepting = false;
     }
 
     #[allow(dead_code)]
     pub(crate) fn mark_stopped(&self) {
         self.stopped.store(true, Ordering::Release);
+        let mut admission = self.admission.lock().expect("admission mutex poisoned");
+        admission.accepting = false;
+    }
+
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<AdmissionLease> {
+        if !self.accepts_new_requests() {
+            return None;
+        }
+        let mut admission = self.admission.lock().expect("admission mutex poisoned");
+        if !admission.accepting || !self.policy_allows_admission() {
+            return None;
+        }
+        admission.active += 1;
+        Some(AdmissionLease {
+            state: Arc::clone(self),
+        })
+    }
+
+    pub(crate) async fn wait_for_quiescence(&self, timeout: Duration) -> bool {
+        let notified = self.quiesced.notified();
+        tokio::pin!(notified);
+        loop {
+            if self.active_admissions() == 0 {
+                return true;
+            }
+            notified.as_mut().enable();
+            if self.active_admissions() == 0 {
+                return true;
+            }
+            if tokio::time::timeout(timeout, notified.as_mut())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) fn active_admissions(&self) -> usize {
+        self.admission
+            .lock()
+            .expect("admission mutex poisoned")
+            .active
+    }
+
+    fn policy_allows_admission(&self) -> bool {
+        !self.drain_requested.load(Ordering::Acquire)
+            && !self.stopped.load(Ordering::Acquire)
+            && (!self.tenant_store_requires_redis.load(Ordering::Acquire)
+                || self.required_dependency_ready.load(Ordering::Acquire))
     }
 
     pub(crate) fn accepts_new_requests(&self) -> bool {
-        !self.drain_requested.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire)
+        self.policy_allows_admission()
     }
 
     pub(crate) fn evaluate(&self) -> ReadinessDecision {
@@ -353,6 +447,123 @@ mod tests {
         assert!(!state.accepts_new_requests());
         assert_eq!(state.evaluate().phase, RuntimePhase::Draining);
         assert!(!state.evaluate().ready);
+    }
+
+    #[test]
+    fn required_redis_outage_closes_new_admission() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_tenant_store_requires_redis(true);
+        state.set_required_dependency_ready(true);
+        assert!(state.accepts_new_requests());
+
+        state.set_required_dependency_ready(false);
+
+        assert!(!state.accepts_new_requests());
+        assert_eq!(
+            state.evaluate().reason,
+            ReadinessReason::RequiredDependencyUnavailable
+        );
+    }
+
+    #[test]
+    fn optional_redis_outage_keeps_admission_open() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+        state.set_optional_dependencies_ready(false);
+
+        assert!(state.accepts_new_requests());
+        assert_eq!(state.evaluate().phase, RuntimePhase::Degraded);
+    }
+
+    #[test]
+    fn redis_recovery_does_not_reopen_admission_after_drain() {
+        let state = RuntimeHealthState::new();
+        state.set_required_dependency_ready(true);
+        state.request_drain();
+        state.set_required_dependency_ready(false);
+        state.set_required_dependency_ready(true);
+
+        assert!(!state.accepts_new_requests());
+        assert_eq!(state.evaluate().phase, RuntimePhase::Draining);
+    }
+
+    #[test]
+    fn admission_lease_linearizes_drain_and_releases_active_count() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+
+        let lease = state.try_admit().expect("first request admitted");
+        assert_eq!(state.active_admissions(), 1);
+
+        state.request_drain();
+
+        assert!(
+            state.try_admit().is_none(),
+            "drain must close new admission"
+        );
+        assert_eq!(state.active_admissions(), 1);
+        drop(lease);
+        assert_eq!(state.active_admissions(), 0);
+    }
+
+    #[test]
+    fn required_dependency_outage_blocks_try_admit_but_optional_degradation_does_not() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+        state.set_tenant_store_requires_redis(true);
+
+        let required_lease = state.try_admit().expect("healthy required Redis admits");
+        drop(required_lease);
+        state.set_required_dependency_ready(false);
+        assert!(state.try_admit().is_none());
+
+        state.set_tenant_store_requires_redis(false);
+        state.set_optional_dependencies_ready(false);
+        assert!(state.try_admit().is_some());
+    }
+
+    #[tokio::test]
+    async fn quiescence_wait_completes_only_after_last_lease_is_dropped() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let state = RuntimeHealthState::new();
+        let lease = state.try_admit().expect("admitted request");
+        let wait = state.wait_for_quiescence(Duration::from_secs(1));
+        tokio::pin!(wait);
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+
+        drop(lease);
+
+        assert!(wait.await);
+        assert_eq!(state.active_admissions(), 0);
+    }
+
+    #[tokio::test]
+    async fn quiescence_wait_times_out_while_admission_lease_is_active() {
+        let state = RuntimeHealthState::new();
+        let _lease = state.try_admit().expect("admitted request");
+
+        assert!(!state.wait_for_quiescence(Duration::ZERO).await);
+    }
+
+    #[test]
+    fn stopped_state_blocks_try_admit_even_without_drain() {
+        let state = RuntimeHealthState::new();
+        state.set_config_valid(true);
+        state.set_required_listener_ready(true);
+        state.set_required_dependency_ready(true);
+        state.mark_stopped();
+
+        assert!(state.try_admit().is_none());
     }
 
     #[test]

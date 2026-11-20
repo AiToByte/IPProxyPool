@@ -1,4 +1,6 @@
-# 任务执行流水日志（IPProxyPool GW-R1）
+**E1 lifecycle 本地收口（2026-11-19）**：HTTP/CONNECT 使用共享的非 Clone RAII admission lease；lease 获取与 drain 关闭使用同一 mutex 状态线性化，已有 lease 在释放前保持计数。增加有界 quiescence wait、周期 tenant flusher stop signal 和最终有界 flush 顺序：关闭 admission → 停周期写回 → 最多等待 5 秒活跃 lease → 最终 flush 最多 5 秒。restore report 区分不完整的 indexed tenant state；required store 遇到不完整状态不启动，空 Redis index 仍允许首次启动。Windows 验证：workspace **456 passed / 0 failed / 10 ignored**，Redis startup integration **4 passed**；fmt、strict Clippy 与全部文档/凭据门通过。未证明 Linux/live SIGTERM 顺序、Pingora listener/runtime teardown 对齐、真实进程关停时最终结算；本轮未操作远端主机或生产服务。
+
+
 
 - **E1 Redis required-mode**：新增本地 loopback Redis RESP fixture 的 4 个启动集成测试，覆盖不可达、状态加载失败、成功加载、memory 可选模式。required 连接/加载失败均 exit `1`，不启动 flusher；原始 Redis sentinel 不进入错误输出。当前 workspace **445 passed / 0 failed / 10 ignored**，startup integration **4 passed**；未运行远端 Linux/live Redis。
  `5ba7ae3bce162679ddebf726712b7876f84e2281` 基础上，仅修改 `gateway/src/health.rs`、`gateway/src/gateway/{mod.rs,hooks.rs,tests.rs}`、`gateway/src/connect.rs`、`gateway/src/main.rs` 和相应计划/基线文档。新增 HTTP draining→503（gate 在 tenant auth 前）、CONNECT draining→503 且无上游 accept、已建立 CONNECT tunnel 在 runtime drain 后仍可双向传输、bounded tenant flush timeout tests。RED 已确认：移除 HTTP gate 后返回非 503；移除 CONNECT gate 后等待拒绝响应超时。GREEN 后 `cargo clippy --locked --workspace --all-targets -- -D warnings` 通过，workspace tests **443 passed / 0 failed / 10 ignored**。三个 Python 文档/路由/可观测性门通过。

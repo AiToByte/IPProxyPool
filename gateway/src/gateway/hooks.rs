@@ -25,6 +25,12 @@ impl ProxyHttp for SmartProxyGateway {
             return Ok(true);
         }
 
+        let Some(admission) = self.health.try_admit() else {
+            session.respond_error(503).await?;
+            return Ok(true);
+        };
+        ctx.admission = Some(admission);
+
         if let Some(addr) = session.client_addr() {
             ctx.client_ip = addr.to_string();
         }

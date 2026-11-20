@@ -491,6 +491,7 @@ async fn setup_gateway() -> Server {
     use startup_config::TenantStoreMode;
     let tenant_store_requires_redis = startup.tenant_store == TenantStoreMode::Redis;
     let redis_client = redis::Client::open(startup.redis_url).expect("validated Redis URL");
+    runtime_health.set_tenant_store_requires_redis(tenant_store_requires_redis);
     let redis_conn: Option<ConnectionManager> = match tokio::time::timeout(
         Duration::from_secs(3),
         ConnectionManager::new(redis_client.clone()),
@@ -765,11 +766,14 @@ async fn setup_gateway() -> Server {
     // 立刻写回 Redis，把上次运行时的真实余额覆盖掉——一个只在"重启后"才暴露的
     // 静默清零。实测证据见 TASK_PLAN 步骤 60。
     let persisted_load = if tenant_store_requires_redis {
-        tokio::time::timeout(Duration::from_secs(3), tenant_mgr.load_persisted())
+        tokio::time::timeout(Duration::from_secs(3), tenant_mgr.load_persisted_report())
             .await
-            .map(|result| result.map(|_| ()))
             .map_err(|_| "timeout")
-            .and_then(|result| result.map_err(|_| "unavailable"))
+            .and_then(|result| {
+                result
+                    .map_err(|_| "unavailable")
+                    .and_then(|report| (!report.is_incomplete()).then_some(()).ok_or("incomplete"))
+            })
     } else {
         tenant_mgr
             .load_persisted()
@@ -796,7 +800,8 @@ async fn setup_gateway() -> Server {
         Err(_) => log::warn!("[Tenant] optional state load failed; starting from config defaults"),
     }
     let tenant_flush_secs = env_secs("TENANT_FLUSH_SECS", 5);
-    if tenant_mgr.spawn_flusher(tenant_flush_secs).is_some() {
+    let flusher_stop = tenant_mgr.spawn_flusher(tenant_flush_secs);
+    if flusher_stop.is_some() {
         log::info!(
             "[Tenant] write-through flusher online (max lag {}s)",
             tenant_flush_secs.as_secs()
@@ -1479,6 +1484,7 @@ async fn setup_gateway() -> Server {
     let runtime_health_for_signal = runtime_health.clone();
     let signal_tx = shutdown_tx;
     let flush_on_shutdown = tenant_mgr.clone();
+    let flusher_stop_on_shutdown = flusher_stop;
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -1497,6 +1503,18 @@ async fn setup_gateway() -> Server {
         runtime_health_for_signal.request_drain();
         log::warn!("[Shutdown] signal received, stopping background respawns");
         let _ = signal_tx.send(true);
+        if let Some(stop) = flusher_stop_on_shutdown {
+            let _ = stop.send(());
+        }
+        // Wait for all admitted HTTP/CONNECT work to settle before the final flush.
+        // The deadline is bounded; a timeout is reported as best-effort persistence.
+        const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let quiesced = runtime_health_for_signal
+            .wait_for_quiescence(SHUTDOWN_DRAIN_TIMEOUT)
+            .await;
+        if !quiesced {
+            log::warn!("[Shutdown] admission drain timed out; active work may remain");
+        }
         // Keep the tenant flush best-effort but strictly bounded; Pingora owns the
         // listener grace period while this watcher continues independently.
         const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);

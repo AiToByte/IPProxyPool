@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bandit::VectorD;
+use crate::health::AdmissionLease;
 use crate::tenant::TenantAccount;
 
 /// Upstream egress proxy node metadata.
@@ -138,6 +139,7 @@ pub struct ProxyContext {
     pub tenant_id: Option<String>,
     /// GW-4: authenticated tenant account (owns one in-flight slot).
     pub tenant_account: Option<Arc<TenantAccount>>,
+    pub admission: Option<AdmissionLease>,
     /// GW-4 reservation: streaming byte counter (filled by response_body_filter).
     pub transferred_bytes: u64,
     /// R2-2：本请求已失败的 `ip:port` 集合（`fail_to_connect` 记录，
@@ -169,6 +171,7 @@ impl Default for ProxyContext {
             client_ip: String::new(),
             tenant_id: None,
             tenant_account: None,
+            admission: None,
             transferred_bytes: 0,
             failed_addrs: Vec::new(),
             bandit_context: None,

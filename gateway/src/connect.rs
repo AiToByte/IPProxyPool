@@ -400,6 +400,7 @@ struct EstablishedTunnel<'a, D> {
     tunnel: TunnelGuard<'a>,
     settlement: SettlementGuard<'a>,
     _admission: AdmissionGuard,
+    _lifecycle_admission: crate::health::AdmissionLease,
 }
 
 impl<D: AsyncRead + AsyncWrite + Unpin> EstablishedTunnel<'_, D> {
@@ -513,7 +514,10 @@ impl ConnectServerApp {
             return None;
         }
 
-        // 连接 permit 从读头开始持有，覆盖未认证阶段及整个隧道寿命。
+        let Some(lifecycle_admission) = self.health.try_admit() else {
+            let _ = write_connect_error(&mut downstream, 503).await;
+            return None;
+        };
         let admission = match self.max_concurrent.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.metrics.connect_admission_acquired(true);
@@ -645,6 +649,7 @@ impl ConnectServerApp {
             },
             settlement,
             _admission: admission,
+            _lifecycle_admission: lifecycle_admission,
         })
     }
 }
@@ -1001,6 +1006,79 @@ mod tests {
         upstream.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"server-early");
         server.await.expect("stub task");
+    }
+
+    #[tokio::test]
+    async fn required_redis_outage_rejects_connect_before_upstream_dial() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let mut upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("upstream accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("upstream request");
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("upstream response");
+        });
+        let node = crate::model::ProxyNode::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            None,
+            None,
+            "US".to_string(),
+            "datacenter".to_string(),
+            "stub".to_string(),
+            100,
+        );
+        let tenants = Arc::new(TenantManager::new());
+        tenants.register_tenant("tenant-a", "connect-key", 10_000, 10, 100);
+        let health = RuntimeHealthState::new();
+        health.set_tenant_store_requires_redis(true);
+        health.set_required_dependency_ready(true);
+        health.set_required_dependency_ready(false);
+        let app = ConnectServerApp::with_max_concurrent_and_metrics_and_health(
+            Arc::new(RouterEngine::new(vec![node])),
+            tenants,
+            DEFAULT_MAX_CONCURRENT as u32,
+            Arc::new(MetricsRegistry::new()),
+            health,
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        let app_task = tokio::spawn(async move {
+            app.serve_connection(Box::new(server)).await;
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nX-API-Key: connect-key\r\n\r\n")
+            .await
+            .expect("send CONNECT request");
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = tokio::time::timeout(Duration::from_secs(1), client.read(&mut chunk))
+                .await
+                .expect("CONNECT refusal timeout")
+                .expect("read CONNECT refusal");
+            assert_ne!(count, 0, "connection closed before refusal response");
+            response.extend_from_slice(&chunk[..count]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable"));
+        app_task.await.expect("CONNECT app task");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut upstream_task)
+                .await
+                .is_err()
+        );
+        upstream_task.abort();
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ IPProxyPool 已形成具备差异化的智能出口网关：HTTP/SOCKS 出站、
 | 租户 Redis 写穿 | 部分 | 异步 dirty flush、版本化确认和取消安全；不是金融账本，不保证多实例原子配额。 |
 | Admin API/UI | 部分 | 节点查询、增删、调权、隔离、节点文件持久化和 UI；租户生命周期、RBAC、全量配置发布和集群协调尚缺。 |
 | Prometheus/Grafana | 已验证（仓内） | 具备 exposition、告警与仪表盘；指标语义门禁存在。尚未证明目标生产 SLO。 |
-| 自动化质量门 | 已验证（测试范围内） | 当前 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md) 记录 445 passed、10 ignored、22 Python 静态门；Windows 覆盖率见专用基线，测试数量不等于生产成熟度。 |
+| 自动化质量门 | 已验证（测试范围内） | 当前 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md) 记录 456 passed、10 ignored、22 Python 静态门；Windows 覆盖率见专用基线，测试数量不等于生产成熟度。 |
 | 真实容量 | 部分 | [`PERF_BASELINE.md`](PERF_BASELINE.md) 为单进程、loopback 上游、遥测关闭环境，持续约 10k 成功 QPS 受到租户限流器限制；裸产能、遥测开销、真实远端上游及 Linux 长稳未覆盖。 |
 
 ## 4. 外部参照与可比边界
@@ -153,7 +153,7 @@ CONNECT-UDP/CONNECT-IP/MASQUE、QUIC-native dataplane、eBPF/io_uring 只有在�
 可以说：
 
 - 仓库包含成熟的 HTTP/SOCKS egress、智能选路、节点治理、租户限额和遥测实现；
-- 当前质量基线记录 445 pass / 10 ignored，具体值以 `QUALITY_BASELINE.md` 为唯一真源；
+- 当前质量基线记录 456 pass / 10 ignored，具体值以 `QUALITY_BASELINE.md` 为唯一真源；
 - **当前工作树中**存在 loopback-only HTTP/1.1 CONNECT 实现与协议测试；
 - 性能基线是在单进程、回环上游、遥测关闭条件下取得，限流器影响持续吞吐；
 - Linux 隔离构建与 live 依赖恢复已有按特定版本/拓扑记录的证据；仍未证明 Linux 容量、长稳、HA、目标生产 SLO 或真实远端上游表现。

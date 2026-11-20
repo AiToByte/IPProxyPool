@@ -11,7 +11,7 @@ IPProxyPool 是基于 Pingora 的企业级代理网关：智能选路（LinUCB�
 
 - 数据面：`:8916`（Pingora 五阶段：鉴权→选路→转发→计量→遥测），P99 dev 基线约 65ms（Windows debug 参考值，非生产承诺）。
 - 控制面：Admin API/UI（节点运行时增删/调权/隔离 + `NODES_FILE` 原子持久化）＋prober/prewarmer/sweep/arbitrage/free_pool 后台 ticker＋supervisor 托管。
-- 质量：445 单测＋6 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。数字口径见 [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md)。
+- 质量：456 单测＋6 真 live＋release bandit 8 臂 <200ns＋curl 全回归＋韧性演练（Redis/CH/Mock 断电自愈）。数字口径见 [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md)。
 - Linux 验证：Linux fmt/Clippy/workspace tests/release build 与隔离 Redis/ClickHouse 恢复、Gateway probe、SIGTERM graceful shutdown 已有特定版本和拓扑的记录；**不代表容量、HA 或生产 SLO 已通过**。详情见 [`EXEC_LOG.md`](EXEC_LOG.md)。
 - 第三方数据：启用 GeoLite2（`GEOIP_MMDB_PATH`）即须随部署附带 **MaxMind 署名**（CC BY-SA 4.0 强制）——可复制文本见 [`docs/OPERATION.md` §第三方数据署名](docs/OPERATION.md#第三方数据署名--third-party-data-attribution)。
 
@@ -58,7 +58,7 @@ IPProxyPool is a Pingora-based enterprise proxy gateway: smart routing (LinUCB +
 
 - Data plane: `:8916` (Pingora five phases: auth → route → forward → meter → telemetry); P99 dev baseline ~65ms (Windows debug reference, not a production commitment).
 - Control plane: Admin API/UI (runtime node add/remove/adjust/quarantine + atomic `NODES_FILE` persistence) plus prober/prewarmer/sweep/arbitrage/free_pool tickers, supervised.
-- Quality: 445 unit tests + 6 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage recovery). Numbers are canonical in [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md).
+- Quality: 456 unit tests + 6 live + release bandit 8-arm <200ns + full curl regression + resilience drills (Redis/CH/Mock outage recovery). Numbers are canonical in [`docs/QUALITY_BASELINE.md`](docs/QUALITY_BASELINE.md).
 - Linux verification: Linux fmt/Clippy/workspace tests/release build and isolated Redis/ClickHouse recovery, Gateway probes, and graceful SIGTERM have evidence for a specific revision and topology; **this does not establish capacity, HA, or production SLO**. See [`EXEC_LOG.md`](EXEC_LOG.md).
 - Third-party data: enabling GeoLite2 (`GEOIP_MMDB_PATH`) requires shipping the **MaxMind attribution** with your deployment (mandated by CC BY-SA 4.0) — copy-paste text in [`docs/OPERATION.md`](docs/OPERATION.md#第三方数据署名--third-party-data-attribution).
 

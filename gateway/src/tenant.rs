@@ -111,10 +111,33 @@ trait PersistBackend {
 
     /// 枚举索引里的全部记录。**无法解析的记录在这里被丢弃并告警**（不是
     /// 错误）——一条坏记录不该让整个启动加载失败。
-    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String>;
+    async fn read_all(&self) -> Result<PersistedRecords, String>;
 }
 
-/// `Store::Redis` 对应的真实后端。
+/// Persisted records returned by a backend, including keys that could not be decoded.
+struct PersistedRecords {
+    records: Vec<(String, PersistedTenant)>,
+    indexed_keys: std::collections::HashSet<String>,
+    malformed_keys: Vec<String>,
+}
+
+/// Result of restoring configured tenant state.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub applied: usize,
+    pub configured: usize,
+    pub has_persisted_records: bool,
+    pub missing_configured_keys: Vec<String>,
+    pub malformed_keys: Vec<String>,
+}
+
+impl RestoreReport {
+    pub fn is_incomplete(&self) -> bool {
+        !self.missing_configured_keys.is_empty() || !self.malformed_keys.is_empty()
+    }
+}
+
+/// `RedisBackend` and the test recorder share this persistence contract.
 struct RedisBackend {
     conn: redis::aio::ConnectionManager,
     prefix: String,
@@ -138,29 +161,35 @@ impl PersistBackend for RedisBackend {
             .map_err(|e| format!("租户状态写回失败（Redis 前缀已隐藏）: {e}"))
     }
 
-    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+    async fn read_all(&self) -> Result<PersistedRecords, String> {
         let mut conn = self.conn.clone();
         let index_key = format!("{}:index", self.prefix);
         let keys: Vec<String> = redis::AsyncCommands::smembers(&mut conn, &index_key)
             .await
             .map_err(|e| format!("租户状态索引读取失败: {e}"))?;
         let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
+        let mut malformed_keys = Vec::new();
+        for key in &keys {
             let hash_key = format!("{}:{key}", self.prefix);
             let hash: std::collections::HashMap<String, String> =
                 redis::AsyncCommands::hgetall(&mut conn, &hash_key)
                     .await
                     .map_err(|e| format!("租户状态读取失败: {e}"))?;
             match PersistedTenant::from_hash(&hash) {
-                Some(rec) => out.push((key, rec)),
+                Some(rec) => out.push((key.clone(), rec)),
                 None => {
+                    malformed_keys.push(key.clone());
                     log::warn!(
                         "[Tenant] 租户状态记录无法解析（余额字段缺失或非有限值），保留内存值"
                     )
                 }
             }
         }
-        Ok(out)
+        Ok(PersistedRecords {
+            records: out,
+            indexed_keys: keys.into_iter().collect(),
+            malformed_keys,
+        })
     }
 }
 
@@ -226,17 +255,27 @@ impl PersistBackend for RecordingBackend {
         Ok(())
     }
 
-    async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+    async fn read_all(&self) -> Result<PersistedRecords, String> {
         let snapshot: Vec<(String, std::collections::HashMap<String, String>)> = self
             .hashes
             .lock()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        Ok(snapshot
-            .into_iter()
-            .filter_map(|(k, h)| PersistedTenant::from_hash(&h).map(|r| (k, r)))
-            .collect())
+        let indexed_keys = snapshot.iter().map(|(key, _)| key.clone()).collect();
+        let mut records = Vec::new();
+        let mut malformed_keys = Vec::new();
+        for (key, hash) in snapshot {
+            match PersistedTenant::from_hash(&hash) {
+                Some(record) => records.push((key, record)),
+                None => malformed_keys.push(key),
+            }
+        }
+        Ok(PersistedRecords {
+            records,
+            indexed_keys,
+            malformed_keys,
+        })
     }
 }
 
@@ -537,16 +576,15 @@ impl TenantManager {
         }
     }
 
-    /// 从持久化后端加载并覆盖**运行期可变状态**（`is_active` /
-    /// `balance_usd` / `total_bytes`）。
-    ///
-    /// 返回应用的记录数。**必须在 `spawn_flusher` 之前调用**，否则首轮 flush
-    /// 会把刚注册的初始值（余额 100）写回后端，覆盖掉上次的余额。
-    ///
-    /// 未启用持久化时返回 `Ok(0)`（不是错误）。
+    /// Load persisted state and return the number of applied records.
     pub async fn load_persisted(&self) -> Result<usize, String> {
+        Ok(self.load_persisted_report().await?.applied)
+    }
+
+    /// Load persisted state with enough detail for required-store startup policy.
+    pub async fn load_persisted_report(&self) -> Result<RestoreReport, String> {
         match &self.store {
-            Store::Memory => Ok(0),
+            Store::Memory => Ok(RestoreReport::default()),
             Store::Redis { conn, prefix } => {
                 let backend = RedisBackend {
                     conn: conn.clone(),
@@ -560,28 +598,43 @@ impl TenantManager {
     }
 
     /// 加载算法本体（与后端无关，因此测试覆盖的就是生产代码）。
-    async fn load_via<B: PersistBackend>(&self, backend: &B) -> Result<usize, String> {
+    async fn load_via<B: PersistBackend>(&self, backend: &B) -> Result<RestoreReport, String> {
         let records = backend.read_all().await?;
-        let mut applied = 0usize;
-        let mut orphan = 0usize;
-        for (key, rec) in records {
+        let mut report = RestoreReport {
+            configured: self.tenants.len(),
+            has_persisted_records: !records.indexed_keys.is_empty(),
+            ..RestoreReport::default()
+        };
+        report.malformed_keys = records.malformed_keys;
+        let mut restored_keys = std::collections::HashSet::new();
+        for (key, rec) in records.records {
             let Some(acct) = self.tenants.get(&key).map(|e| e.value().clone()) else {
-                // 配置里已没有这个租户 ⇒ 不复活（见 `Store` 的语义边界说明）。
-                orphan += 1;
                 continue;
             };
             acct.is_active.store(rec.is_active, Ordering::Relaxed);
             acct.balance_usd.store(rec.balance_usd, Ordering::Relaxed);
             acct.total_bytes.store(rec.total_bytes, Ordering::Relaxed);
-            applied += 1;
+            restored_keys.insert(key);
+            report.applied += 1;
         }
-        if orphan > 0 {
-            log::info!(
-                "[Tenant] {orphan} 条 Redis 记录对应的租户不在当前配置中，已忽略\
-                 （配置决定「有哪些租户」，Redis 只决定「它们的状态」）"
+        report.missing_configured_keys = self
+            .tenants
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|key| {
+                !records.indexed_keys.is_empty()
+                    && !restored_keys.contains(key)
+                    && !records.indexed_keys.contains(key)
+            })
+            .collect();
+        report.missing_configured_keys.sort();
+        if !report.missing_configured_keys.is_empty() {
+            log::warn!(
+                "[Tenant] configured tenant state is incomplete; {} record(s) remain at defaults",
+                report.missing_configured_keys.len()
             );
         }
-        Ok(applied)
+        Ok(report)
     }
 
     /// 把脏集写回后端。返回写入成功的条数。
@@ -642,25 +695,29 @@ impl TenantManager {
     pub fn spawn_flusher(
         self: &Arc<Self>,
         interval: std::time::Duration,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
         if !self.is_persistent() {
             return None;
         }
         let me = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // 慢机器上漏拍时按 Delay 补齐，不要 Burst 连发（连发会在
             // 积压后瞬间打出几百次 Redis 往返）。
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
-                match me.flush_dirty().await {
-                    Ok(0) => {}
-                    Ok(n) => log::debug!("[Tenant] flushed {n} record(s) to Redis"),
-                    Err(e) => log::warn!("[Tenant] flush failed, will retry: {e}"),
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = ticker.tick() => match me.flush_dirty().await {
+                        Ok(0) => {}
+                        Ok(n) => log::debug!("[Tenant] flushed {n} record(s) to Redis"),
+                        Err(e) => log::warn!("[Tenant] flush failed, will retry: {e}"),
+                    },
                 }
             }
-        }))
+        });
+        Some(stop_tx)
     }
 
     /// R2-3 默认 burst：`qps/10`（至少 1）。突发容忍与限流强度解耦，
@@ -1184,7 +1241,7 @@ mod tests {
             self.inner.write(key, rec).await
         }
 
-        async fn read_all(&self) -> Result<Vec<(String, PersistedTenant)>, String> {
+        async fn read_all(&self) -> Result<PersistedRecords, String> {
             self.inner.read_all().await
         }
     }
@@ -1249,6 +1306,35 @@ mod tests {
         assert_eq!(backend.stored("k1").unwrap()["balance_usd"], "17");
     }
 
+    #[tokio::test]
+    async fn required_restore_reports_missing_configured_tenant_state() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "k1",
+            &[
+                ("tenant_id", "t-1"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+        manager.register_tenant("t-2", "k2", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert_eq!(report.applied, 1);
+        assert!(report.has_persisted_records);
+        assert_eq!(report.missing_configured_keys, vec!["k2"]);
+        assert!(report.is_incomplete());
+    }
+
     /// 写出去 → 读回来，运行期可变状态一字不差。
     #[tokio::test]
     async fn p2_2_flush_then_load_roundtrips_runtime_state() {
@@ -1296,6 +1382,20 @@ mod tests {
             d.balance_usd
         );
         assert_eq!(d.total_bytes, 1_073_741_824, "累计流量必须跨重启保留");
+    }
+
+    #[tokio::test]
+    async fn flusher_stops_when_signaled() {
+        let (manager, backend) = persistent_manager();
+        register_default(&manager, "k1");
+        let stop = Arc::new(manager)
+            .spawn_flusher(std::time::Duration::from_millis(1))
+            .expect("persistent flusher");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let writes_before_stop = backend.writes();
+        stop.send(()).expect("stop flusher");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(backend.writes(), writes_before_stop);
     }
 
     /// 缺省（memory）后端**必须**是完全的空操作：这是"升级后行为零变化"的保证，
