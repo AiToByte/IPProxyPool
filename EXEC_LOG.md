@@ -1,4 +1,5 @@
-**E1 lifecycle 本地收口（2026-11-19）**：HTTP/CONNECT 使用共享的非 Clone RAII admission lease；lease 获取与 drain 关闭使用同一 mutex 状态线性化，已有 lease 在释放前保持计数。增加有界 quiescence wait、周期 tenant flusher stop signal 和最终有界 flush 顺序：关闭 admission → 停周期写回 → 最多等待 5 秒活跃 lease → 最终 flush 最多 5 秒。restore report 区分不完整的 indexed tenant state；required store 遇到不完整状态不启动，空 Redis index 仍允许首次启动。Windows 验证：workspace **456 passed / 0 failed / 10 ignored**，Redis startup integration **4 passed**；fmt、strict Clippy 与全部文档/凭据门通过。未证明 Linux/live SIGTERM 顺序、Pingora listener/runtime teardown 对齐、真实进程关停时最终结算；本轮未操作远端主机或生产服务。
+- **2026-11-20 后续执行准备**：对已推送 `f646229c41f1842f52db3f370556093b66d5f158` 重新执行本地检查，workspace `456 passed / 0 failed / 10 ignored`、Redis startup integration `4 passed`；fmt/check/strict Clippy 与文档/凭据门全部通过。对已授权 WireGuard 主机 `11.8.0.5:22` 的只读 SSH readiness 检查返回 `Connection timed out`，未认证、未发送远程命令，未创建/启动/停止任何远端资源。E1 Linux SIGTERM/live 顺序与 final settlement 证据保持 `BLOCKED/NOT RUN`，容量/强杀仍未执行；需服务器网络/SSH 恢复后再按隔离计划进行只读预检和温和 SIGTERM 验证。
+
 
 
 

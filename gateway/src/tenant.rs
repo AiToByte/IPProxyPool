@@ -695,13 +695,16 @@ impl TenantManager {
     pub fn spawn_flusher(
         self: &Arc<Self>,
         interval: std::time::Duration,
-    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+    ) -> Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
         if !self.is_persistent() {
             return None;
         }
         let me = Arc::clone(self);
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // 慢机器上漏拍时按 Delay 补齐，不要 Burst 连发（连发会在
             // 积压后瞬间打出几百次 Redis 往返）。
@@ -717,7 +720,7 @@ impl TenantManager {
                 }
             }
         });
-        Some(stop_tx)
+        Some((stop_tx, task))
     }
 
     /// R2-3 默认 burst：`qps/10`（至少 1）。突发容忍与限流强度解耦，
@@ -1388,14 +1391,12 @@ mod tests {
     async fn flusher_stops_when_signaled() {
         let (manager, backend) = persistent_manager();
         register_default(&manager, "k1");
-        let stop = Arc::new(manager)
-            .spawn_flusher(std::time::Duration::from_millis(1))
+        let (stop, task) = Arc::new(manager)
+            .spawn_flusher(std::time::Duration::from_secs(60))
             .expect("persistent flusher");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let writes_before_stop = backend.writes();
         stop.send(()).expect("stop flusher");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        assert_eq!(backend.writes(), writes_before_stop);
+        task.await.expect("flusher joins after stop");
+        assert_eq!(backend.writes(), 0);
     }
 
     /// 缺省（memory）后端**必须**是完全的空操作：这是"升级后行为零变化"的保证，

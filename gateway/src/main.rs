@@ -800,8 +800,8 @@ async fn setup_gateway() -> Server {
         Err(_) => log::warn!("[Tenant] optional state load failed; starting from config defaults"),
     }
     let tenant_flush_secs = env_secs("TENANT_FLUSH_SECS", 5);
-    let flusher_stop = tenant_mgr.spawn_flusher(tenant_flush_secs);
-    if flusher_stop.is_some() {
+    let flusher_control = tenant_mgr.spawn_flusher(tenant_flush_secs);
+    if flusher_control.is_some() {
         log::info!(
             "[Tenant] write-through flusher online (max lag {}s)",
             tenant_flush_secs.as_secs()
@@ -1484,7 +1484,7 @@ async fn setup_gateway() -> Server {
     let runtime_health_for_signal = runtime_health.clone();
     let signal_tx = shutdown_tx;
     let flush_on_shutdown = tenant_mgr.clone();
-    let flusher_stop_on_shutdown = flusher_stop;
+    let flusher_control_on_shutdown = flusher_control;
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -1503,15 +1503,20 @@ async fn setup_gateway() -> Server {
         runtime_health_for_signal.request_drain();
         log::warn!("[Shutdown] signal received, stopping background respawns");
         let _ = signal_tx.send(true);
-        if let Some(stop) = flusher_stop_on_shutdown {
-            let _ = stop.send(());
-        }
-        // Wait for all admitted HTTP/CONNECT work to settle before the final flush.
-        // The deadline is bounded; a timeout is reported as best-effort persistence.
+        // Wait for all admitted HTTP/CONNECT work to settle before stopping the
+        // periodic flusher and running the final flush.
         const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
         let quiesced = runtime_health_for_signal
             .wait_for_quiescence(SHUTDOWN_DRAIN_TIMEOUT)
             .await;
+        if let Some((stop, task)) = flusher_control_on_shutdown {
+            let _ = stop.send(());
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => log::warn!("[Shutdown] tenant flusher task failed while stopping"),
+                Err(_) => log::warn!("[Shutdown] tenant flusher did not stop before deadline"),
+            }
+        }
         if !quiesced {
             log::warn!("[Shutdown] admission drain timed out; active work may remain");
         }
