@@ -32,7 +32,7 @@
 | `circuit_breaker.rs` | 13 | 熔断：Stream 消费＋隔离＋目标合法性守卫 | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
 | `ch_sink.rs` | 11 | 数仓泵：游标分页认领/去重/批量落库/hold 重放 | `ChSinkWorker/parse_entry/SeenIds` |
 | `analytics.rs` | 8 | 落库查询：SLA 窗口＋注入守卫 | `AnalyticsEngine/sla_sql/normalize_sla_rate` |
-| `tenant.rs` | 28 | 租户：鉴权/QPS/并发/计费（Free $0） | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
+| `tenant.rs` | 39 | 租户：鉴权/QPS/并发/计费（Free $0） | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
 | `vendor_arbitrage.rs` | 5 | 套利：付费 80/95＋免费 50/80 分档 | `arbitrage_action/free_pool_action/VendorArbitrageWorker` |
 | `startup_config.rs` | 6 | 启动配置：typed preflight、Admin/Gateway/Metrics/CONNECT/Redis/TenantStore/API key 解析与非 Unicode 错误拒绝、脱敏诊断 | `StartupConfigInput/StartupConfig/parse_startup_config` |
 | `metrics/mod.rs` | 29 | 指标：:9091 exposition，新增 CONNECT admission、字节与隧道寿命指标 | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
@@ -49,7 +49,7 @@
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
 | `health.rs` | 17 | 纯 liveness/readiness 状态决策模型与共享运行时快照、Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
-**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 466（其中 456 passed、10 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
+**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 477（其中 466 passed、11 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
@@ -232,7 +232,7 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `circuit_breaker.rs` | 13 | Breaker: stream consume + quarantine + target-validity guard | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
 | `ch_sink.rs` | 11 | Warehouse pump: cursor-paged claim/dedup/batch land/hold replay | `ChSinkWorker/parse_entry/SeenIds` |
 | `analytics.rs` | 8 | Warehouse queries: SLA window + injection guard | `AnalyticsEngine/sla_sql/normalize_sla_rate` |
-| `tenant.rs` | 28 | Tenants: auth/QPS/concurrency/billing (Free $0) | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
+| `tenant.rs` | 39 | Tenants: auth/QPS/concurrency/billing (Free $0) | `TenantManager/price_per_gb/resolve_api_key/is_loopback_listen` |
 | `vendor_arbitrage.rs` | 5 | Arbitrage: paid 80/95 + free 50/80 bands | `arbitrage_action/free_pool_action/VendorArbitrageWorker` |
 | `metrics/mod.rs` | 29 | Metrics: :9091 exposition, including CONNECT admission, bytes, and tunnel lifetime | `MetricsRegistry/FreePoolSnapshot/BreakerSnapshot` |
 | `prober.rs` | 7 | Liveness probe: dual-source fallback + client pool + idle eviction | `CanaryProber/extract_exit_ip/ProbeResult` |

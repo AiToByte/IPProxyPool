@@ -109,8 +109,7 @@ trait PersistBackend {
     /// 写入一条记录，并把它登记进索引（保证 `read_all` 下次能枚举到）。
     async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String>;
 
-    /// 枚举索引里的全部记录。**无法解析的记录在这里被丢弃并告警**（不是
-    /// 错误）——一条坏记录不该让整个启动加载失败。
+    /// Discover indexed and unindexed records; preserve decode failures for startup policy.
     async fn read_all(&self) -> Result<PersistedRecords, String>;
 }
 
@@ -119,6 +118,8 @@ struct PersistedRecords {
     records: Vec<(String, PersistedTenant)>,
     indexed_keys: std::collections::HashSet<String>,
     malformed_keys: Vec<String>,
+    orphan_keys: Vec<String>,
+    missing_index_keys: Vec<String>,
 }
 
 /// Result of restoring configured tenant state.
@@ -129,6 +130,7 @@ pub struct RestoreReport {
     pub has_persisted_records: bool,
     pub missing_configured_keys: Vec<String>,
     pub malformed_keys: Vec<String>,
+    pub orphan_keys: Vec<String>,
 }
 
 impl RestoreReport {
@@ -150,10 +152,10 @@ impl PersistBackend for RedisBackend {
         // （多个 key 顺序写时不必持有可变借用）。
         let mut conn = self.conn.clone();
         let hash_key = format!("{}:{key}", self.prefix);
-        // 一个 pipeline 同时写数据与索引：两者必须**同生同死**，否则会出现
-        // "数据在、索引没有"（永远加载不到）或"索引在、数据没有"（加载时
-        // 空记录）两种半状态。用 pipeline 换取原子性，比事后补偿简单。
+        // MULTI/EXEC prevents interleaving. Redis does not roll back runtime command
+        // errors; restore discovery also checks for index/hash inconsistencies.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         pipe.hset_multiple(&hash_key, &rec.to_hash()).ignore();
         pipe.sadd(format!("{}:index", self.prefix), key).ignore();
         pipe.query_async::<()>(&mut conn)
@@ -164,31 +166,81 @@ impl PersistBackend for RedisBackend {
     async fn read_all(&self) -> Result<PersistedRecords, String> {
         let mut conn = self.conn.clone();
         let index_key = format!("{}:index", self.prefix);
-        let keys: Vec<String> = redis::AsyncCommands::smembers(&mut conn, &index_key)
-            .await
-            .map_err(|e| format!("租户状态索引读取失败: {e}"))?;
-        let mut out = Vec::with_capacity(keys.len());
+        let keys: std::collections::HashSet<String> =
+            redis::AsyncCommands::smembers(&mut conn, &index_key)
+                .await
+                .map_err(|e| format!("租户状态索引读取失败: {e}"))?;
+        // Redis MATCH interprets glob metacharacters; the configured prefix is literal.
+        let key_prefix = format!("{}:", self.prefix);
+        let mut pattern = String::with_capacity(key_prefix.len() + 1);
+        for ch in key_prefix.chars() {
+            if matches!(ch, '*' | '?' | '[' | ']') || ch == char::from(92) {
+                pattern.push(char::from(92));
+            }
+            pattern.push(ch);
+        }
+        pattern.push('*');
+        let mut cursor = 0u64;
+        let mut discovered = std::collections::HashSet::new();
+        loop {
+            let (next, page): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(128)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| format!("租户状态键扫描失败: {e}"))?;
+            cursor = next;
+            for redis_key in page {
+                let Some(suffix) = redis_key.strip_prefix(&key_prefix) else {
+                    continue;
+                };
+                if suffix != "index" {
+                    discovered.insert(suffix.to_string());
+                }
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+        let mut missing_index_keys: Vec<String> = discovered.difference(&keys).cloned().collect();
+        missing_index_keys.sort();
+        let orphan_keys = missing_index_keys.clone();
+        let indexed_keys = keys.clone();
+        let mut keys: Vec<String> = keys.into_iter().collect();
+        keys.extend(missing_index_keys.iter().cloned());
+        keys.sort();
+        let mut records = Vec::with_capacity(keys.len());
         let mut malformed_keys = Vec::new();
         for key in &keys {
             let hash_key = format!("{}:{key}", self.prefix);
             let hash: std::collections::HashMap<String, String> =
-                redis::AsyncCommands::hgetall(&mut conn, &hash_key)
-                    .await
-                    .map_err(|e| format!("租户状态读取失败: {e}"))?;
+                match redis::AsyncCommands::hgetall(&mut conn, &hash_key).await {
+                    Ok(hash) => hash,
+                    Err(error) if error.code() == Some("WRONGTYPE") => {
+                        malformed_keys.push(key.clone());
+                        continue;
+                    }
+                    Err(error) => return Err(format!("tenant state read failed: {error}")),
+                };
             match PersistedTenant::from_hash(&hash) {
-                Some(rec) => out.push((key.clone(), rec)),
+                Some(record) => records.push((key.clone(), record)),
                 None => {
                     malformed_keys.push(key.clone());
                     log::warn!(
                         "[Tenant] 租户状态记录无法解析（余额字段缺失或非有限值），保留内存值"
-                    )
+                    );
                 }
             }
         }
         Ok(PersistedRecords {
-            records: out,
-            indexed_keys: keys.into_iter().collect(),
+            records,
+            indexed_keys,
             malformed_keys,
+            orphan_keys,
+            missing_index_keys,
         })
     }
 }
@@ -205,10 +257,14 @@ pub struct RecordingBackend {
     hashes: parking_lot::Mutex<
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     >,
+    index: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// 模拟写失败（Redis 抖动 / 网络断）。
     fail_keys: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     /// 成功写入次数（用于断言"重复 flush 不会重复写"）。
     writes: std::sync::atomic::AtomicUsize,
+    pause_writes: AtomicBool,
+    write_entered: tokio::sync::Notify,
+    resume_writes: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -219,11 +275,39 @@ impl RecordingBackend {
 
     /// 预置一条**原始** hash（可以是坏的），用于验证加载路径对脏数据的容忍。
     fn put_raw(&self, key: &str, hash: &[(&str, &str)]) {
+        self.index.lock().insert(key.to_string());
         let mut g = self.hashes.lock();
         g.insert(
             key.to_string(),
             hash.iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+    }
+
+    fn remove_hash(&self, key: &str) {
+        self.hashes.lock().remove(key);
+    }
+
+    fn remove_index_member(&self, key: &str) {
+        self.index.lock().remove(key);
+    }
+
+    #[allow(dead_code)]
+    fn store_hash_without_index(&self, key: &str, hash: &[(&str, &str)]) {
+        self.hashes.lock().insert(
+            key.to_string(),
+            hash.iter()
+                .map(|(field, value)| ((*field).to_string(), (*value).to_string()))
+                .collect(),
+        );
+    }
+
+    fn store_unindexed_raw(&self, key: &str, hash: &[(&str, &str)]) {
+        self.hashes.lock().insert(
+            key.to_string(),
+            hash.iter()
+                .map(|(field, value)| ((*field).to_string(), (*value).to_string()))
                 .collect(),
         );
     }
@@ -239,15 +323,33 @@ impl RecordingBackend {
     fn writes(&self) -> usize {
         self.writes.load(Ordering::Relaxed)
     }
+
+    fn pause_writes(&self) {
+        self.pause_writes.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_write_blocked(&self) {
+        self.write_entered.notified().await;
+    }
+
+    fn resume_writes(&self) {
+        self.pause_writes.store(false, Ordering::Release);
+        self.resume_writes.notify_one();
+    }
 }
 
 #[cfg(test)]
 impl PersistBackend for RecordingBackend {
     async fn write(&self, key: &str, rec: &PersistedTenant) -> Result<(), String> {
+        if self.pause_writes.load(Ordering::Acquire) {
+            self.write_entered.notify_one();
+            self.resume_writes.notified().await;
+        }
         if self.fail_keys.lock().contains(key) {
             return Err("租户状态写回失败（测试注入）".to_string());
         }
         // 守卫在 return 前自然释放，不跨 await（本函数体内无 await）。
+        self.index.lock().insert(key.to_string());
         self.hashes
             .lock()
             .insert(key.to_string(), rec.to_hash().into_iter().collect());
@@ -256,25 +358,42 @@ impl PersistBackend for RecordingBackend {
     }
 
     async fn read_all(&self) -> Result<PersistedRecords, String> {
+        let indexed_keys = self.index.lock().clone();
         let snapshot: Vec<(String, std::collections::HashMap<String, String>)> = self
             .hashes
             .lock()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let indexed_keys = snapshot.iter().map(|(key, _)| key.clone()).collect();
+        let unindexed_hashes = snapshot
+            .iter()
+            .map(|(key, _)| key.clone())
+            .filter(|key| !indexed_keys.contains(key))
+            .collect::<Vec<_>>();
         let mut records = Vec::new();
         let mut malformed_keys = Vec::new();
-        for (key, hash) in snapshot {
-            match PersistedTenant::from_hash(&hash) {
-                Some(record) => records.push((key, record)),
-                None => malformed_keys.push(key),
+        let orphan_keys = unindexed_hashes;
+        let missing_index_keys = orphan_keys.clone();
+        let keys: std::collections::HashSet<_> = indexed_keys
+            .iter()
+            .chain(missing_index_keys.iter())
+            .cloned()
+            .collect();
+        for key in &keys {
+            match snapshot.iter().find(|(stored_key, _)| stored_key == key) {
+                Some((_, hash)) => match PersistedTenant::from_hash(hash) {
+                    Some(record) => records.push((key.clone(), record)),
+                    None => malformed_keys.push(key.clone()),
+                },
+                None => malformed_keys.push(key.clone()),
             }
         }
         Ok(PersistedRecords {
             records,
             indexed_keys,
             malformed_keys,
+            orphan_keys,
+            missing_index_keys,
         })
     }
 }
@@ -602,32 +721,63 @@ impl TenantManager {
         let records = backend.read_all().await?;
         let mut report = RestoreReport {
             configured: self.tenants.len(),
-            has_persisted_records: !records.indexed_keys.is_empty(),
+            has_persisted_records: !records.indexed_keys.is_empty()
+                || !records.malformed_keys.is_empty()
+                || !records.records.is_empty()
+                || !records.orphan_keys.is_empty(),
             ..RestoreReport::default()
         };
-        report.malformed_keys = records.malformed_keys;
+        let malformed_keys: std::collections::HashSet<String> = records
+            .malformed_keys
+            .iter()
+            .chain(records.missing_index_keys.iter())
+            .filter(|key| self.tenants.contains_key(*key))
+            .cloned()
+            .collect();
         let mut restored_keys = std::collections::HashSet::new();
+        let mut orphan_keys: Vec<String> = records
+            .indexed_keys
+            .iter()
+            .chain(records.missing_index_keys.iter())
+            .chain(records.malformed_keys.iter())
+            .filter(|key| !self.tenants.contains_key(*key))
+            .cloned()
+            .collect();
         for (key, rec) in records.records {
             let Some(acct) = self.tenants.get(&key).map(|e| e.value().clone()) else {
+                orphan_keys.push(key);
                 continue;
             };
+            if malformed_keys.contains(&key) {
+                continue;
+            }
             acct.is_active.store(rec.is_active, Ordering::Relaxed);
             acct.balance_usd.store(rec.balance_usd, Ordering::Relaxed);
             acct.total_bytes.store(rec.total_bytes, Ordering::Relaxed);
             restored_keys.insert(key);
             report.applied += 1;
         }
+        let existing_state = report.has_persisted_records;
         report.missing_configured_keys = self
             .tenants
             .iter()
             .map(|entry| entry.key().clone())
             .filter(|key| {
-                !records.indexed_keys.is_empty()
-                    && !restored_keys.contains(key)
-                    && !records.indexed_keys.contains(key)
+                existing_state && !restored_keys.contains(key) && !malformed_keys.contains(key)
             })
             .collect();
         report.missing_configured_keys.sort();
+        report.malformed_keys = malformed_keys.into_iter().collect();
+        report.malformed_keys.sort();
+        report.orphan_keys = orphan_keys;
+        report.orphan_keys.sort();
+        report.orphan_keys.dedup();
+        if !report.orphan_keys.is_empty() {
+            log::warn!(
+                "[Tenant] ignored {} orphan persisted record(s); no tenants created",
+                report.orphan_keys.len()
+            );
+        }
         if !report.missing_configured_keys.is_empty() {
             log::warn!(
                 "[Tenant] configured tenant state is incomplete; {} record(s) remain at defaults",
@@ -1310,6 +1460,335 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated Redis at 127.0.0.1:48173"]
+    async fn redis_backend_restore_discovers_unindexed_hashes() {
+        let client = redis::Client::open("redis://127.0.0.1:48173/").unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let prefix = format!(
+            "restore:test:[{}]*?",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let backend = RedisBackend {
+            conn: conn.clone(),
+            prefix: prefix.clone(),
+        };
+        let manager = TenantManager::with_store(Store::Redis {
+            conn: conn.clone(),
+            prefix: prefix.clone(),
+        });
+        manager.register_tenant("test", "k1", 100, 100, 100);
+        let record = PersistedTenant {
+            tenant_id: "test".into(),
+            qps: 100,
+            max_concurrency: 100,
+            is_active: false,
+            balance_usd: 42.5,
+            total_bytes: 7,
+        };
+        backend.write("k1", &record).await.unwrap();
+        let mut conn = conn;
+        let legacy = format!("{prefix}:legacy");
+        redis::cmd("HSET")
+            .arg(&legacy)
+            .arg("balance_usd")
+            .arg("9")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let raw = backend.read_all().await.unwrap();
+        assert_eq!(raw.missing_index_keys, vec!["legacy"]);
+        assert!(raw
+            .records
+            .iter()
+            .any(|(key, value)| key == "legacy" && value.balance_usd == 9.0));
+        let restored = manager.load_persisted_report().await.unwrap();
+        assert_eq!(restored.applied, 1);
+        assert_eq!(restored.orphan_keys, vec!["legacy"]);
+        assert!(!restored.is_incomplete());
+        assert_eq!(manager.tenant_detail("k1").unwrap().balance_usd, 42.5);
+        assert!(manager.tenant_detail("legacy").is_none());
+
+        // A foreign prefixed value is diagnostic; a configured wrong type is incomplete.
+        redis::cmd("DEL")
+            .arg(&legacy)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        redis::cmd("SET")
+            .arg(&legacy)
+            .arg("not-a-hash")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let restored = manager.load_persisted_report().await.unwrap();
+        assert_eq!(restored.orphan_keys, vec!["legacy"]);
+        assert!(!restored.is_incomplete());
+        let configured = format!("{prefix}:k1");
+        redis::cmd("SET")
+            .arg(&configured)
+            .arg("not-a-hash")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let restored = manager.load_persisted_report().await.unwrap();
+        assert_eq!(restored.malformed_keys, vec!["k1"]);
+        assert_eq!(restored.applied, 0);
+        assert!(restored.is_incomplete());
+        redis::cmd("DEL")
+            .arg(&configured)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        redis::cmd("HSET")
+            .arg(&configured)
+            .arg("balance_usd")
+            .arg("5")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        redis::cmd("SREM")
+            .arg(format!("{prefix}:index"))
+            .arg("k1")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let restored = manager.load_persisted_report().await.unwrap();
+        assert_eq!(restored.malformed_keys, vec!["k1"]);
+        assert_eq!(restored.applied, 0);
+        assert_eq!(manager.tenant_detail("k1").unwrap().balance_usd, 42.5);
+        assert!(restored.is_incomplete());
+        // Delete only this test's exact keys, never the shared database.
+        redis::cmd("DEL")
+            .arg(&configured)
+            .arg(&legacy)
+            .arg(format!("{prefix}:index"))
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_unindexed_record_is_only_one_orphan_diagnostic() {
+        let backend = RecordingBackend::new();
+        backend.put_raw("k1", &[("balance_usd", "42.5")]);
+        backend.store_unindexed_raw("legacy", &[("balance_usd", "9")]);
+        let manager = TenantManager::with_store(Store::Recording(backend));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+        let report = manager.load_persisted_report().await.unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.orphan_keys, vec!["legacy"]);
+        assert!(report.malformed_keys.is_empty());
+        assert!(!report.is_incomplete());
+        assert!(manager.tenant_detail("legacy").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_unknown_record_is_orphan_only() {
+        let backend = RecordingBackend::new();
+        backend.put_raw("k1", &[("balance_usd", "42.5")]);
+        backend.put_raw("legacy", &[("balance_usd", "NaN")]);
+        let manager = TenantManager::with_store(Store::Recording(backend));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+        let report = manager.load_persisted_report().await.unwrap();
+        assert_eq!(report.orphan_keys, vec!["legacy"]);
+        assert!(report.malformed_keys.is_empty());
+        assert!(!report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn complete_restore_reports_all_configured_tenants_applied() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "k1",
+            &[
+                ("tenant_id", "t-1"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert_eq!(report.applied, 1);
+        assert!(report.has_persisted_records);
+        assert!(report.missing_configured_keys.is_empty());
+        assert!(report.malformed_keys.is_empty());
+        assert!(!report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn indexed_configured_tenant_with_missing_hash_is_incomplete() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "k1",
+            &[
+                ("tenant_id", "t-1"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        backend.remove_hash("k1");
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert!(report.has_persisted_records);
+        assert!(report.malformed_keys.contains(&"k1".to_string()));
+        assert!(report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn orphaned_persisted_tenant_does_not_resurrect_or_mark_restore_incomplete() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "orphan-key",
+            &[
+                ("tenant_id", "deleted-tenant"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "9.0"),
+                ("total_bytes", "1"),
+            ],
+        );
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert!(manager.tenant_detail("orphan-key").is_none());
+        assert!(report.has_persisted_records);
+        assert_eq!(report.orphan_keys, vec!["orphan-key"]);
+        assert_eq!(report.configured, 0);
+        assert_eq!(report.applied, 0);
+        assert!(!report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn configured_tenant_without_persisted_index_is_incomplete_after_restore_exists() {
+        let backend = RecordingBackend::new();
+        backend.store_unindexed_raw(
+            "other-key",
+            &[
+                ("tenant_id", "other"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-2", "k2", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert!(report.has_persisted_records);
+        assert_eq!(report.missing_configured_keys, vec!["k2"]);
+        assert!(report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn removed_persisted_index_member_reports_malformed_tenant() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "k1",
+            &[
+                ("tenant_id", "t-1"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "1"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        backend.remove_index_member("k1");
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert!(report.has_persisted_records);
+        assert!(report.orphan_keys.is_empty());
+        assert_eq!(report.malformed_keys, vec!["k1"]);
+        assert_eq!(report.applied, 0);
+        assert_eq!(manager.tenant_detail("k1").unwrap().balance_usd, 100.0);
+        assert!(report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn indexed_configured_tenant_with_missing_hash_is_reported_malformed() {
+        let backend = RecordingBackend::new();
+        backend.put_raw(
+            "k1",
+            &[
+                ("tenant_id", "t-1"),
+                ("qps", "100"),
+                ("max_concurrency", "100"),
+                ("is_active", "0"),
+                ("balance_usd", "42.5"),
+                ("total_bytes", "7"),
+            ],
+        );
+        backend.remove_hash("k1");
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert_eq!(report.applied, 0);
+        assert!(report.malformed_keys.contains(&"k1".to_string()));
+        assert!(report.is_incomplete());
+    }
+
+    #[tokio::test]
+    async fn malformed_indexed_tenant_record_is_reported_and_not_applied() {
+        let backend = RecordingBackend::new();
+        backend.put_raw("k1", &[("balance_usd", "NaN")]);
+        let manager = TenantManager::with_store(Store::Recording(Arc::clone(&backend)));
+        manager.register_tenant("t-1", "k1", 100, 100, 100);
+
+        let report = manager
+            .load_persisted_report()
+            .await
+            .expect("restore report");
+
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.malformed_keys, vec!["k1"]);
+        assert!(report.is_incomplete());
+        assert_eq!(manager.tenant_detail("k1").unwrap().balance_usd, 100.0);
+    }
+
+    #[tokio::test]
     async fn required_restore_reports_missing_configured_tenant_state() {
         let backend = RecordingBackend::new();
         backend.put_raw(
@@ -1397,6 +1876,31 @@ mod tests {
         stop.send(()).expect("stop flusher");
         task.await.expect("flusher joins after stop");
         assert_eq!(backend.writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn flusher_stop_waits_for_in_progress_persist_write_then_joins() {
+        let (manager, backend) = persistent_manager();
+        register_default(&manager, "k1");
+        backend.pause_writes();
+        let flusher_manager = Arc::new(manager);
+        let (stop, task) = flusher_manager
+            .spawn_flusher(std::time::Duration::from_millis(1))
+            .expect("persistent test flusher");
+
+        backend.wait_until_write_blocked().await;
+        let stopped = tokio::spawn(async move {
+            stop.send(()).expect("send stop");
+            task.await.expect("flusher task");
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !stopped.is_finished(),
+            "active write must finish before join"
+        );
+        backend.resume_writes();
+        stopped.await.expect("stop and join flusher");
+        assert_eq!(backend.writes(), 1);
     }
 
     /// 缺省（memory）后端**必须**是完全的空操作：这是"升级后行为零变化"的保证，

@@ -44,12 +44,14 @@ impl TcpConnector for TokioTcpConnector {
 /// 未来接入时仅需替换此处 `connect` 内部为 `tokio_uring::net::TcpStream::connect`，
 /// 其余调用点无需改动。
 #[cfg(unix)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UringTcpConnector {
     pub timeout: Duration,
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 #[async_trait]
 impl TcpConnector for UringTcpConnector {
     async fn connect(&self, addr: &str) -> io::Result<TcpStream> {

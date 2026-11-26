@@ -19,18 +19,19 @@
 
 | 指标 | 值 | 复现命令 |
 | ---- | -- | -------- |
-| 单元测试通过数 | **456** | `cd gateway && cargo test --locked --workspace` |
+| 单元测试通过数 | **466** | `cd gateway && cargo test --locked --workspace` |
 | 单元测试失败数 | **0** | 同上 |
-| 忽略测试数 | **10** | 同上 |
-| 其中：真 live 测试 | **6** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
+| 忽略测试数 | **11** | 同上 |
+| 其中：真 live 测试 | **7** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
 | 其中：串行分配契约测试 | 3 | 需 `--test-threads=1 --include-ignored --exact` |
 | release bandit 臂数 | 8 臂均 <200ns | `cargo test --locked --release bandit` |
 | Python 静态门 | **22** 个 | `ls tools/check_*.py`（口径：`tools/` 下 `check_*.py` 且已接入 CI） |
 
-### 10 个忽略测试的构成
+### 11 个忽略测试的构成
 
-**6 个真 live 测试**（依赖外部服务，故默认忽略）：
+**7 个真 live 测试**（依赖外部服务，故默认忽略）：
 
+- `tenant::tests::redis_backend_restore_discovers_unindexed_hashes` (isolated local Redis on port 48173; unique prefix, seeds and deletes only its own keys)
 - `analytics::tests::live_insert_and_sla_roundtrip`（需 ClickHouse）
 - `analytics::tests::live_trace_id_roundtrip`（需 ClickHouse；OPT-R18 P1-1 的
   「按 trace_id 点查」端到端验证，对应 `docs/OPERATION.md` §4.3）
@@ -66,10 +67,17 @@ cargo test --locked --workspace router::tests::opt_r11_b1_pick_weighted_streamin
 改动测试后：
 
 1. 跑全量：`cd gateway && cargo test --locked --workspace`，读 `test result:` 行。
-2. 若 `ignored` 数变了，同步更新上面「10 个忽略测试的构成」清单。
+2. 若 `ignored` 数变了，同步更新上面「11 个忽略测试的构成」清单。
 3. 更新本文件表格的三个数字。
 4. 跑 `python tools/check_doc_consistency.py`，它会把所有活文档的数字与本文件对齐。
 5. 在 `EXEC_LOG.md` 记录实测输出。
 
 **不要**手工去改 `CHANGELOG.md` / `TASK_PLAN.md` / `plan/*.md` / `EXEC_LOG.md`
 里的历史数字——那些是史实，改了就等于伪造记录。
+
+### 2026-11-24 local restore verification
+
+- Default workspace run: **466 passed / 0 failed / 11 ignored** in the binary unit target; **11 passed / 0 failed** in `redis_startup` integration target (reported separately).
+- The ignored tenant Redis regression was explicitly run: **1 passed**, using isolated Docker Redis 7 on loopback port 48173. Covers literal glob prefixes, unindexed discovery, configured index loss, wrong types and orphan-only classification.
+- fmt/check/strict Clippy passed. Coverage was not remeasured: this toolchain lacks `llvm-tools-preview`; the historical coverage baseline is not a measurement of this diff.
+- No remote Linux/SIGTERM/capacity tests were run for this slice.
