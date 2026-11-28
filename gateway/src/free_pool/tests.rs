@@ -14,19 +14,16 @@ fn api_source_prefilters_by_anonymity() {
     // NEXT-B1：Geonode `anonymityLevel` 预筛——transparent 声明丢弃（质检预算集中到
     // elite/anonymous；历史 pass 全为 Elite，见步骤 18/19/演示）；字段缺失 fail-open。
     let body = r#"{"data":[
-            {"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"elite"},
-            {"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE","anonymityLevel":"anonymous"},
-            {"ip":"192.0.2.1","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"transparent"},
-            {"ip":"192.0.2.2","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"TRANSPARENT"},
-            {"ip":"192.0.2.3","port":"8080","protocols":["http"],"country":"US"},
-            {"ip":"192.0.2.4","port":"8080","protocols":["socks5"],"country":"US","anonymityLevel":"elite"}
+            {"ip":"8.8.8.7","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"elite"},
+            {"ip":"1.1.1.9","port":3128,"protocols":["https"],"country":"DE","anonymityLevel":"anonymous"},
+            {"ip":"9.9.9.1","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"transparent"},
+            {"ip":"9.9.9.2","port":"8080","protocols":["http"],"country":"US","anonymityLevel":"TRANSPARENT"},
+            {"ip":"9.9.9.3","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"9.9.9.4","port":"8080","protocols":["socks5"],"country":"US","anonymityLevel":"elite"}
         ]}"#;
     let nodes = ApiSource::parse("geonode", body);
     let ips: Vec<&str> = nodes.iter().map(|n| n.ip.as_str()).collect();
-    assert_eq!(
-        ips,
-        vec!["203.0.113.7", "198.51.100.9", "192.0.2.3", "192.0.2.4"]
-    );
+    assert_eq!(ips, vec!["8.8.8.7", "1.1.1.9", "9.9.9.3", "9.9.9.4"]);
 }
 
 #[tokio::test]
@@ -56,10 +53,10 @@ async fn api_source_fetches_multiple_pages() {
                 .collect::<String>();
             let body = match page.as_str() {
                 "2" => {
-                    r#"{"data":[{"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
+                    r#"{"data":[{"ip":"1.1.1.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
                 }
                 _ => {
-                    r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#
+                    r#"{"data":[{"ip":"8.8.8.7","port":"8080","protocols":["http"],"country":"US"}]}"#
                 }
             };
             let _ = s
@@ -82,10 +79,7 @@ async fn api_source_fetches_multiple_pages() {
     assert!(!outcome.not_modified);
     let mut ips: Vec<String> = outcome.nodes.iter().map(|n| n.ip.clone()).collect();
     ips.sort();
-    assert_eq!(
-        ips,
-        vec!["198.51.100.9".to_string(), "203.0.113.7".to_string()]
-    );
+    assert_eq!(ips, vec!["1.1.1.9".to_string(), "8.8.8.7".to_string()]);
 }
 
 #[tokio::test]
@@ -119,9 +113,9 @@ async fn b10_first_page_uses_etag_second_fetch_304() {
                 "HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n".to_string()
             } else {
                 let body = if page == "2" {
-                    r#"{"data":[{"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
+                    r#"{"data":[{"ip":"1.1.1.9","port":3128,"protocols":["https"],"country":"DE"}]}"#
                 } else {
-                    r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#
+                    r#"{"data":[{"ip":"8.8.8.7","port":"8080","protocols":["http"],"country":"US"}]}"#
                 };
                 format!(
                         "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -140,16 +134,16 @@ async fn b10_first_page_uses_etag_second_fetch_304() {
     // 首页 304 无产出，次页照常：整体 Ok 且非 not_modified，只剩次页节点。
     assert!(!second.not_modified);
     assert_eq!(second.nodes.len(), 1);
-    assert_eq!(second.nodes[0].ip, "198.51.100.9");
+    assert_eq!(second.nodes[0].ip, "1.1.1.9");
 }
 
 #[test]
 fn api_source_parses_geonode_shape() {
     let body = r#"{"data":[
-            {"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"},
-            {"ip":"198.51.100.9","port":3128,"protocols":["https"],"country":"DE"},
+            {"ip":"8.8.8.7","port":"8080","protocols":["http"],"country":"US"},
+            {"ip":"1.1.1.9","port":3128,"protocols":["https"],"country":"DE"},
             {"ip":"bad","port":"x","protocols":["http"],"country":"US"},
-            {"ip":"192.0.2.1","port":"1080","protocols":["socks5"],"country":"US"}
+            {"ip":"9.9.9.1","port":"1080","protocols":["socks5"],"country":"US"}
         ]}"#;
     let nodes = ApiSource::parse("geonode", body);
     // 坏行丢弃；socks5 解析保留（Phase 1 由 Verifier 跳过，不在此处丢）。
@@ -163,18 +157,15 @@ fn api_source_parses_geonode_shape() {
 
 #[test]
 fn html_source_extracts_ip_ports() {
-    let html = r#"<table><tr><td>203.0.113.7</td><td>8080</td><td>yes</td></tr>
+    let html = r#"<table><tr><td>8.8.8.7</td><td>8080</td><td>yes</td></tr>
             <tr><td>999.1.1.1</td><td>80</td></tr>
-            <tr><td>198.51.100.9:3128</td></tr>
+            <tr><td>1.1.1.9:3128</td></tr>
             <tr><td>10.0.0.1</td><td>70000</td></tr></table>"#;
     let nodes = HtmlSource::extract("fpl", html, FreeProto::Http);
     // 非法 octet/超范围端口丢弃；`ip:port` 紧凑形态同样识别。
     assert_eq!(nodes.len(), 2);
-    assert_eq!((nodes[0].ip.as_str(), nodes[0].port), ("203.0.113.7", 8080));
-    assert_eq!(
-        (nodes[1].ip.as_str(), nodes[1].port),
-        ("198.51.100.9", 3128)
-    );
+    assert_eq!((nodes[0].ip.as_str(), nodes[0].port), ("8.8.8.7", 8080));
+    assert_eq!((nodes[1].ip.as_str(), nodes[1].port), ("1.1.1.9", 3128));
     assert!(nodes
         .iter()
         .all(|n| n.proto == FreeProto::Http && n.source == "fpl"));
@@ -182,7 +173,7 @@ fn html_source_extracts_ip_ports() {
 
 #[test]
 fn github_source_parses_line_list() {
-    let body = "203.0.113.7:8080\n\n# comment\n198.51.100.9:3128 socks5\nbad-line\n10.0.0.1:0\n";
+    let body = "8.8.8.7:8080\n\n# comment\n1.1.1.9:3128 socks5\nbad-line\n10.0.0.1:0\n";
     let nodes = GitHubSource::parse_with("gh", body, FreeProto::Http);
     assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].proto, FreeProto::Http);
@@ -201,6 +192,143 @@ fn github_parse_honors_default_proto_and_rejects_junk() {
     // 行内标记优先于默认值。
     let mixed = GitHubSource::parse_with("opl", "9.9.9.9:1080 socks4\n", FreeProto::Socks5);
     assert_eq!(mixed[0].proto, FreeProto::Socks4);
+}
+
+#[test]
+fn uri_source_accepts_strict_uri_feeds() {
+    let body = "http://8.8.8.8:8080\nsocks4://1.1.1.1:1080\nsocks5://9.9.9.9:1080\n8.8.4.4:3128\n";
+    let nodes = UriSource::parse("uri", body);
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(
+        nodes.iter().map(|n| n.proto).collect::<Vec<_>>(),
+        vec![FreeProto::Http, FreeProto::Socks4, FreeProto::Socks5]
+    );
+}
+
+#[tokio::test]
+async fn uri_source_fetches_and_honors_etag_not_modified() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        for round in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let size = socket.read(&mut request).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..size]);
+            let response = if round == 0 {
+                b"HTTP/1.1 200 OK\r\nETag: v1\r\nContent-Length: 20\r\nConnection: close\r\n\r\nhttp://8.8.8.8:8080\n".as_slice()
+            } else {
+                assert!(request.to_ascii_lowercase().contains("if-none-match: v1"));
+                b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".as_slice()
+            };
+            socket.write_all(response).await.unwrap();
+        }
+    });
+    let source = UriSource::new("uri0", format!("http://127.0.0.1:{port}/list.txt"));
+    let client = reqwest::Client::new();
+    let first = source.fetch(&client).await.unwrap();
+    assert_eq!(first.nodes.len(), 1);
+    assert!(!first.not_modified);
+    let second = source.fetch(&client).await.unwrap();
+    assert!(second.not_modified);
+}
+
+#[test]
+fn uri_source_accepts_scheme_case_insensitively() {
+    let nodes = UriSource::parse("uri", "HTTP://8.8.8.8:80\nSoCkS5://1.1.1.1:1080\n");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].proto, FreeProto::Http);
+    assert_eq!(nodes[1].proto, FreeProto::Socks5);
+}
+
+#[test]
+fn uri_source_rejects_special_use_ipv4_ranges() {
+    for ip in [
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "100.64.0.1",
+        "198.18.0.1",
+        "192.0.0.1",
+    ] {
+        let line = format!("http://{ip}:8080");
+        assert!(UriSource::parse("uri", &line).is_empty(), "accepted {ip}");
+    }
+}
+
+#[test]
+fn intake_cap_round_robins_sources_before_refilling_earlier_sources() {
+    let raws = (0..4)
+        .map(|i| raw(&format!("8.8.8.{i}"), "early"))
+        .chain((0..4).map(|i| raw(&format!("1.1.1.{i}"), "late")))
+        .collect();
+    let admitted = cap_intake(raws, 4, &HashSet::new());
+    let sources: Vec<_> = admitted.iter().map(|node| node.source.as_str()).collect();
+    assert_eq!(sources, vec!["early", "late", "early", "late"]);
+}
+
+#[tokio::test]
+async fn paginated_api_rejects_oversized_and_error_responses() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for response in [
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            super::MAX_SOURCE_BODY_BYTES + 1
+        ),
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string(),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = response.into_bytes();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).await;
+                socket.write_all(&response).await.unwrap();
+            }
+        });
+        let source =
+            ApiSource::new("pages", format!("http://127.0.0.1:{port}/?limit=1")).with_pages(2);
+        assert!(source.fetch(&reqwest::Client::new()).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn raw_source_rejects_oversized_and_error_responses() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for response in [
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            super::MAX_SOURCE_BODY_BYTES + 1
+        ),
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string(),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = response.into_bytes();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(&response).await.unwrap();
+        });
+        let source = GitHubSource::new(
+            "raw",
+            format!("http://127.0.0.1:{port}/list"),
+            FreeProto::Http,
+        );
+        assert!(source.fetch(&reqwest::Client::new()).await.is_err());
+    }
+}
+
+#[test]
+fn uri_source_rejects_credentials_paths_and_invalid_hosts() {
+    let body = "http://user:pass@8.8.8.8:80\nhttp://8.8.8.8:80/\nhttp://8.8.8.8:80?x=1\nhttp://8.8.8.8:80#x\nhttp://example.com:80\nhttps://8.8.8.8:443\nsocks5://127.0.0.1:1080\nhttp://8.8.8.8:0\n";
+    assert!(UriSource::parse("uri", body).is_empty());
 }
 
 #[test]
@@ -260,7 +388,7 @@ async fn github_source_fetches_from_local_server() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut buf = [0u8; 1024];
         let _ = s.read(&mut buf).await;
-        let body = "203.0.113.7:8080\n";
+        let body = "8.8.8.7:8080\n";
         let _ = s
             .write_all(
                 format!(
@@ -280,7 +408,7 @@ async fn github_source_fetches_from_local_server() {
     let outcome = src.fetch(&client).await.expect("fetch");
     assert!(!outcome.not_modified);
     assert_eq!(outcome.nodes.len(), 1);
-    assert_eq!(outcome.nodes[0].ip, "203.0.113.7");
+    assert_eq!(outcome.nodes[0].ip, "8.8.8.7");
 }
 
 #[tokio::test]
@@ -316,7 +444,7 @@ async fn github_source_etag_not_modified() {
                     .write_all(b"HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n")
                     .await;
             } else {
-                let body = "203.0.113.7:8080\n";
+                let body = "8.8.8.7:8080\n";
                 let _ = s
                         .write_all(
                             format!(
@@ -401,8 +529,7 @@ async fn spawn_etag_stub(
 #[tokio::test]
 async fn api_source_etag_not_modified() {
     // R3-5：ApiSource 礼貌轮询（对齐 GitHub）：首轮存 ETag，次轮 304→not_modified。
-    let body =
-        r#"{"data":[{"ip":"203.0.113.7","port":"8080","protocols":["http"],"country":"US"}]}"#;
+    let body = r#"{"data":[{"ip":"8.8.8.7","port":"8080","protocols":["http"],"country":"US"}]}"#;
     let (port, seen) = spawn_etag_stub(body).await;
     let client = reqwest::Client::new();
     let src = ApiSource::new("api", format!("http://127.0.0.1:{port}/api"));
@@ -420,7 +547,7 @@ async fn api_source_etag_not_modified() {
 #[tokio::test]
 async fn html_source_etag_not_modified() {
     // R3-5：HtmlSource 礼貌轮询同理。
-    let body = "<table><tr><td>203.0.113.7</td><td>8080</td></tr></table>";
+    let body = "<table><tr><td>8.8.8.7</td><td>8080</td></tr></table>";
     let (port, seen) = spawn_etag_stub(body).await;
     let client = reqwest::Client::new();
     let src = HtmlSource::new(
@@ -545,13 +672,17 @@ fn b1_bogon_ips_never_routable() {
     ] {
         assert!(!is_routable_ip(bad), "{bad} must not routable");
     }
-    for good in ["8.8.8.8", "1.1.1.1", "203.0.113.7", " 9.9.9.9 "] {
+    for good in ["8.8.8.8", "1.1.1.1", "9.9.9.9", "172.15.0.1", "172.32.0.1"] {
         assert!(is_routable_ip(good), "{good} must routable");
     }
     // 边界：172.15/172.32 不是私网；x.y.z.0 主机位零放行。
     assert!(is_routable_ip("172.15.0.1"));
     assert!(is_routable_ip("172.32.0.1"));
-    assert!(is_routable_ip("203.0.113.0"));
+    assert!(!is_routable_ip("192.0.2.1"));
+    assert!(!is_routable_ip("198.51.100.1"));
+    assert!(!is_routable_ip("203.0.113.7"));
+    assert!(!is_routable_ip("100.64.0.1"));
+    assert!(!is_routable_ip("198.18.0.1"));
 }
 
 #[test]
@@ -1132,7 +1263,7 @@ fn b6_checker_client_cache_reuses_and_bounds() {
 
 #[test]
 fn b8_weighted_truncation_prefers_elite_then_source_order() {
-    // OPT-R4 B8：Elite 历史优先；同级按源首次出现序（api>html>github）。
+    // Elite history wins first, with first-seen source order as the tie-breaker.
     let mut raws = Vec::new();
     for i in 0..10 {
         raws.push(raw(&format!("10.7.0.{i}"), "gh0"));
@@ -1146,8 +1277,6 @@ fn b8_weighted_truncation_prefers_elite_then_source_order() {
         .collect();
     let capped = cap_intake(raws, 3, &elite);
     assert_eq!(capped.len(), 3);
-    // Elite 历史优先（gh0 的 Elite 排 api0 的 Elite 之前：源序次之）：
-    // 再接最早源首个非 Elite（gh0 10.7.0.0，而非 api0）。
     assert_eq!(capped[0].ip, "10.7.0.3");
     assert_eq!(capped[1].ip, "10.8.0.9");
     assert_eq!(capped[2].ip, "10.7.0.0");

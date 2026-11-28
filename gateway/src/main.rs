@@ -149,6 +149,7 @@ mod pool;
 mod prober;
 mod redis_shard;
 mod router;
+mod shutdown;
 mod socks_bridge;
 mod socks_handshake;
 mod startup_config;
@@ -164,7 +165,7 @@ use circuit_breaker::{PassiveCircuitBreaker, DELTA_CHANNEL};
 use dashmap::DashMap;
 use free_pool::{
     FreePoolConfig, FreePoolWorker, API_MAX_PAGES, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE,
-    DEFAULT_GITHUB_URL, DEFAULT_HTML_URL,
+    DEFAULT_GITHUB_URL, DEFAULT_HTML_URL, DEFAULT_URI_URL,
 };
 use gateway::{is_loopback_addr, SmartProxyGateway};
 use metrics::{serve_metrics, MetricsRegistry};
@@ -321,14 +322,17 @@ pub fn clamp_bridge_timeout(tt: Duration) -> Duration {
     tt.min(Duration::from_secs(router::QUARANTINE_MAX_TTL_SECS))
 }
 
-/// FreePool 逗号分隔 URL 列表读值（去空白＋去空项＋仅 http/https，file/dict/gopher
-/// 一律过滤防 SSRF；缺省走 default）。
 fn split_env_list(key: &str, default: &str) -> Vec<String> {
+    split_uri_env_list(key, default)
+}
+
+fn split_uri_env_list(key: &str, default: &str) -> Vec<String> {
     env_str(key, default)
         .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        .map(str::trim)
+        .filter_map(|value| reqwest::Url::parse(value).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        .map(|url| url.to_string())
         .collect()
 }
 
@@ -395,21 +399,8 @@ fn main() {
     server.run_forever();
 }
 
-enum BoundedFlushError<E> {
-    Failed(E),
-    TimedOut,
-}
-
-async fn bounded_flush<F, T, E>(flush: F, timeout: Duration) -> Result<T, BoundedFlushError<E>>
-where
-    F: std::future::Future<Output = Result<T, E>>,
-{
-    match tokio::time::timeout(timeout, flush).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(BoundedFlushError::Failed(error)),
-        Err(_) => Err(BoundedFlushError::TimedOut),
-    }
-}
+#[cfg(test)]
+use shutdown::{bounded_flush, BoundedFlushError};
 
 /// Poll the configured data-plane socket until Pingora has successfully bound it.
 ///
@@ -800,7 +791,9 @@ async fn setup_gateway() -> Server {
         Err(_) => log::warn!("[Tenant] optional state load failed; starting from config defaults"),
     }
     let tenant_flush_secs = env_secs("TENANT_FLUSH_SECS", 5);
-    let flusher_control = tenant_mgr.spawn_flusher(tenant_flush_secs);
+    let flusher_control = tenant_mgr
+        .spawn_flusher(tenant_flush_secs)
+        .map(shutdown::TenantFlusher::new);
     if flusher_control.is_some() {
         log::info!(
             "[Tenant] write-through flusher online (max lag {}s)",
@@ -896,6 +889,7 @@ async fn setup_gateway() -> Server {
                 .clamp(1, API_MAX_PAGES),
             html_urls: split_env_list("FREE_HTML_URLS", DEFAULT_HTML_URL),
             github_urls: split_env_list("FREE_GITHUB_URLS", DEFAULT_GITHUB_URL),
+            uri_urls: split_uri_env_list("FREE_URI_URLS", DEFAULT_URI_URL),
             fetch_interval: env_secs("FREE_FETCH_INTERVAL_SECS", 600),
             ttl: clamp_free_ttl(env_secs("FREE_TTL_SECS", 1800)),
             verify_timeout: env_secs("FREE_VERIFY_TIMEOUT_SECS", 3),
@@ -1500,38 +1494,20 @@ async fn setup_gateway() -> Server {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        runtime_health_for_signal.request_drain();
-        log::warn!("[Shutdown] signal received, stopping background respawns");
-        let _ = signal_tx.send(true);
-        // Wait for all admitted HTTP/CONNECT work to settle before stopping the
-        // periodic flusher and running the final flush.
-        const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-        let quiesced = runtime_health_for_signal
-            .wait_for_quiescence(SHUTDOWN_DRAIN_TIMEOUT)
-            .await;
-        if let Some((stop, task)) = flusher_control_on_shutdown {
-            let _ = stop.send(());
-            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, task).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => log::warn!("[Shutdown] tenant flusher task failed while stopping"),
-                Err(_) => log::warn!("[Shutdown] tenant flusher did not stop before deadline"),
-            }
+        let report = shutdown::shutdown_tenants(
+            runtime_health_for_signal,
+            signal_tx,
+            flush_on_shutdown,
+            flusher_control_on_shutdown,
+            Duration::from_secs(5),
+        )
+        .await;
+        if report.locally_complete() {
+            log::info!("[Shutdown] local tenant shutdown completed: {report:?}");
+        } else {
+            log::warn!("[Shutdown] local tenant shutdown incomplete: {report:?}");
         }
-        if !quiesced {
-            log::warn!("[Shutdown] admission drain timed out; active work may remain");
-        }
-        // Keep the tenant flush best-effort but strictly bounded; Pingora owns the
-        // listener grace period while this watcher continues independently.
-        const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-        match bounded_flush(flush_on_shutdown.flush_dirty(), SHUTDOWN_FLUSH_TIMEOUT).await {
-            Ok(flushed) => log::info!("[Shutdown] tenant flush completed: {flushed} updates"),
-            Err(BoundedFlushError::Failed(_)) => {
-                log::warn!("[Shutdown] tenant flush failed; some updates may not be persisted")
-            }
-            Err(BoundedFlushError::TimedOut) => {
-                log::warn!("[Shutdown] tenant flush timed out after {SHUTDOWN_FLUSH_TIMEOUT:?}")
-            }
-        }
+        // Pingora still owns listener/runtime termination independently.
     });
     // 5. Pingora data plane.
     let opt = Opt::parse_args();
@@ -1938,17 +1914,16 @@ mod tests {
 
     #[test]
     fn split_env_list_filters_non_http() {
-        // SSRF 护栏：仅 http/https 源保留，file/dict/gopher 一律过滤。
+        // URL parsing allows case-insensitive HTTP schemes and rejects non-HTTP protocols.
         std::env::set_var(
             "R2T_FREE_URLS",
-            "https://a.example/list, file:///etc/passwd ,dict://b:80/x,, http://c.example/p",
+            "https://a.example/list, file:///etc/passwd ,dict://b:80/x,, HTTP://c.example/p",
         );
-        let urls = split_env_list("R2T_FREE_URLS", "https://dflt.example/");
+        let urls = split_env_list("R2T_FREE_URLS", "HTTPS://dflt.example/");
         assert_eq!(urls, vec!["https://a.example/list", "http://c.example/p"]);
         std::env::remove_var("R2T_FREE_URLS");
-        // 缺省值同样经过滤（默认皆 https，不受影响）。
         assert_eq!(
-            split_env_list("R2T_FREE_URLS_MISSING_XYZ", "https://dflt.example/"),
+            split_env_list("R2T_FREE_URLS_MISSING_XYZ", "HTTPS://dflt.example/"),
             vec!["https://dflt.example/"]
         );
     }

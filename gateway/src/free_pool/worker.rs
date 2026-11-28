@@ -17,6 +17,8 @@ pub struct FreePoolConfig {
     pub api_pages: usize,
     pub html_urls: Vec<String>,
     pub github_urls: Vec<String>,
+    /// Strict proxy URI lists (one `scheme://IPv4:port` per line).
+    pub uri_urls: Vec<String>,
     pub fetch_interval: Duration,
     pub ttl: Duration,
     pub verify_timeout: Duration,
@@ -54,6 +56,7 @@ pub const DEFAULT_HTML_URL: &str = "https://free-proxy-list.net/";
 /// （`scheme://ip:port`形态不兼容parse_with）／proxyspace.pro（双路200＋3901/3232行形态对但首行
 /// 0.0.0.0污染＋体量大记备份）／hproxy（双路200＋43k行形态对但淹没intake记备份）。
 pub const DEFAULT_GITHUB_URL: &str = "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,https://api.openproxylist.xyz/http.txt,https://api.openproxylist.xyz/socks5.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt,https://cdn.jsdelivr.net/gh/relayglass/free-proxy-list@main/protocol/http/http.txt,https://cdn.jsdelivr.net/gh/relayglass/free-proxy-list@main/protocol/socks5/socks5.txt";
+pub const DEFAULT_URI_URL: &str = "";
 pub const DEFAULT_FULL_CHECK_BASE: &str = "https://httpbin.org";
 
 /// FullCheck 任务装配 helper（许可拿不到按失败计，沿 R2-7 `?`-in-bool 教训）。
@@ -114,8 +117,11 @@ impl FreePoolWorker {
     ) -> Self {
         let ttl = config.ttl;
         let max_nodes = config.max_nodes;
-        let n_sources =
-            (config.api_urls.len() + config.html_urls.len() + config.github_urls.len()).max(1);
+        let n_sources = (config.api_urls.len()
+            + config.html_urls.len()
+            + config.github_urls.len()
+            + config.uri_urls.len())
+        .max(1);
         let guards = (0..n_sources)
             .map(|_| SourceGuard::new(config.max_zero_cycles, config.suspend_retry_every))
             .collect();
@@ -184,14 +190,14 @@ impl FreePoolWorker {
         leaked
     }
 
-    /// 组装三类源（配置序＝去重优先级：api > html > github；URL 集合变化时重建
-    /// guards 以对齐下标）。
+    /// Assemble API, HTML, raw and opt-in URI sources. Each source has its own breaker.
     fn build_sources(&mut self) -> Vec<Box<dyn Source>> {
         // 先克隆 URL 表（避免 config 不可变借用与 intern_name 可变借用冲突）。
         let api_urls = self.config.api_urls.clone();
         let api_pages = self.config.api_pages;
         let html_urls = self.config.html_urls.clone();
         let github_urls = self.config.github_urls.clone();
+        let uri_urls = self.config.uri_urls.clone();
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         for (i, url) in api_urls.iter().enumerate() {
             let name = self.intern_name(format!("api{i}"));
@@ -223,6 +229,10 @@ impl FreePoolWorker {
                 url.clone(),
                 default_proto,
             )));
+        }
+        for (i, url) in uri_urls.iter().enumerate() {
+            let name = self.intern_name(format!("uri{i}"));
+            sources.push(Box::new(UriSource::new(name, url.clone())));
         }
         if self.guards.len() != sources.len() {
             self.guards = (0..sources.len())

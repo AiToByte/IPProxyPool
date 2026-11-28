@@ -19,7 +19,7 @@
 
 | 指标 | 值 | 复现命令 |
 | ---- | -- | -------- |
-| 单元测试通过数 | **466** | `cd gateway && cargo test --locked --workspace` |
+| 单元测试通过数 | **487** | `cd gateway && cargo test --locked --workspace` |
 | 单元测试失败数 | **0** | 同上 |
 | 忽略测试数 | **11** | 同上 |
 | 其中：真 live 测试 | **7** | 需外部依赖（CH/Redis/mock 上游），不进快速门 |
@@ -27,7 +27,12 @@
 | release bandit 臂数 | 8 臂均 <200ns | `cargo test --locked --release bandit` |
 | Python 静态门 | **22** 个 | `ls tools/check_*.py`（口径：`tools/` 下 `check_*.py` 且已接入 CI） |
 
-### 11 个忽略测试的构成
+### 本轮验证（2026-11-27，Windows offline）
+
+- Workspace unit binary: **487 passed / 0 failed / 11 ignored**; `redis_startup` integration: **11 passed / 0 failed**.
+- `cargo fmt --manifest-path gateway/Cargo.toml --check`, all-target workspace `cargo check`, strict all-target Clippy, component table, documentation consistency, Admin routes, observability truth and plaintext-credential gates passed.
+- Coverage was not remeasured. No current-revision Linux/live SIGTERM/runtime teardown, capacity, alert receiver or rollback tests were run.
+
 
 **7 个真 live 测试**（依赖外部服务，故默认忽略）：
 

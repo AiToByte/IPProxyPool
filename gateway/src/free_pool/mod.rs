@@ -38,6 +38,9 @@
 
 use std::time::Duration;
 use std::time::Instant;
+
+/// Maximum decoded response body accepted from any public free-proxy source.
+pub const MAX_SOURCE_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// 抓取协议（P2：全协议进池；出站形态见 `egress_of`，选路隔离见 `RouterEngine::matches`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreeProto {
@@ -100,6 +103,30 @@ pub trait Source: Send + Sync {
     async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String>;
 }
 
+/// Read a successful source response with a hard cap on decoded bytes.
+async fn read_source_body(resp: reqwest::Response) -> Result<String, String> {
+    if !resp.status().is_success() {
+        return Err(format!("source returned HTTP {}", resp.status()));
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_SOURCE_BODY_BYTES as u64)
+    {
+        return Err("source response exceeds size limit".to_string());
+    }
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "source response read failed".to_string())?;
+        if body.len().saturating_add(chunk.len()) > MAX_SOURCE_BODY_BYTES {
+            return Err("source response exceeds size limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| "source response is not UTF-8".to_string())
+}
+
 /// 条件 GET（R3-5 礼貌轮询共享件；GitHubSource 自有实现不动，存量冻结）。
 /// 发 `If-None-Match`／`If-Modified-Since`（有缓存才带）；304→`Ok(None)`
 /// （调用方包 `not_modified`，SourceGuard 不计数）；200→更新缓存并 `Ok(Some(body))`。
@@ -123,20 +150,20 @@ async fn conditional_get(
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(None);
     }
-    if let Some(v) = resp.headers().get("etag").and_then(|h| h.to_str().ok()) {
-        *etag.lock() = Some(v.to_string());
-    }
-    if let Some(v) = resp
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let new_modified = resp
         .headers()
         .get("last-modified")
-        .and_then(|h| h.to_str().ok())
-    {
-        *last_modified.lock() = Some(v.to_string());
-    }
-    resp.text()
-        .await
-        .map(Some)
-        .map_err(|e| format!("read {url} failed: {e}"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = read_source_body(resp).await?;
+    *etag.lock() = new_etag;
+    *last_modified.lock() = new_modified;
+    Ok(Some(body))
 }
 
 /// JSON API 源（默认 Geonode；URL env 可配，见 Task 12）。
@@ -157,14 +184,20 @@ pub fn is_routable_ip(ip: &str) -> bool {
     if parts.next().is_some() {
         return false;
     }
-    let [a, b, _, _] = octets;
-    if a == 0 || a == 127 || a >= 224 {
+    let [a, b, c, _] = octets;
+    if a == 0 || a == 10 || a == 127 || a >= 224 {
         return false;
     }
-    if a == 10 || (a == 172 && (16..32).contains(&b)) || (a == 192 && b == 168) {
-        return false;
-    }
-    if a == 169 && b == 254 {
+    if (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (18..=19).contains(&b))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+    {
         return false;
     }
     true
@@ -212,7 +245,7 @@ mod worker;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use registry::{Health, Registry, SourceGuard};
 #[cfg_attr(not(test), allow(unused_imports))]
-pub use sources::{ApiSource, GitHubSource, HtmlSource, API_MAX_PAGES};
+pub use sources::{ApiSource, GitHubSource, HtmlSource, UriSource, API_MAX_PAGES};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use verify::{
     classify_anonymity, egress_of, socks_target_of_base, AnonLevel, FullCheckResult, FullChecker,
@@ -220,7 +253,7 @@ pub use verify::{
 };
 pub use worker::{
     FreePoolConfig, FreePoolWorker, DEFAULT_API_URL, DEFAULT_FULL_CHECK_BASE, DEFAULT_GITHUB_URL,
-    DEFAULT_HTML_URL,
+    DEFAULT_HTML_URL, DEFAULT_URI_URL,
 };
 
 /// VPN-IMMUNE：共享出站 Client（抓取＋基线）：显式禁用系统代理。

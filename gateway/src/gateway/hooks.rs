@@ -66,7 +66,11 @@ impl ProxyHttp for SmartProxyGateway {
         match self.tenant_mgr.authenticate_and_throttle(&api_key) {
             Ok(account) => {
                 ctx.tenant_id = Some(account.tenant_id.clone());
-                ctx.tenant_account = Some(account);
+                ctx.tenant_account = Some(Arc::clone(&account));
+                ctx.settlement = Some(crate::tenant::TenantSettlement::new(
+                    Arc::clone(&self.tenant_mgr),
+                    account,
+                ));
             }
             Err(msg) => {
                 // R2-3：429/402/403 映射收敛到 `status_for_auth_error`（单测锁定）。
@@ -183,6 +187,9 @@ impl ProxyHttp for SmartProxyGateway {
         // P2：peer 装配经守卫函数（socks 节点硬失败，正常走不到——见函数注释）。
         let peer = build_http_peer(&node, &target_host)?;
         // R2-6：`current_node` 落 ctx（`Arc` 句柄本身零成本 move）。
+        if let Some(settlement) = ctx.settlement.as_mut() {
+            settlement.set_tier(&node.tier);
+        }
         ctx.current_node = Some(node);
         Ok(peer)
     }
@@ -262,7 +269,10 @@ impl ProxyHttp for SmartProxyGateway {
             ctx.first_byte_at = Some(Instant::now());
         }
         if let Some(ref chunk) = body {
-            ctx.transferred_bytes += chunk.len() as u64;
+            ctx.transferred_bytes = ctx.transferred_bytes.saturating_add(chunk.len() as u64);
+            if let Some(settlement) = ctx.settlement.as_mut() {
+                settlement.add_bytes(chunk.len() as u64);
+            }
         }
         Ok(None)
     }
@@ -314,13 +324,12 @@ impl ProxyHttp for SmartProxyGateway {
         }
         // GW-4: release the tenant slot + meter actual egress bytes/tier,
         // and record Prometheus signals (works even in degraded mode).
-        if let Some(ref account) = ctx.tenant_account {
-            let tier = node
-                .as_ref()
-                .map(|n| n.tier.as_str())
-                .unwrap_or("datacenter");
-            self.tenant_mgr
-                .release_and_meter(account, ctx.transferred_bytes, tier);
+        let tier = node
+            .as_ref()
+            .map(|n| n.tier.as_str())
+            .unwrap_or("datacenter");
+        if let Some(settlement) = ctx.settlement.take() {
+            settlement.settle(ctx.transferred_bytes, tier);
         }
         let provider_for_metrics = node.as_ref().map(|n| n.provider.as_str());
         self.metrics.observe(

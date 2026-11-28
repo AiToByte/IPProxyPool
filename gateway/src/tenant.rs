@@ -60,6 +60,63 @@ pub struct TenantManager {
     store: Store,
 }
 
+/// Cancellation-safe owner of an authenticated tenant slot and its final accounting.
+///
+/// The guard records response bytes as callbacks observe them. If Pingora skips the
+/// logging callback because a request future is cancelled, Drop still settles once.
+pub(crate) struct TenantSettlement {
+    manager: Arc<TenantManager>,
+    account: Option<Arc<TenantAccount>>,
+    bytes: u64,
+    price_per_gb: f64,
+}
+
+impl TenantSettlement {
+    pub(crate) fn new(manager: Arc<TenantManager>, account: Arc<TenantAccount>) -> Self {
+        Self {
+            manager,
+            account: Some(account),
+            bytes: 0,
+            price_per_gb: PRICE_DC_PER_GB,
+        }
+    }
+
+    pub(crate) fn set_bytes(&mut self, bytes: u64) {
+        self.bytes = bytes;
+    }
+
+    pub(crate) fn reset_bytes(&mut self) {
+        self.bytes = 0;
+    }
+
+    pub(crate) fn add_bytes(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    pub(crate) fn set_tier(&mut self, tier: &str) {
+        self.price_per_gb = price_per_gb(tier);
+    }
+
+    pub(crate) fn settle(mut self, bytes: u64, tier: &str) {
+        self.set_tier(tier);
+        self.bytes = bytes;
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if let Some(account) = self.account.take() {
+            self.manager
+                .release_and_meter_at_price(&account, self.bytes, self.price_per_gb);
+        }
+    }
+}
+
+impl Drop for TenantSettlement {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// 租户状态的持久化后端。
 ///
 /// # 语义边界（重要）
@@ -269,7 +326,7 @@ pub struct RecordingBackend {
 
 #[cfg(test)]
 impl RecordingBackend {
-    fn new() -> std::sync::Arc<Self> {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
     }
 
@@ -312,27 +369,27 @@ impl RecordingBackend {
         );
     }
 
-    fn fail_on(&self, key: &str) {
+    pub(crate) fn fail_on(&self, key: &str) {
         self.fail_keys.lock().insert(key.to_string());
     }
 
-    fn stored(&self, key: &str) -> Option<std::collections::HashMap<String, String>> {
+    pub(crate) fn stored(&self, key: &str) -> Option<std::collections::HashMap<String, String>> {
         self.hashes.lock().get(key).cloned()
     }
 
-    fn writes(&self) -> usize {
+    pub(crate) fn writes(&self) -> usize {
         self.writes.load(Ordering::Relaxed)
     }
 
-    fn pause_writes(&self) {
+    pub(crate) fn pause_writes(&self) {
         self.pause_writes.store(true, Ordering::Release);
     }
 
-    async fn wait_until_write_blocked(&self) {
+    pub(crate) async fn wait_until_write_blocked(&self) {
         self.write_entered.notified().await;
     }
 
-    fn resume_writes(&self) {
+    pub(crate) fn resume_writes(&self) {
         self.pause_writes.store(false, Ordering::Release);
         self.resume_writes.notify_one();
     }
@@ -792,6 +849,11 @@ impl TenantManager {
     /// 失败语义：**逐条删脏**，失败的那条（及其后的）保留在脏集里，下一轮
     /// 重试。不采用"先清空再写"——那样写失败就等于静默丢掉余额更新，而
     /// 接口早已对运维报过成功。
+    /// A successful snapshot write is not proof that concurrent updates were flushed.
+    pub(crate) fn has_dirty_state(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
     pub async fn flush_dirty(&self) -> Result<usize, String> {
         match &self.store {
             Store::Memory => Ok(0),
@@ -839,9 +901,8 @@ impl TenantManager {
 
     /// 启动后台 flush 循环。未启用持久化时返回 `None`（不起空转任务）。
     ///
-    /// `interval` 是**最大**持久化延迟：进程被强杀时最多丢这么多秒的余额
-    /// 变动。默认 5s（`TENANT_FLUSH_SECS`）——免费/低价流量下这远小于一次
-    /// 结算周期，且比"重启全部归零"好得多。
+    /// The interval is the healthy writeback cadence, not a data-loss limit.
+    /// Dependency outages and backlog can retain older unpersisted updates.
     pub fn spawn_flusher(
         self: &Arc<Self>,
         interval: std::time::Duration,
@@ -865,7 +926,7 @@ impl TenantManager {
                     _ = ticker.tick() => match me.flush_dirty().await {
                         Ok(0) => {}
                         Ok(n) => log::debug!("[Tenant] flushed {n} record(s) to Redis"),
-                        Err(e) => log::warn!("[Tenant] flush failed, will retry: {e}"),
+                        Err(_) => log::warn!("[Tenant] flush failed; retaining dirty updates for retry"),
                     },
                 }
             }
@@ -1009,6 +1070,10 @@ impl TenantManager {
     ///
     /// R2-3：允许一次扣成负数（当次流量不断流），欠费由下次 `authenticate` 拦截。
     pub fn release_and_meter(&self, tenant: &TenantAccount, bytes: u64, tier: &str) {
+        self.release_and_meter_at_price(tenant, bytes, price_per_gb(tier));
+    }
+
+    fn release_and_meter_at_price(&self, tenant: &TenantAccount, bytes: u64, price: f64) {
         // OPT-R4 A1：旧 `load==0` 检查与 `fetch_sub` 非原子，并发双释放可同时过检
         // 把 in_flight 绕回 usize::MAX（永久熔断该租户并发）；改 CAS 循环原子扣槽
         //（不用 `fetch_sub` 返回值判定：零槽先减后加会瞬时暴露 MAX，可被并发
@@ -1036,7 +1101,7 @@ impl TenantManager {
             }
         }
         tenant.total_bytes.fetch_add(bytes, Ordering::Relaxed);
-        let cost = (bytes as f64 / BYTES_PER_GB) * price_per_gb(tier);
+        let cost = (bytes as f64 / BYTES_PER_GB) * price;
         tenant.balance_usd.fetch_sub(cost, Ordering::Relaxed);
         // 计量改变了余额 ⇒ 标脏。**这是热路径上唯一新增的开销**，且仅在
         // 持久化开启时发生（`mark_dirty` 内部先判后端）。零字节请求直接跳过，

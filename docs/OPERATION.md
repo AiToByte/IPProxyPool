@@ -152,8 +152,8 @@ $env:REDIS_URL = "redis://127.0.0.1:6379/"
   记录**不会**复活一个已从配置里删掉的租户。反过来 `is_active` /
   `balance_usd` / `total_bytes` 会从 Redis 恢复。因此"删租户"仍然是改配置，
   不是删 Redis 键（删了也只会让它回到初始余额）。
-- **周期写回不是数据丢失上限**：`TENANT_FLUSH_SECS`（默认 5 秒）是健康状态下的写回周期；Redis 故障或写回积压可能扩大未持久化窗口。收到关停信号后，应用标记 `draining` 并通知后台任务停止，再尝试一次最多等待 5 秒的租户写回。该尝试不与 Pingora 退出同步，不保证成功，也不保证覆盖仍在处理的请求产生的更新。
-- **关停探针与入口**：进入 `draining` 后，编排器应依据 `/readyz=503` 停止调度新流量；`/livez` 在 Admin 可响应时仍返回 200。HTTP/CONNECT 入口检测到 draining 后会拒绝新请求；监听器关闭后可能直接连接失败。CONNECT 的生命周期边界是：握手/建链和 `200 Connection Established` 刷新前仍可被 Pingora 的 shutdown watch 取消；`200` 已刷出后，初始 shutdown 广播不会直接取消已建立的 relay，relay 继续受现有 idle/max-lifetime 约束。该本地回归不等于最终 runtime shutdown、完整 grace 或 bounded in-flight drain 已被证明。
+- **周期写回不是数据丢失上限**：`TENANT_FLUSH_SECS`（默认 5 秒）是健康状态下的写回节拍；Redis 故障或写回积压会扩大未持久化窗口。收到关停信号后，应用标记 `draining` 并关闭 HTTP/CONNECT 与 Admin 租户 PATCH admission，等待活动 lease 最多 5 秒；随后请求周期 flusher 停止并有界 join，再执行最多等待 5 秒的 best-effort final flush。quiescence 超时、flusher 未确认终止、flush 失败/超时或 final flush 后仍有 dirty version 都会被报告为 incomplete，不能宣称完成持久化。Abort 会取消本地 Tokio task，但不回滚已经发送至 Redis 的命令。
+- **关停探针与入口**：进入 `draining` 后，编排器应依据 `/readyz=503` 停止调度新流量；`/livez` 在 Admin 可响应时仍返回 200。HTTP/CONNECT 入口和 Admin 租户 PATCH 会拒绝新 admission。HTTP request context 的 RAII settlement 与 CONNECT tunnel settlement 均先于对应 lifecycle admission lease 析构；确定性测试覆盖了已观察到的字节与最终 tenant 状态。该本地屏障仍不与 Pingora listener/runtime teardown 同步，不能推断所有服务回调已停止或进程已安全退出；当前 revision 的 Linux SIGTERM/Ctrl-C/live runtime 仍须独立验收。
 - **`TENANT_STORE=redis` 要求持久化后端可用**：Redis 连接失败/超时，或租户状态读取失败/超时，启动以非零状态退出；不会启动为 memory、不会启动写回循环、也不会开启数据面 listener。修复 Redis/索引/记录读取问题后再重启。`TENANT_STORE=memory` 仍可在 Redis 不可用时启动，遥测与熔断工作者按原有 degraded 语义运行。
 - Redis PING 恢复只会反映可选 Redis 依赖状态；它不重新配置 tenant store。required Redis 模式在连接及初次租户状态加载成功后才继续启动，并开始运行期健康探测。
 - **启动顺序**：先加载 Redis，再起 flush 循环。反过来会让首轮 flush 把刚注册

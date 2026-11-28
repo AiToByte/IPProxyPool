@@ -41,6 +41,78 @@ fn test_gateway(nodes: Vec<ProxyNode>) -> SmartProxyGateway {
     }
 }
 
+/// Exercise real Pingora callbacks; pause after metering but before logging.
+#[tokio::test]
+async fn context_cancellation_settles_tenant_before_admission_quiescence() {
+    for cancelled in [true, false] {
+        let gateway = test_gateway(vec![test_node("127.0.0.1", 8080)]);
+        gateway
+            .tenant_mgr
+            .register_tenant("t", "cancel-key", 10, 10, 10);
+        let tenants = gateway.tenant_mgr.clone();
+        let health = gateway.health.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, client) =
+            tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+        let (stream, _) = accepted.unwrap();
+        let mut client = client.unwrap();
+        let (metered, seen) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            use pingora_core::protocols::l4::stream::Stream;
+            let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+            session.read_request().await.unwrap();
+            let mut ctx = gateway.new_ctx();
+            assert!(!gateway
+                .request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap());
+            gateway.upstream_peer(&mut session, &mut ctx).await.unwrap();
+            let mut bytes = Some(Bytes::from_static(b"hello"));
+            gateway
+                .response_body_filter(&mut session, &mut bytes, false, &mut ctx)
+                .unwrap();
+            // A retry clears both observable and cancellation-fallback counters.
+            reset_retry_accounting(&mut ctx);
+            gateway
+                .response_body_filter(&mut session, &mut bytes, false, &mut ctx)
+                .unwrap();
+            metered.send(()).unwrap();
+            finished.await.unwrap();
+            gateway.logging(&mut session, None, &mut ctx).await;
+            // The slot is released exactly once even if logging is called twice.
+            gateway.logging(&mut session, None, &mut ctx).await;
+        });
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX-API-Key: cancel-key\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), seen)
+            .await
+            .unwrap()
+            .unwrap();
+        health.request_drain();
+        assert_eq!(tenants.tenant_detail("cancel-key").unwrap().in_flight, 1);
+        assert!(!health.wait_for_quiescence(Duration::ZERO).await);
+        if cancelled {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            finish.send(()).unwrap();
+            task.await.unwrap();
+        }
+        assert!(health.wait_for_quiescence(Duration::from_secs(1)).await);
+        let detail = tenants.tenant_detail("cancel-key").unwrap();
+        assert_eq!(detail.in_flight, 0);
+        assert_eq!(detail.total_bytes, 5);
+        let expected = 100.0 - 5.0 / 1_073_741_824.0 * crate::tenant::PRICE_RESIDENTIAL_PER_GB;
+        assert!((detail.balance_usd - expected).abs() < 1e-12);
+    }
+}
+
 #[tokio::test]
 async fn draining_http_request_is_rejected_before_tenant_authentication() {
     use pingora_core::protocols::l4::stream::Stream;

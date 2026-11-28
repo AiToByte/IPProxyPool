@@ -400,6 +400,7 @@ struct EstablishedTunnel<'a, D> {
     tunnel: TunnelGuard<'a>,
     settlement: SettlementGuard<'a>,
     _admission: AdmissionGuard,
+    // Dropped last: settlement finishes before runtime quiescence is signalled.
     _lifecycle_admission: crate::health::AdmissionLease,
 }
 
@@ -1652,14 +1653,20 @@ mod tests {
                 "stub".into(),
                 100,
             );
-            let tenants = Arc::new(TenantManager::new());
+            let backend = crate::tenant::RecordingBackend::new();
+            let tenants = Arc::new(TenantManager::with_store(crate::tenant::Store::Recording(
+                backend.clone(),
+            )));
             tenants.register_tenant("t", "key", 1000, 1, 100);
+            tenants.flush_dirty().await.unwrap();
             let metrics = Arc::new(MetricsRegistry::new());
-            let app = ConnectServerApp::with_max_concurrent_and_metrics(
+            let health = crate::health::RuntimeHealthState::new();
+            let app = ConnectServerApp::with_max_concurrent_and_metrics_and_health(
                 Arc::new(RouterEngine::new(vec![node])),
                 tenants.clone(),
                 256,
                 metrics.clone(),
+                health.clone(),
             );
             let (server, mut client) = tokio::io::duplex(1024);
             let task = tokio::spawn(async move {
@@ -1670,8 +1677,28 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(&seen_rx.await.unwrap(), b"hello");
+            assert_eq!(health.active_admissions(), 1);
+            assert!(!health.wait_for_quiescence(Duration::ZERO).await);
+            let (stop, _watch) = tokio::sync::watch::channel(false);
+            let shutdown = crate::shutdown::shutdown_tenants(
+                health.clone(),
+                stop,
+                tenants.clone(),
+                None,
+                Duration::from_secs(1),
+            );
+            tokio::pin!(shutdown);
+            use std::future::{poll_fn, Future};
+            use std::task::Poll;
+            assert!(poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+            assert!(health.try_admit().is_none());
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
+            assert!(health.wait_for_quiescence(Duration::from_secs(1)).await);
+            assert!(shutdown.await.locally_complete());
+            let persisted = backend.stored("key").unwrap();
+            assert_eq!(persisted["total_bytes"], "5");
+            assert_eq!(backend.writes(), 2);
             origin.abort();
             let detail = tenants.tenant_detail("key").unwrap();
             assert_eq!(detail.in_flight, 0);

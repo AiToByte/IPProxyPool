@@ -146,6 +146,10 @@ impl SmartProxyGateway {
             }
             ctx.current_node = Some(Arc::clone(&node));
             ctx.transferred_bytes = 0; // OPT-3：只计最后 attempt
+            if let Some(settlement) = ctx.settlement.as_mut() {
+                settlement.reset_bytes();
+                settlement.set_tier(&node.tier);
+            }
             let breq = BridgeRequest {
                 method: method.clone(),
                 url: url.clone(),
@@ -167,6 +171,9 @@ impl SmartProxyGateway {
                     // REVIEW-R2 Q9：egress 已发生即记账（写下游失败仍计量出站成本；
                     // OPT-3 只计最后 attempt 口径不变，`?` 前先赋值）。
                     ctx.transferred_bytes = resp.body.len() as u64;
+                    if let Some(settlement) = ctx.settlement.as_mut() {
+                        settlement.set_bytes(resp.body.len() as u64);
+                    }
                     self.write_bridge_response(session, resp).await?;
                     return Ok(());
                 }

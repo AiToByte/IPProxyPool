@@ -1,7 +1,7 @@
 # 功能说明文档 / Feature Catalog
 
 > 双语：中文在前，English after.
-> 口径基线：D3（Key 门默认开＋回环监听）、466 单测＋6 真 live（权威数字见 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)）。每项按“是什么／为什么／怎么看／配置项”四段写。
+> 口径基线：D3（Key 门默认开＋回环监听）、487 单测＋7 真 live（权威数字见 [`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)）。每项按“是什么／为什么／怎么看／配置项”四段写。
 
 ## 中文
 
@@ -21,10 +21,10 @@
 
 ### F3 免费第二供应线
 
-- **是什么**：Geonode（api，分页预筛）＋free-proxy-list（html）＋clarketm/openproxylist/monosans/relayglass（github raw，共 7 URL）→TCP 初筛→FullCheck 复检（Elite/Anonymous/Transparent 三级＋canary）→merge 进池（tier=free 隔离档）。
+- **是什么**：Geonode（api，分页预筛）＋free-proxy-list（html）＋clarketm/openproxylist/monosans/relayglass（raw）＋可选 URI 格式公开列表（需显式配置 FREE_URI_URLS）→TCP 初筛→FullCheck 复检（Elite/Anonymous/Transparent 三级＋canary）→merge 进池（tier=free 隔离档）。
 - **为什么**：零成本补充 marrange 出口；Elite 偶发但真实（用户实操 104.245.245.218 三重证据）。
 - **怎么看**：`free_pool_nodes_total` 水位（常态 0 属源站生态）；`free_pool_source_yield/elite_total{source}`；`free_pool_verify_total{result}` 四组漏斗＋B9 四指标；`FREE_BASELINE.md` 干旱记录。
-- **配置项**：`FREE_ENABLED=1` 总开关；`FREE_API_PAGES`；`FREE_REQUIRE_ELITE`；`FREE_FETCH_TIMEOUT_SECS`/`FREE_INTAKE_FACTOR`；`FREE_FULL_CHECK_URLS` 多基址。
+- **配置项**：`FREE_ENABLED=1` 总开关；`FREE_API_PAGES`；`FREE_URI_URLS`；`FREE_REQUIRE_ELITE`；`FREE_FETCH_TIMEOUT_SECS`/`FREE_INTAKE_FACTOR`；`FREE_FULL_CHECK_URLS` 多基址。
 
 ### F4 SOCKS 出站
 

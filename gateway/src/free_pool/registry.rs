@@ -413,26 +413,50 @@ pub(super) fn baseline_bases(primary: &str, fallbacks: &[String]) -> Vec<String>
     bases
 }
 
-/// OPT-R4 B8：加权截断——Elite 历史优先，其次源序（fetch_all 已按
-/// api>html>github 拼接，首次出现序即优先级），同级内稳定排序保原始相对顺序.
-/// 确定性（无 shuffle）：落选者下轮重抓仍有机会；调用方保证 cap>0。
+/// Select candidates fairly across sources, prioritizing previously Elite nodes
+/// within each source without discarding the remaining candidates.
 pub(super) fn cap_intake(
-    mut raws: Vec<RawNode>,
+    raws: Vec<RawNode>,
     cap: usize,
     elite_addrs: &HashSet<String>,
 ) -> Vec<RawNode> {
+    use std::collections::VecDeque;
     if raws.len() <= cap {
         return raws;
     }
-    let mut order: HashMap<String, usize> = HashMap::new();
-    for r in &raws {
-        let n = order.len();
-        order.entry(r.source.clone()).or_insert(n);
+    if cap == 0 {
+        return Vec::new();
     }
-    raws.sort_by_key(|r| {
-        let elite = elite_addrs.contains(&format!("{}:{}", r.ip, r.port));
-        (!elite, *order.get(&r.source).unwrap_or(&usize::MAX))
-    });
-    raws.truncate(cap);
-    raws
+    let mut order = Vec::<String>::new();
+    let mut grouped = HashMap::<String, Vec<RawNode>>::new();
+    for raw in raws {
+        if !grouped.contains_key(&raw.source) {
+            order.push(raw.source.clone());
+        }
+        grouped.entry(raw.source.clone()).or_default().push(raw);
+    }
+    let mut queues: Vec<VecDeque<RawNode>> = order
+        .into_iter()
+        .filter_map(|source| grouped.remove(&source))
+        .map(|mut nodes| {
+            nodes.sort_by_key(|node| !elite_addrs.contains(&format!("{}:{}", node.ip, node.port)));
+            nodes.into()
+        })
+        .collect();
+    let mut admitted = Vec::with_capacity(cap);
+    while admitted.len() < cap {
+        let previous_len = admitted.len();
+        for queue in &mut queues {
+            if let Some(node) = queue.pop_front() {
+                admitted.push(node);
+                if admitted.len() == cap {
+                    return admitted;
+                }
+            }
+        }
+        if admitted.len() == previous_len {
+            break;
+        }
+    }
+    admitted
 }

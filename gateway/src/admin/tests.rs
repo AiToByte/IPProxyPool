@@ -912,3 +912,33 @@ async fn audit_layer_preserves_error_contract() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).expect("错误体必须是 JSON");
     assert_eq!(v["code"], 404);
 }
+
+#[tokio::test]
+async fn tenant_mutations_are_rejected_after_drain_while_reads_remain_available() {
+    let state = test_state(vec![], &["drain-key"]);
+    let tenants = state.tenant_mgr.clone();
+    state.health.request_drain();
+    let app = super::router(state);
+    for (path, body) in [
+        ("balance", r#"{"balance_usd":5}"#),
+        ("active", r#"{"active":false}"#),
+    ] {
+        let (status, _) = send_json(
+            app.clone(),
+            "PATCH",
+            &format!("/api/v1/tenants/drain-key/{path}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let detail = tenants.tenant_detail("drain-key").unwrap();
+    assert_eq!(detail.balance_usd, 100.0);
+    assert!(detail.is_active);
+    assert_eq!(
+        send_json(app, "GET", "/api/v1/tenants/drain-key", None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+}

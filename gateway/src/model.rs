@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::bandit::VectorD;
 use crate::health::AdmissionLease;
-use crate::tenant::TenantAccount;
+use crate::tenant::{TenantAccount, TenantSettlement};
 
 /// Upstream egress proxy node metadata.
 ///
@@ -139,6 +139,9 @@ pub struct ProxyContext {
     pub tenant_id: Option<String>,
     /// GW-4: authenticated tenant account (owns one in-flight slot).
     pub tenant_account: Option<Arc<TenantAccount>>,
+    /// Cancellation-safe settlement guard. It must be declared before `admission`
+    /// so Drop settles the tenant before quiescence releases the lifecycle lease.
+    pub settlement: Option<TenantSettlement>,
     pub admission: Option<AdmissionLease>,
     /// GW-4 reservation: streaming byte counter (filled by response_body_filter).
     pub transferred_bytes: u64,
@@ -171,6 +174,7 @@ impl Default for ProxyContext {
             client_ip: String::new(),
             tenant_id: None,
             tenant_account: None,
+            settlement: None,
             admission: None,
             transferred_bytes: 0,
             failed_addrs: Vec::new(),

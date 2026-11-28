@@ -65,7 +65,7 @@
 | `SOCKS_BRIDGE_TIMEOUT_SECS`／`SOCKS_MAX_BODY_BYTES` | `20`／`10485760` | 翻译桥 |
 | `GEOIP_MMDB_PATH`／`GEOIP_ENFORCE_MISMATCH` | 空／`0` | 无库 Disabled；执法默认关 |
 | `FREE_ENABLED` | `0` | 第二线总开关 |
-| `FREE_API/HTML/GITHUB_URLS` | Geonode limit=100／fpl／clarketm raw | 仅 http/https（SSRF 过滤） |
+| `FREE_API/HTML/GITHUB/URI_URLS` | Geonode limit=100／fpl／clarketm raw／URI opt-in | URI 代理格式已解析；抓取源 URL 仅 http/https |
 | `FREE_FETCH/TTL/VERIFY_TIMEOUT_SECS` | `600/1800/3` | TTL 上限钳 30 天 |
 | `FREE_MAX_LATENCY_MS` | `3000` | TCP 门＋EWMA 中性点 |
 | `FREE_MAX/FULL_CONCURRENT` | `50/20` | 质检并发 |
@@ -79,7 +79,7 @@
 
 ### 7. 门禁定义（见 `CONTRIBUTING.md`）
 
-`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 466 单测（11 ignored）＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
+`fmt --check` clean＋`clippy -D warnings` 零告警＋`test` 487 单测（11 ignored）＋`--ignored` 4 真过（先验 PONG/Ok、无 SKIP）＋`bench --no-run`＋release bandit<200ns。
 
 ## English
 
@@ -138,7 +138,7 @@
 | `SOCKS_BRIDGE_TIMEOUT_SECS` / `SOCKS_MAX_BODY_BYTES` | `20` / `10485760` | translation bridge |
 | `GEOIP_MMDB_PATH` / `GEOIP_ENFORCE_MISMATCH` | empty / `0` | Disabled without DB; enforcement off |
 | `FREE_ENABLED` | `0` | second-line master switch |
-| `FREE_API/HTML/GITHUB_URLS` | Geonode limit=100 / fpl / clarketm raw | http/https only (SSRF filter) |
+| `FREE_API/HTML/GITHUB/URI_URLS` | Geonode limit=100 / fpl / clarketm raw / URI opt-in | URI proxy format is strict; source URLs are http/https only |
 | `FREE_FETCH/TTL/VERIFY_TIMEOUT_SECS` | `600/1800/3` | TTL clamped at 30 days |
 | `FREE_MAX_LATENCY_MS` | `3000` | TCP gate + EWMA neutral point |
 | `FREE_MAX/FULL_CONCURRENT` | `50/20` | verification concurrency |
@@ -152,4 +152,4 @@
 
 ### 7. Gates (see `CONTRIBUTING.md`)
 
-`fmt --check` clean + `clippy -D warnings` zero + `test` 466 unit tests (11 ignored) + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.
+`fmt --check` clean + `clippy -D warnings` zero + `test` 487 unit tests (11 ignored) + `--ignored` 4 true passes (PONG/Ok first, no SKIP) + `bench --no-run` + release bandit <200ns.

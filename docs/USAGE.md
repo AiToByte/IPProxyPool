@@ -7,6 +7,60 @@
 
 ## 中文
 
+### 本机免费代理最小闭环（Windows PowerShell）
+
+在仓库根目录执行；先确认 `8916`、`9091`、`9092` 没有被已有实例占用。
+下面用内存租户模式运行，不需要为基础转发启动 Docker；Redis/ClickHouse 不可用时相关功能会降级。
+若已有实例，请在它原来的启动窗口停止或按其部署方式管理，勿全局结束同名进程。
+
+```powershell
+$env:FREE_ENABLED = "1"
+$env:TENANT_STORE = "memory"
+$env:GATEWAY_ADDR = "127.0.0.1:8916"
+$env:METRICS_ADDR = "127.0.0.1:9091"
+$env:ADMIN_ADDR = "127.0.0.1:9092"
+cargo run --manifest-path gateway/Cargo.toml --locked
+```
+
+保持该窗口运行，在第二个 PowerShell 窗口中检查状态并请求目标：
+
+```powershell
+curl.exe --noproxy "*" --max-time 5 http://127.0.0.1:9092/readyz
+curl.exe --noproxy "*" --max-time 5 -s http://127.0.0.1:9091/metrics |
+    Select-String "free_pool_nodes_total|free_pool_nodes_by_proto"
+
+# 未设置 API_KEY 时才使用公开的本机开发 Key；设置过则使用同一真实 Key。
+$GatewayKey = if ($env:API_KEY) { $env:API_KEY } else { "default_key" }
+curl.exe --noproxy "*" --max-time 30 -i http://127.0.0.1:8916/ip `
+    -H "Host: httpbin.org" `
+    -H "X-Api-Key: $GatewayKey" `
+    -H "X-Proxy-Tier: free"
+```
+
+免费 worker 会抓取、验证并合并节点。等待首轮质检完成后再看水位；`/readyz=200` 只表示入口就绪，不保证免费节点存在。
+默认请求只使用 HTTP 出口；如果指标仅有 SOCKS5 节点，在上面请求中增加 `-H "X-Proxy-Proto: socks5"`。
+链路为 **客户端 → 本机 Gateway → 选中的免费出口 → 目标站 → Gateway → 客户端**；curl 会直接收到目标的状态、响应头和正文。
+这是使用方法，不能保证此刻的公网免费源有可用节点，也不能把一次质检成功等同于目标请求成功。
+
+免费源支持 JSON API、HTML 表格、裸 `IPv4:port` 列表，以及每行 `http://`、`socks4://` 或 `socks5://` 加 `IPv4:port` 的 URI 列表。URI 来源默认关闭；通过 `FREE_URI_URLS` 显式配置逗号分隔的列表地址来启用，设为空则禁用。URI 中的 `https://` 暂不接受，因为它可能表示到代理本身的 TLS，而现有出口不支持该语义。来源地址由部署者可信配置；抓取内容不能直接进入路由，仍需通过现有质检。额外来源不保证在线或有可用节点，使用前应检查其许可和访问条款。
+
+需要标准 HTTP proxy 形态时，在第三个窗口执行：
+
+```powershell
+python tools/ipp_forward.py 18080 127.0.0.1 8916
+```
+
+再从客户端窗口请求：
+
+```powershell
+curl.exe --noproxy "" --max-time 30 -i -x http://127.0.0.1:18080 `
+    -H "X-Api-Key: $GatewayKey" -H "X-Proxy-Tier: free" http://httpbin.org/ip
+```
+
+`503` 可能表示免费池空、筛选后无节点、draining 或必需依赖不可用；`403` 检查 Key，以及免费请求是否带 `Authorization`/`Cookie`；`400` 检查 Host 与请求形态。
+如果已显式设置空白或 `default_key` 的 `API_KEY`，默认租户会拒绝注册，应先修正启动环境再启动。
+开发 Key 只用于本机测试。此适配器仅供普通 HTTP，不转发 HTTPS 的 CONNECT；独立 `CONNECT_ADDR` 是另一条显式启用的入口。
+
 ### 方式一：程序直调（推荐，零中转）
 
 ```powershell
@@ -100,7 +154,7 @@ if status != 200 {
 |------|------|
 | absolute-URI 直连网关 | 400（须经适配器） |
 | CONNECT（HTTPS 隧道） | `ipp_forward.py` 适配器不转发；独立 HTTP/1.1 listener 通过 `CONNECT_ADDR` 显式启用，明文仅允许回环绑定 |
-| chunked 请求体／>10MB | 适配器 501／413 |
+| chunked 请求体／>10MB | 有效 chunked 解码后以 Content-Length 转发；畸形/截断返回 501；超上限返回 413 |
 | 免费池水位 | 常态 0（公网存活率极低）；`tier=free` 池空时正确 503 |
 | `tier=free`＋`Authorization`/`Cookie` | 403（D1：匿名共享出口拒收凭据，防泄露给陌生出口；网关自有 `X-API-Key` 不受影响） |
 | 鉴权（D3 缺省开门） | 无 `X-Api-Key` 头即 403；开发带 `default_key`，生产换真 Key（SDK 缺省已带） |
@@ -213,7 +267,7 @@ Consistency is asserted in CI by `tools/check_sdk_contract.py`, which needs **no
 |------|----------|
 | absolute-URI direct to gateway | 400 (use the adaptor) |
 | CONNECT (HTTPS tunneling) | `ipp_forward.py` does not forward CONNECT; enable the standalone HTTP/1.1 listener via `CONNECT_ADDR` (plaintext loopback only) |
-| chunked body / >10MB | adaptor 501 / 413 |
+| chunked body / >10MB | valid chunked decoded to Content-Length; malformed/truncated input 501; oversized body 413 |
 | Free pool level | usually 0 (tiny public survival); `tier=free` correctly 503 when empty |
 | `tier=free` + `Authorization`/`Cookie` | 403 (D1: anonymous shared egress refuses credentials, blocks leaks to stranger exits; the gateway's own `X-API-Key` unaffected) |
 | Auth (D3 gate on by default) | headerless requests get 403; send dev `default_key`, production uses real keys (SDK sends one by default) |

@@ -17,16 +17,16 @@
 
 ## 中文
 
-### 1. 模块表（27 个）
+### 1. 模块表（28 个）
 
 | 模块 | 单测 | 职责 | 关键 API |
 |------|------|------|----------|
-| `main.rs` | 25 | 装配：typed startup preflight、启动环境采集、supervisor/后台 ticker/Pingora 启动/平台感知优雅期 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 44 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `main.rs` | 25 | 装配：typed startup preflight、启动环境采集、supervisor/后台 ticker/Pingora 启动/平台感知优雅期、有限 shutdown 编排 | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 45 | 数据面：鉴权/选路/转发/重试/计量/遥测/桥短路；Pingora 回调完成时显式结算，取消时由 context RAII guard 结算 | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
 | `connect.rs` | 28 | 可选标准 HTTP/1.1 CONNECT：authority 解析、鉴权、独立 listener、双向隧道 | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
 | `router.rs` | 73 | 选路：加权/粘滞/隔离/原子替换/套利缩放/主动健康探测闸门 | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | 模型：节点/规格/上下文＋tier 归一 | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
-| `free_pool/mod.rs` | 59 | 免费第二线：抓取/两级质检/注册/熔断/合并 | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
+| `free_pool/mod.rs` | 67 | 免费第二线：抓取/两级质检/注册/熔断/合并 | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
 | `bandit.rs` | 18 | LinUCB d=4 选路＋分档遗忘＋免费风险溢价 | `forget_every_for_tier/cost_weight_for_tier/FREE_RISK_PREMIUM` |
 | `telemetry.rs` | 7 | 遥测：MPSC 批量 XADD＋幂等＋双丢弃计数 | `TelemetryPublisher/TelemetryWorker/TelemetryEvent` |
 | `circuit_breaker.rs` | 13 | 熔断：Stream 消费＋隔离＋目标合法性守卫 | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
@@ -42,21 +42,29 @@
 | `geo.rs` | 4 | 画像：GeoIP 查询＋mismatch 判定（无库 Disabled） | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS 翻译桥：显式 socks 请求出站＋hop 过滤＋body 上限 | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | 握手：RFC1928/1929＋SOCKS4/4a＋greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 24 | Admin REST 面：:9092 独立服务；公开 `/livez`/`/readyz` 健康探针；`/api/v1/*` 统一 `X-Admin-Key`、fail-closed | `AdminState/router/RuntimeHealthState` |
+| `admin/mod.rs` | 25 | Admin REST 面：:9092 独立服务；公开 `/livez`/`/readyz` 探针；`/api/v1/*` 统一认证；tenant balance/active mutation 接入 drain admission | `AdminState/router/RuntimeHealthState` |
 | `node_registry.rs` | 14 | 控制面节点注册表：运行时增删＋原子持久化（进程重启不丢） | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | 淘汰计数助手：四处 sweep 共用一份「淘汰并报数」逻辑 | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream 分片预留（默认 1 分片＝行为逐字节不变） | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | 传输层连接器抽象：默认 tokio，Linux 预留 io_uring 接入点 | `TcpConnector/TokioTcpConnector` |
-| `health.rs` | 17 | 纯 liveness/readiness 状态决策模型与共享运行时快照、Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
+| `shutdown.rs` | 11 | 本地 shutdown drain/quiescence/flusher join/final-flush 编排；不代表 Pingora runtime teardown 已同步 | `shutdown_tenants/TenantFlusher/bounded_flush` |
+| `health.rs` | 17 | 纯存活/就绪决策模型、共享运行时快照及 Redis required/optional 策略：starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
-**单元测试属性计数**：源码 `#[test]` / `#[tokio::test]` 总数为 477（其中 466 passed、11 ignored）；执行结果和忽略项以 `QUALITY_BASELINE.md` 为准。
+**单元测试属性计数**：源码 `#[test]`/`#[tokio::test]` 属性计数以组件门禁按模块统计；实际 passed/ignored 数以本轮完整测试结束后更新的 `QUALITY_BASELINE.md` 为准。
+
+### 1.1 `shutdown` 内部测试模块
+
+关停协调器的行为测试集中在独立子模块中，覆盖 drain、flusher join 与 final flush 的顺序和失败路径。
+
+| 子模块 | 职责 | 关键 API |
+|--------|------|----------|
+| `shutdown/tests.rs` | 关停生命周期回归测试 | — |
 
 ### 1.1 `router` 内部子模块（OPT-R18 P2-1 拆分）
 
 `router.rs` 曾是 3564 行的单文件巨型模块（选路＋粘滞＋隔离＋主动健康＋套利缩放
 ＋控制面增删混在一起）。P2-1 把它按职责拆为父模块 `router.rs`（结构定义＋构造器）
-＋ 5 个子模块文件。**子模块的测试数已并入上表的 `router.rs` 行**（69 = 59 + 10），
-故这张职责表目前有 27 行（含 `startup_config.rs` 与 `health.rs` 独立模块），`router` 的 7 个子模块仍折叠在父模块行中。
+＋ 5 个子模块文件。**子模块的测试数已并入上表的 `router.rs` 行**，`router` 的 7 个子模块仍折叠在父模块行中。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
@@ -77,13 +85,13 @@ method）调用方直接 `engine.foo()` 即可，再导出会触发 `unused_impo
 
 `free_pool` 模块曾是 3727 行的单文件（抓取源＋两级质检＋注册表状态＋后台 worker
 混在一起）。现按职责拆为父模块 `free_pool/mod.rs`（类型定义＋`shared_client`＋
-再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，职责表目前共 27 行，子模块仍不单独占行。
+再导出）＋ 5 个子模块。**子模块的测试数已并入上表的 `free_pool/mod.rs` 行**，子模块仍不单独占行。
 
 | 子模块 | 职责 | 关键 API |
 |--------|------|----------|
-| `free_pool/sources.rs` | 三类抓取源（JSON API / HTML / GitHub 裸列表）＋礼貌轮询缓存（ETag/304）＋全源并发抓取 | `ApiSource/HtmlSource/GitHubSource/fetch_all/API_MAX_PAGES` |
+| `free_pool/sources.rs` | JSON API / HTML / 裸列表 / 严格 URI 列表抓取；成功状态、响应体大小限制、ETag 轮询＋全源并发抓取 | `ApiSource/HtmlSource/GitHubSource/UriSource/fetch_all/API_MAX_PAGES` |
 | `free_pool/verify.rs` | 两级质检：轻量 `Verifier`（TCP/协议）＋ `FullChecker`（canary 全量）＋匿名度分级 | `Verifier/FullChecker/classify_anonymity/egress_of/socks_target_of_base` |
-| `free_pool/registry.rs` | 池状态：`Health`（EWMA）＋ `Registry`（TTL/淘汰/失败指纹）＋源站熔断＋intake 配额 | `Registry/Health/SourceGuard/cap_intake/intake_cap_limit/baseline_bases` |
+| `free_pool/registry.rs` | 池状态：`Health`（EWMA）＋ `Registry`（TTL/淘汰/失败指纹）＋源站熔断＋多源 round-robin intake 配额 | `Registry/Health/SourceGuard/cap_intake/intake_cap_limit/baseline_bases` |
 | `free_pool/worker.rs` | 驱动层：env 组装、周期抓取→质检→geo 裁决→Router 合并 | `FreePoolWorker/FreePoolConfig/apply_geo_verdict/spawn_full_check` |
 | `free_pool/tests.rs` | 全部单测（原文件后半段迁出） | — |
 
@@ -216,17 +224,17 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 
 ## English
 
-### 1. Modules (27)
+### 1. Modules (28)
 
 | Module | Tests | Responsibility | Key APIs |
 |--------|-------|----------------|----------|
-| `main.rs` | 25 | Wiring: typed startup preflight/env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
-| `gateway/mod.rs` | 44 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge short-circuit | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
+| `main.rs` | 25 | Wiring: typed startup preflight/env binding/supervisor/background tickers/Pingora bootstrap/platform-aware grace and bounded local shutdown orchestration | `env_str/env_secs/split_env_list/supervise/clamp_free_ttl/default_grace_secs` |
+| `gateway/mod.rs` | 45 | Data plane: auth/routing/forwarding/retry/metering/telemetry/bridge; settlement callback plus cancellation-safe context guard | `SmartProxyGateway/should_reject_missing_api_key/resolve_bandit_context/status_for_auth_error` |
 | `connect.rs` | 28 | Optional standard HTTP/1.1 CONNECT: authority parsing, auth, standalone listener, bidirectional tunnel | `ConnectTarget/parse_connect_authority/ConnectServerApp` |
 | `router.rs` | 73 | Routing: weighted/sticky/quarantine/atomic swap/arbitrage scaling/active-health gate | `RouterEngine/NodeFilter/normalize_domain/ProbeFailureOutcome` |
 | `model.rs` | 0 | Models: node/spec/context + tier canonicalization | `ProxyNode/canonical_tier/RoutingSpec/ProxyContext/EgressProto` |
 | `startup_config.rs` | 6 | Startup configuration: typed preflight, Admin/Gateway/Metrics/CONNECT/Redis/TenantStore/API key parsing, non-Unicode rejection, and sanitized diagnostics | `StartupConfigInput/StartupConfig/parse_startup_config` |
-| `free_pool/mod.rs` | 59 | Free 2nd line: fetch/two-stage verify/registry/circuit-break/merge | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
+| `free_pool/mod.rs` | 67 | Free 2nd line: fetch/two-stage verify/registry/circuit-break/merge | `FreePoolWorker/Source/Verifier/FreeProto/is_routable_ip` |
 | `bandit.rs` | 18 | LinUCB d=4 routing + per-tier forgetting + free risk premium | `forget_every_for_tier/cost_weight_for_tier/FREE_RISK_PREMIUM` |
 | `telemetry.rs` | 7 | Telemetry: MPSC batched XADD + idempotency + dual drop counters | `TelemetryPublisher/TelemetryWorker/TelemetryEvent` |
 | `circuit_breaker.rs` | 13 | Breaker: stream consume + quarantine + target-validity guard | `PassiveCircuitBreaker/parse_delta_message/valid_quarantine_target/quarantine_ttl_for_status` |
@@ -241,15 +249,24 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 | `geo.rs` | 4 | Profiling: GeoIP lookup + mismatch verdict (Disabled w/o DB) | `GeoDb/geo_verdict/GeoVerdict` |
 | `socks_bridge.rs` | 8 | SOCKS egress bridge: explicit-socks requests + hop filter + body cap | `SocksBridge/BridgeRequest/BridgeResponse` |
 | `socks_handshake.rs` | 12 | Handshake: RFC1928/1929 + SOCKS4/4a + greeting-only | `establish/greet_only` |
-| `admin/mod.rs` | 24 | Admin REST surface: standalone :9092, public `/livez`/`/readyz` probes, `/api/v1/*` behind `X-Admin-Key` (fail-closed) | `AdminState/router/RuntimeHealthState` |
+| `admin/mod.rs` | 25 | Admin REST surface: standalone :9092, public `/livez`/`/readyz` probes, `/api/v1/*` authentication, tenant balance/active writes join drain admission | `AdminState/router/RuntimeHealthState` |
 | `node_registry.rs` | 14 | Control-plane node registry: runtime add/remove + atomic persistence (survives restart) | `NodeRegistry/is_free_provider/path_from_env/RegistryError` |
 | `janitor.rs` | 3 | Eviction-count helper: one shared "evict and report" path for four sweeps | `removed_count` |
 | `redis_shard.rs` | 9 | Redis Stream sharding scaffold (1 shard by default = byte-identical behaviour) | `RedisStreamSharder/TELEMETRY_STREAM_BASE` |
 | `net_connector.rs` | 2 | Transport connector abstraction: tokio today, io_uring hook on Linux | `TcpConnector/TokioTcpConnector` |
+| `shutdown.rs` | 11 | Local shutdown drain/quiescence/flusher join/final-flush orchestration; no claim that Pingora runtime teardown is synchronized | `shutdown_tenants/TenantFlusher/bounded_flush` |
 | `health.rs` | 17 | Pure liveness/readiness decision model, shared runtime snapshot and Redis required/optional policy: starting/ready/degraded/draining/stopped | `RuntimeHealthState/redis_dependency_facts/evaluate_readiness` |
 
 
 `startup_config.rs` is a pure startup parser helper, including environment collection and invalid-Unicode rejection. The responsibility table also includes `health.rs`, which owns only pure readiness decisions; HTTP wiring remains a separate approved slice.
+
+### 1.1 `shutdown` internal tests
+
+Shutdown coordinator behaviour tests live in a dedicated submodule and cover drain, flusher join, final-flush ordering, and failure paths.
+
+| Submodule | Responsibility | Key APIs |
+|-----------|----------------|----------|
+| `shutdown/tests.rs` | Shutdown lifecycle regression tests | — |
 
 ### 1.1 `router` internal submodules (OPT-R18 P2-1 split)
 
@@ -257,9 +274,8 @@ Redis 7（6379）/ ClickHouse 24（8123）/ Prometheus 2.53（9090）/ Grafana 1
 quarantine + active health + arbitrage scaling + control-plane mutation all mixed
 together). P2-1 splits it by responsibility into the parent module `router.rs`
 (structure + constructors) plus 5 submodule files. **Submodule tests are folded
-into the `router.rs` row above** (62 = 52 + 10), so the module table stays at 24
-rows — readers build their mental model by responsibility, and 7 rows would
-mislead them.
+into the `router.rs` row above** (73), so the module table stays at 28 rows —
+readers build their mental model by responsibility, and 7 rows would mislead them.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|-----------|
@@ -284,13 +300,13 @@ The `free_pool` module used to be a 3727-line single file (fetch sources + two-s
 verify + registry state + background worker all mixed together). It is now the
 parent module `free_pool/mod.rs` (types + `shared_client` + re-exports) plus 5
 submodules. **Submodule tests are folded into the `free_pool/mod.rs` row above**;
-the component table has 27 rows total and keeps submodules folded into their parent row.
+the component table has 28 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|
-| `free_pool/sources.rs` | Three fetch sources (JSON API / HTML / GitHub raw list) + polite polling cache (ETag/304) + concurrent fetch-all | `ApiSource/HtmlSource/GitHubSource/fetch_all/API_MAX_PAGES` |
+| `free_pool/sources.rs` | JSON API / HTML / raw / strict URI-list fetchers; successful status and body-size limits, ETag polling and concurrent fetch-all | `ApiSource/HtmlSource/GitHubSource/UriSource/fetch_all/API_MAX_PAGES` |
 | `free_pool/verify.rs` | Two-stage verify: lightweight `Verifier` (TCP/proto) + `FullChecker` (canary) + anonymity grading | `Verifier/FullChecker/classify_anonymity/egress_of/socks_target_of_base` |
-| `free_pool/registry.rs` | Pool state: `Health` (EWMA) + `Registry` (TTL/eviction/failure marks) + source breaker + intake quota | `Registry/Health/SourceGuard/cap_intake/intake_cap_limit/baseline_bases` |
+| `free_pool/registry.rs` | Pool state: `Health` (EWMA) + `Registry` (TTL/eviction/failure marks) + source breaker + round-robin multi-source intake quota | `Registry/Health/SourceGuard/cap_intake/intake_cap_limit/baseline_bases` |
 | `free_pool/worker.rs` | Driver: env assembly, periodic fetch→verify→geo verdict→Router merge | `FreePoolWorker/FreePoolConfig/apply_geo_verdict/spawn_full_check` |
 | `free_pool/tests.rs` | All unit tests (moved out of the old file's second half) | — |
 
@@ -312,7 +328,7 @@ The `gateway` module used to be a 2275-line single file mixing **four concerns**
 pure auth/tier decisions, LinUCB routing context, upstream peer assembly, and SOCKS
 bridge forwarding — plus 40 unit tests. It is now the parent module `gateway/mod.rs`
 (struct + trace id + `parse_routing_spec` + re-exports) plus 6 submodules.
-**Submodule tests are folded into the `gateway/mod.rs` row above**; the component table has 27 rows total and keeps submodules folded into their parent row.
+**Submodule tests are folded into the `gateway/mod.rs` row above**; the component table has 28 rows total and keeps submodules folded into their parent row.
 
 | Submodule | Responsibility | Key APIs |
 |-----------|----------------|----------|

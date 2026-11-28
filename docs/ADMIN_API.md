@@ -223,7 +223,7 @@ OpenAPI 3.1 文档由 `utoipa` 自动生成，可在 `GET /api/v1/openapi.json` 
 { "active": true }
 ```
 
-**响应**：更新后的 `TenantDetail`，未找到返回 `404`。
+**响应**：更新后的 `TenantDetail`，未找到返回 `404`；进入 shutdown drain 后拒绝变更并返回 `503`。Admin tenant mutation shares the runtime admission barrier with data-plane requests, so accepted updates remain visible to the quiescence waiter until their dirty version has been recorded.
 
 ---
 

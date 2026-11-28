@@ -67,6 +67,9 @@ pub fn record_failed_addr(ctx: &mut ProxyContext) {
 /// - 已知限制：强制一次失败重试的端到端构造困难，覆盖以本单测 + 代码走查为准。
 pub fn reset_retry_accounting(ctx: &mut ProxyContext) {
     ctx.transferred_bytes = 0;
+    if let Some(settlement) = ctx.settlement.as_mut() {
+        settlement.reset_bytes();
+    }
 }
 
 /// 修剪游离臂：删除不在路由器全量池中的臂状态。

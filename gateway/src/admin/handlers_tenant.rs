@@ -64,7 +64,8 @@ pub(super) async fn get_tenant_handler(
     responses(
         (status = 200, description = "余额已更新", body = TenantDetail),
         (status = 400, description = "请求体非法 / 余额非有限值", body = ErrorResponse),
-        (status = 404, description = "租户不存在", body = ErrorResponse)
+        (status = 404, description = "租户不存在", body = ErrorResponse),
+        (status = 503, description = "租户写入正在停止或必需依赖不可用", body = ErrorResponse)
     )
 )]
 pub(super) async fn patch_tenant_balance_handler(
@@ -72,6 +73,14 @@ pub(super) async fn patch_tenant_balance_handler(
     Path(api_key): Path<String>,
     body: Result<AxumJson<TenantBalanceRequest>, JsonRejection>,
 ) -> Result<Json<TenantDetail>, ApiError> {
+    // Share the admission barrier with data-plane requests: a mutation accepted
+    // before drain keeps quiescence pending until its dirty version is recorded.
+    let _admission = state.health.try_admit().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tenant updates unavailable",
+        )
+    })?;
     let AxumJson(payload) = body.map_err(|rej| {
         error_response(
             StatusCode::BAD_REQUEST,
@@ -116,7 +125,8 @@ pub(super) async fn patch_tenant_balance_handler(
     request_body = TenantActiveRequest,
     responses(
         (status = 200, description = "启用状态已更新", body = TenantDetail),
-        (status = 404, description = "租户不存在", body = ErrorResponse)
+        (status = 404, description = "租户不存在", body = ErrorResponse),
+        (status = 503, description = "租户写入正在停止或必需依赖不可用", body = ErrorResponse)
     )
 )]
 pub(super) async fn patch_tenant_active_handler(
@@ -124,6 +134,14 @@ pub(super) async fn patch_tenant_active_handler(
     Path(api_key): Path<String>,
     body: Result<AxumJson<TenantActiveRequest>, JsonRejection>,
 ) -> Result<Json<TenantDetail>, ApiError> {
+    // Share the admission barrier with data-plane requests: a mutation accepted
+    // before drain keeps quiescence pending until its dirty version is recorded.
+    let _admission = state.health.try_admit().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tenant updates unavailable",
+        )
+    })?;
     let AxumJson(payload) = body.map_err(|rej| {
         error_response(
             StatusCode::BAD_REQUEST,

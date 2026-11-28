@@ -180,7 +180,7 @@ impl ApiSource {
         let results = futures::future::join_all(futs).await;
         for (p, r) in results {
             match r {
-                Ok(resp) => match resp.text().await {
+                Ok(resp) => match read_source_body(resp).await {
                     Ok(body) => {
                         ok_pages += 1;
                         nodes.extend(Self::parse(self.name, &body));
@@ -369,6 +369,96 @@ impl Source for HtmlSource {
     }
 }
 
+/// URI-formatted plain-text source: one strict `scheme://IPv4:port` per line.
+pub struct UriSource {
+    pub name: &'static str,
+    pub url: String,
+    etag: parking_lot::Mutex<Option<String>>,
+}
+
+impl UriSource {
+    pub fn new(name: &'static str, url: String) -> Self {
+        Self {
+            name,
+            url,
+            etag: parking_lot::Mutex::new(None),
+        }
+    }
+
+    pub fn parse(source: &str, body: &str) -> Vec<RawNode> {
+        body.lines()
+            .filter_map(|line| Self::parse_line(source, line.trim()))
+            .collect()
+    }
+
+    fn parse_line(source: &str, line: &str) -> Option<RawNode> {
+        if line.is_empty() || line.starts_with('#') || line.bytes().any(|b| b.is_ascii_control()) {
+            return None;
+        }
+        let (scheme, authority) = line.split_once("://")?;
+        let proto = match scheme.to_ascii_lowercase().as_str() {
+            "http" => FreeProto::Http,
+            "socks4" => FreeProto::Socks4,
+            "socks5" => FreeProto::Socks5,
+            _ => return None,
+        };
+        if authority.is_empty()
+            || authority.chars().any(|ch| {
+                matches!(ch, '/' | '?' | '#' | '@' | '%' | '\\' | ' ') || ch.is_ascii_control()
+            })
+        {
+            return None;
+        }
+        let (host, port) = authority.rsplit_once(':')?;
+        if host.contains(':') || host.is_empty() {
+            return None;
+        }
+        let ip = host.parse::<std::net::Ipv4Addr>().ok()?.to_string();
+        let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+        if !is_routable_ip(&ip) {
+            return None;
+        }
+        Some(RawNode {
+            ip,
+            port,
+            proto,
+            country: None,
+            source: source.to_string(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for UriSource {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn fetch(&self, client: &reqwest::Client) -> Result<FetchOutcome, String> {
+        let mut request = client.get(&self.url);
+        if let Some(etag) = self.etag.lock().clone() {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| "source request failed".to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(FetchOutcome::not_modified());
+        }
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = read_source_body(response).await?;
+        if let Some(etag) = etag {
+            *self.etag.lock() = Some(etag);
+        }
+        Ok(FetchOutcome::nodes(Self::parse(self.name, &body)))
+    }
+}
+
 /// raw 行列表源（默认 clarketm＋openproxylist；URL env 可配）。
 /// 行格式：`ip:port`（`#` 开头与空行跳过；行内 `socks4`/`socks5` 标记优先，
 /// 无标记落 `default_proto`，供 openproxylist 按文件切分协议）。
@@ -465,13 +555,15 @@ impl Source for GitHubSource {
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::not_modified());
         }
-        if let Some(v) = resp.headers().get("etag").and_then(|h| h.to_str().ok()) {
-            *self.etag.lock() = Some(v.to_string());
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|header| header.to_str().ok())
+            .map(str::to_owned);
+        let body = read_source_body(resp).await?;
+        if let Some(etag) = etag {
+            *self.etag.lock() = Some(etag);
         }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("read {} failed: {e}", self.url))?;
         Ok(FetchOutcome::nodes(Self::parse_with(
             self.name,
             &body,
